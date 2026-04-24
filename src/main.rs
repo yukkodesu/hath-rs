@@ -14,6 +14,7 @@ pub mod request;
 pub mod response;
 pub mod cache;
 pub mod server;
+pub mod scheduler;
 
 fn main() {
     println!("Hentai@Home Rust client starting...");
