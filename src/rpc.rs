@@ -1,0 +1,166 @@
+use crate::config::Config;
+use crate::error::{HathError, Result};
+use crate::utils;
+use reqwest::Url;
+use std::fmt;
+
+pub const CLIENT_BUILD: i32 = 178;
+pub const CLIENT_VERSION: &str = "1.6.5";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    ServerStat,
+    ClientLogin,
+    ClientSettings,
+    ClientStart,
+    ClientSuspend,
+    ClientResume,
+    ClientStop,
+    StillAlive,
+    GetBlacklist,
+    GetCertificate,
+    StaticRangeFetch,
+    DownloaderFetch,
+    DownloaderFailreport,
+    Overload,
+}
+
+impl fmt::Display for Action {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ServerStat => write!(f, "server_stat"),
+            Self::ClientLogin => write!(f, "client_login"),
+            Self::ClientSettings => write!(f, "client_settings"),
+            Self::ClientStart => write!(f, "client_start"),
+            Self::ClientSuspend => write!(f, "client_suspend"),
+            Self::ClientResume => write!(f, "client_resume"),
+            Self::ClientStop => write!(f, "client_stop"),
+            Self::StillAlive => write!(f, "still_alive"),
+            Self::GetBlacklist => write!(f, "get_blacklist"),
+            Self::GetCertificate => write!(f, "get_cert"),
+            Self::StaticRangeFetch => write!(f, "srfetch"),
+            Self::DownloaderFetch => write!(f, "dlfetch"),
+            Self::DownloaderFailreport => write!(f, "dlfails"),
+            Self::Overload => write!(f, "overload"),
+        }
+    }
+}
+
+/// Construct the signed RPC URL query string.
+/// Replicates Java: actkey = SHA1("hentai@home-" + act + "-" + add + "-" + cid + "-" + time + "-" + key)
+pub fn make_rpc_query(act: Action, add: &str, config: &Config) -> String {
+    let corrected_time = config.server_time();
+    let act_str = act.to_string();
+    let plain = format!(
+        "hentai@home-{}-{}-{}-{}-{}",
+        act_str, add, config.client_id.0, corrected_time, config.client_key.as_str()
+    );
+    let actkey = utils::sha1_string(&plain);
+    format!(
+        "clientbuild={}&act={}&add={}&cid={}&acttime={}&actkey={}",
+        CLIENT_BUILD, act_str, add, config.client_id.0, corrected_time, actkey
+    )
+}
+
+/// Build the full RPC URL for a given action.
+pub fn make_rpc_url(act: Action, add: &str, config: &Config) -> Result<Url> {
+    let host = config.get_rpc_host();
+    let query = make_rpc_query(act, add, config);
+    // rpc_path already ends with '?', e.g. "15/rpc?" — do not add another
+    let url_str = format!("http://{}/{}{}", host, config.rpc_path, query);
+    Url::parse(&url_str).map_err(|e| HathError::Rpc(format!("invalid URL: {}", e)))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ResponseStatus { Ok, Fail, Null }
+
+#[derive(Debug)]
+pub struct ServerResponse {
+    pub status: ResponseStatus,
+    pub lines: Vec<String>,
+    pub fail_code: Option<String>,
+    pub fail_host: Option<String>,
+}
+
+/// Parse the raw string response from an RPC call.
+pub fn parse_server_response(body: &str, request_host: &str) -> ServerResponse {
+    let lines: Vec<&str> = body.lines().collect();
+    if lines.is_empty() {
+        return ServerResponse {
+            status: ResponseStatus::Null,
+            lines: vec![],
+            fail_code: Some("NO_RESPONSE".into()),
+            fail_host: Some(request_host.to_lowercase()),
+        };
+    }
+    match lines[0] {
+        "OK" => ServerResponse {
+            status: ResponseStatus::Ok,
+            lines: lines[1..].iter().map(|s| s.to_string()).collect(),
+            fail_code: None,
+            fail_host: None,
+        },
+        "TEMPORARILY_UNAVAILABLE" => ServerResponse {
+            status: ResponseStatus::Null,
+            lines: vec![],
+            fail_code: Some("TEMPORARILY_UNAVAILABLE".into()),
+            fail_host: Some(request_host.to_lowercase()),
+        },
+        first if first.starts_with("KEY_EXPIRED") => ServerResponse {
+            status: ResponseStatus::Null,
+            lines: vec![],
+            fail_code: Some("KEY_EXPIRED".into()),
+            fail_host: Some(request_host.to_lowercase()),
+        },
+        fail => ServerResponse {
+            status: ResponseStatus::Fail,
+            lines: vec![],
+            fail_code: Some(fail.to_string()),
+            fail_host: Some(request_host.to_lowercase()),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::CliArgs;
+    use clap::Parser;
+
+    fn test_config() -> Config {
+        let args = CliArgs::try_parse_from([
+            "hath-rs", "--client-id", "12345", "--client-key", "abcde12345abcde12345",
+        ]).unwrap();
+        Config::load(args).unwrap()
+    }
+
+    #[test]
+    fn test_make_rpc_query() {
+        let config = test_config();
+        let q = make_rpc_query(Action::ClientStart, "", &config);
+        assert!(q.contains("clientbuild=178"));
+        assert!(q.contains("act=client_start"));
+        assert!(q.contains("cid=12345"));
+        assert!(q.contains("actkey="));
+    }
+
+    #[test]
+    fn test_parse_ok() {
+        let r = parse_server_response("OK\nkey=val", "rpc.example.com");
+        assert_eq!(r.status, ResponseStatus::Ok);
+        assert_eq!(r.lines, vec!["key=val"]);
+    }
+
+    #[test]
+    fn test_parse_fail() {
+        let r = parse_server_response("FAIL_CODE", "rpc.example.com");
+        assert_eq!(r.status, ResponseStatus::Fail);
+        assert_eq!(r.fail_code.unwrap(), "FAIL_CODE");
+    }
+
+    #[test]
+    fn test_parse_empty_is_null() {
+        let r = parse_server_response("", "rpc.example.com");
+        assert_eq!(r.status, ResponseStatus::Null);
+    }
+}
