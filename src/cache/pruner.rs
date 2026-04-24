@@ -1,18 +1,19 @@
 use crate::cache::CacheHandler;
 use crate::config::Config;
+use arc_swap::ArcSwap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 pub struct CachePruner {
     cache: Arc<Mutex<CacheHandler>>,
-    config: Arc<Config>,
+    config: Arc<ArcSwap<Config>>,
     check_frequency: u32,
     shutdown: CancellationToken,
 }
 
 impl CachePruner {
-    pub fn new(cache: Arc<Mutex<CacheHandler>>, config: Arc<Config>, shutdown: CancellationToken) -> Self {
+    pub fn new(cache: Arc<Mutex<CacheHandler>>, config: Arc<ArcSwap<Config>>, shutdown: CancellationToken) -> Self {
         Self { cache, config, check_frequency: 60, shutdown }
     }
 
@@ -30,7 +31,8 @@ impl CachePruner {
 
             let cache = self.cache.lock().await;
             let cache_size = cache.get_cache_size_with_overhead();
-            let cache_limit = self.config.disklimit_bytes;
+            let cfg = self.config.load();
+            let cache_limit = cfg.disklimit_bytes;
 
             if cache_size > cache_limit {
                 let pct = 100.0 * (cache_size as f64 / cache_limit as f64) - 100.0;
@@ -50,8 +52,8 @@ impl CachePruner {
 
                 disk_check_ticks += 1;
                 if disk_check_ticks >= 300 {
-                    if let Ok(free) = fs2::free_space(&self.config.cache_dir) {
-                        let min_remaining = self.config.diskremaining_bytes.max(104_857_600);
+                    if let Ok(free) = fs2::free_space(&cfg.cache_dir) {
+                        let min_remaining = cfg.diskremaining_bytes.max(104_857_600);
                         if free < min_remaining {
                             tracing::error!("Free disk space {} below minimum {}; shutting down", free, min_remaining);
                             return;

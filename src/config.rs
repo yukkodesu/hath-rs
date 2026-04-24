@@ -57,7 +57,7 @@ pub struct CliArgs {
     pub image_proxy_port: Option<u16>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Config {
     pub client_id: ClientId,
     pub client_key: ClientKey,
@@ -79,8 +79,10 @@ pub struct Config {
     pub rpc_servers: Vec<IpAddr>,
     pub rpc_port: u16,
     pub rpc_path: String,
-    pub rpc_current: std::sync::RwLock<Option<String>>,
-    pub rpc_last_failed: std::sync::RwLock<Option<String>>,
+    /// Cached RPC host. Set on first successful call, cleared on failure.
+    pub rpc_current: Option<String>,
+    /// Last failed RPC host, used to avoid re-picking it.
+    pub rpc_last_failed: Option<String>,
 
     pub static_ranges: HashMap<String, u8>,
     pub static_range_count: u32,
@@ -156,8 +158,8 @@ impl Config {
             rpc_servers: Vec::new(),
             rpc_port: 80,
             rpc_path: "15/rpc?".to_string(),
-            rpc_current: std::sync::RwLock::new(None),
-            rpc_last_failed: std::sync::RwLock::new(None),
+            rpc_current: None,
+            rpc_last_failed: None,
             static_ranges: HashMap::new(),
             static_range_count: 0,
             verify_cache: args.verify_cache.unwrap_or(false),
@@ -192,60 +194,37 @@ impl Config {
         }
     }
 
+    /// Pick an RPC host. Uses cached `rpc_current` if set, otherwise selects
+    /// a random server from `rpc_servers`. Callers should use rcu to persist
+    /// the chosen host back into `rpc_current`.
     pub fn get_rpc_host(&self) -> String {
-        let mut current = self.rpc_current.write().unwrap();
-        if current.is_none() {
-            if self.rpc_servers.is_empty() {
-                return "rpc.hentaiathome.net".to_string();
-            }
-            let idx = rand::rng().next_u32() as usize % self.rpc_servers.len();
-            let idx = {
-                let last_failed = self.rpc_last_failed.read().unwrap();
-                if let Some(ref failed) = *last_failed {
-                    if self.rpc_servers[idx].to_string().to_lowercase() == *failed && self.rpc_servers.len() > 1 {
-                        (idx + 1) % self.rpc_servers.len()
-                    } else {
-                        idx
-                    }
-                } else {
-                    idx
-                }
-            };
-            let selected = self.rpc_servers[idx].to_string().to_lowercase();
-            *current = Some(if self.rpc_port == 80 {
-                selected
-            } else {
-                format!("{}:{}", selected, self.rpc_port)
-            });
+        if let Some(ref host) = self.rpc_current {
+            return host.clone();
         }
-        current.clone().unwrap_or_else(|| "rpc.hentaiathome.net".to_string())
-    }
-
-    pub fn mark_rpc_server_failure(&self, fail_host: &str) {
-        let mut last_failed = self.rpc_last_failed.write().unwrap();
-        *last_failed = Some(fail_host.to_string());
-        let mut current = self.rpc_current.write().unwrap();
-        *current = None;
-    }
-
-    pub fn clear_rpc_server_failure(&self) {
-        let mut last_failed = self.rpc_last_failed.write().unwrap();
-        if last_failed.is_some() {
-            *last_failed = None;
-            let mut current = self.rpc_current.write().unwrap();
-            *current = None;
+        if self.rpc_servers.is_empty() {
+            return "rpc.hentaiathome.net".to_string();
+        }
+        // Pick a random server, avoiding the last failed one if possible
+        let mut idx = rand::rng().next_u32() as usize % self.rpc_servers.len();
+        if let Some(ref failed) = self.rpc_last_failed
+            && self.rpc_servers[idx].to_string().to_lowercase() == *failed
+            && self.rpc_servers.len() > 1
+        {
+            idx = (idx + 1) % self.rpc_servers.len();
+        }
+        let selected = self.rpc_servers[idx].to_string().to_lowercase();
+        if self.rpc_port == 80 {
+            selected
+        } else {
+            format!("{}:{}", selected, self.rpc_port)
         }
     }
 
-    pub fn apply_server_settings(&mut self, lines: &[String]) {
-        for line in lines {
-            if let Some((key, value)) = line.split_once('=') {
-                self.apply_setting(&key.to_lowercase(), value);
-            }
-        }
+    pub fn is_static_range(&self, range: &str) -> bool {
+        self.static_ranges.contains_key(range)
     }
 
-    fn apply_setting(&mut self, setting: &str, value: &str) {
+    pub fn apply_setting(&mut self, setting: &str, value: &str) {
         match setting {
             "min_client_build" => {
                 if let Ok(build) = value.parse::<i32>()
@@ -316,8 +295,12 @@ impl Config {
         tracing::debug!("Setting altered: {}={}", setting, value);
     }
 
-    pub fn is_static_range(&self, range: &str) -> bool {
-        self.static_ranges.contains_key(range)
+    pub fn apply_server_settings(&mut self, lines: &[String]) {
+        for line in lines {
+            if let Some((key, value)) = line.split_once('=') {
+                self.apply_setting(&key.to_lowercase(), value);
+            }
+        }
     }
 
     pub fn load_client_login(&self) -> Result<Option<(ClientId, ClientKey)>> {
