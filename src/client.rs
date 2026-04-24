@@ -94,13 +94,25 @@ pub async fn run() -> Result<()> {
         flood_control: flood_control.clone(),
     };
 
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let server_shutdown = shutdown.clone();
     let server_state = app_state.clone();
     tokio::spawn(async move {
-        if let Err(e) = server::start_server(server_state, server_shutdown).await {
+        if let Err(e) = server::start_server(server_state, server_shutdown, Some(ready_tx)).await {
             tracing::error!("Server error: {}", e);
         }
     });
+
+    // Wait for server to bind before notifying the RPC server
+    match ready_rx.await {
+        Ok(Ok(_port)) => {}
+        Ok(Err(e)) => {
+            return Err(HathError::Config(format!("Server startup failed: {}", e)));
+        }
+        Err(_) => {
+            return Err(HathError::Config("Server startup failed unexpectedly".into()));
+        }
+    }
 
     // 8. notifyStart: tell server we're ready (this triggers connectivity test)
     let start_resp = rpc_client.client_start().await?;
@@ -110,6 +122,7 @@ pub async fn run() -> Result<()> {
         if code.starts_with("FAIL_OTHER_CLIENT_CONNECTED") || code.starts_with("FAIL_CID_IN_USE") {
             return Err(HathError::Fatal(code));
         }
+        return Err(HathError::Fatal(format!("Unexpected client_start failure: {}", code)));
     }
 
     // 9. Allow normal connections

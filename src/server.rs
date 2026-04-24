@@ -208,50 +208,70 @@ pub async fn nuke_old_connections(_state: &AppState) {
     // We rely on Hyper's built-in timeouts instead of Java's manual nuke.
 }
 
-/// Start the TLS HTTP server.
+/// Start the TLS HTTP server. Sends readiness via `ready_tx` after successful bind.
 pub async fn start_server(
     state: AppState,
     shutdown: tokio_util::sync::CancellationToken,
+    ready_tx: Option<tokio::sync::oneshot::Sender<std::result::Result<u16, String>>>,
 ) -> Result<()> {
-    let cert_path = state.config.data_dir.join("hathcert.p12");
+    let setup_result = async {
+        let cert_path = state.config.data_dir.join("hathcert.p12");
 
-    // Download cert if not present
-    if !cert_path.exists() {
-        let cert_url = rpc::make_rpc_url(Action::GetCertificate, "", &state.config)?;
-        let downloader = crate::downloader::FileDownloader::new(
-            cert_url, 10000, 300000,
-            crate::downloader::DownloadMode::File(cert_path.clone()),
-            false,
-        );
-        downloader.download().await?;
-    }
+        // Download cert if not present
+        if !cert_path.exists() {
+            let cert_url = rpc::make_rpc_url(Action::GetCertificate, "", &state.config)?;
+            let downloader = crate::downloader::FileDownloader::new(
+                cert_url, 10000, 300000,
+                crate::downloader::DownloadMode::File(cert_path.clone()),
+                false,
+            );
+            downloader.download().await?;
+        }
 
-    let cert_data = std::fs::read(&cert_path)?;
-    let keystore = p12_keystore::KeyStore::from_pkcs12(&cert_data, state.config.client_key.as_str(),p12_keystore::Pkcs12ImportPolicy::Strict)
-        .map_err(|e| crate::error::HathError::Tls(rustls::Error::General(e.to_string())))?;
+        let cert_data = std::fs::read(&cert_path)?;
+        let keystore = p12_keystore::KeyStore::from_pkcs12(&cert_data, state.config.client_key.as_str(),p12_keystore::Pkcs12ImportPolicy::Strict)
+            .map_err(|e| crate::error::HathError::Tls(rustls::Error::General(e.to_string())))?;
 
-    let (_, keychain) = keystore.private_key_chain()
-        .ok_or_else(|| crate::error::HathError::Tls(rustls::Error::General(
-            "no private key in PKCS12".into()
-        )))?;
-    
-    let certs: Vec<CertificateDer> = keychain.certs()
-        .iter()
-        .map(|c| CertificateDer::from(c.as_der().to_vec()))
-        .collect();
-    let key: PrivateKeyDer = PrivatePkcs8KeyDer::from(keychain.key().as_der().to_vec()).into();
+        let (_, keychain) = keystore.private_key_chain()
+            .ok_or_else(|| crate::error::HathError::Tls(rustls::Error::General(
+                "no private key in PKCS12".into()
+            )))?;
 
-    let tls_config = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .map_err(crate::error::HathError::Tls)?;
+        let certs: Vec<CertificateDer> = keychain.certs()
+            .iter()
+            .map(|c| CertificateDer::from(c.as_der().to_vec()))
+            .collect();
+        let key: PrivateKeyDer = PrivatePkcs8KeyDer::from(keychain.key().as_der().to_vec()).into();
 
-    let tls_acceptor = TlsAcceptor::from(Arc::new(tls_config));
+        let tls_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .map_err(crate::error::HathError::Tls)?;
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], state.config.client_port));
-    let listener = TcpListener::bind(addr).await.map_err(crate::error::HathError::Io)?;
+        let tls_acceptor = TlsAcceptor::from(Arc::new(tls_config));
 
-    tracing::info!("HTTPServer listening on port {}", state.config.client_port);
+        let addr = SocketAddr::from(([0, 0, 0, 0], state.config.client_port));
+        let listener = TcpListener::bind(addr).await.map_err(crate::error::HathError::Io)?;
+
+        Ok::<_, crate::error::HathError>((listener, tls_acceptor, state.config.client_port))
+    }.await;
+
+    let (listener, tls_acceptor, port) = match setup_result {
+        Ok(v) => {
+            if let Some(tx) = ready_tx {
+                let _ = tx.send(Ok(v.2));
+            }
+            v
+        }
+        Err(e) => {
+            if let Some(tx) = ready_tx {
+                let _ = tx.send(Err(e.to_string()));
+            }
+            return Err(e);
+        }
+    };
+
+    tracing::info!("HTTPServer listening on port {}", port);
 
     loop {
         tokio::select! {
