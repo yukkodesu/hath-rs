@@ -2,44 +2,68 @@ use crate::config::Config;
 use crate::error::{HathError, Result};
 use crate::utils;
 use reqwest::Url;
+use std::fmt;
 
 pub const CLIENT_BUILD: i32 = 178;
 pub const CLIENT_VERSION: &str = "1.6.5";
 
-pub mod actions {
-    pub const SERVER_STAT: &str = "server_stat";
-    pub const CLIENT_LOGIN: &str = "client_login";
-    pub const CLIENT_SETTINGS: &str = "client_settings";
-    pub const CLIENT_START: &str = "client_start";
-    pub const CLIENT_SUSPEND: &str = "client_suspend";
-    pub const CLIENT_RESUME: &str = "client_resume";
-    pub const CLIENT_STOP: &str = "client_stop";
-    pub const STILL_ALIVE: &str = "still_alive";
-    pub const GET_BLACKLIST: &str = "get_blacklist";
-    pub const GET_CERTIFICATE: &str = "get_cert";
-    pub const STATIC_RANGE_FETCH: &str = "srfetch";
-    pub const DOWNLOADER_FETCH: &str = "dlfetch";
-    pub const DOWNLOADER_FAILREPORT: &str = "dlfails";
-    pub const OVERLOAD: &str = "overload";
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    ServerStat,
+    ClientLogin,
+    ClientSettings,
+    ClientStart,
+    ClientSuspend,
+    ClientResume,
+    ClientStop,
+    StillAlive,
+    GetBlacklist,
+    GetCertificate,
+    StaticRangeFetch,
+    DownloaderFetch,
+    DownloaderFailreport,
+    Overload,
+}
+
+impl fmt::Display for Action {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ServerStat => write!(f, "server_stat"),
+            Self::ClientLogin => write!(f, "client_login"),
+            Self::ClientSettings => write!(f, "client_settings"),
+            Self::ClientStart => write!(f, "client_start"),
+            Self::ClientSuspend => write!(f, "client_suspend"),
+            Self::ClientResume => write!(f, "client_resume"),
+            Self::ClientStop => write!(f, "client_stop"),
+            Self::StillAlive => write!(f, "still_alive"),
+            Self::GetBlacklist => write!(f, "get_blacklist"),
+            Self::GetCertificate => write!(f, "get_cert"),
+            Self::StaticRangeFetch => write!(f, "srfetch"),
+            Self::DownloaderFetch => write!(f, "dlfetch"),
+            Self::DownloaderFailreport => write!(f, "dlfails"),
+            Self::Overload => write!(f, "overload"),
+        }
+    }
 }
 
 /// Construct the signed RPC URL query string.
 /// Replicates Java: actkey = SHA1("hentai@home-" + act + "-" + add + "-" + cid + "-" + time + "-" + key)
-pub fn make_rpc_query(act: &str, add: &str, config: &Config) -> String {
+pub fn make_rpc_query(act: Action, add: &str, config: &Config) -> String {
     let corrected_time = config.server_time();
+    let act_str = act.to_string();
     let plain = format!(
         "hentai@home-{}-{}-{}-{}-{}",
-        act, add, config.client_id.0, corrected_time, config.client_key.as_str()
+        act_str, add, config.client_id.0, corrected_time, config.client_key.as_str()
     );
     let actkey = utils::sha1_string(&plain);
     format!(
         "clientbuild={}&act={}&add={}&cid={}&acttime={}&actkey={}",
-        CLIENT_BUILD, act, add, config.client_id.0, corrected_time, actkey
+        CLIENT_BUILD, act_str, add, config.client_id.0, corrected_time, actkey
     )
 }
 
 /// Build the full RPC URL for a given action.
-pub fn make_rpc_url(act: &str, add: &str, config: &Config) -> Result<Url> {
+pub fn make_rpc_url(act: Action, add: &str, config: &Config) -> Result<Url> {
     let host = config.get_rpc_host();
     let query = make_rpc_query(act, add, config);
     // rpc_path already ends with '?', e.g. "15/rpc?" — do not add another
@@ -113,7 +137,7 @@ mod tests {
     #[test]
     fn test_make_rpc_query() {
         let config = test_config();
-        let q = make_rpc_query(actions::CLIENT_START, "", &config);
+        let q = make_rpc_query(Action::ClientStart, "", &config);
         assert!(q.contains("clientbuild=178"));
         assert!(q.contains("act=client_start"));
         assert!(q.contains("cid=12345"));
