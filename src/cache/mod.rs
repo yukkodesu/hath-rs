@@ -14,6 +14,9 @@ use std::sync::Arc;
 
 pub const LRU_CACHE_SIZE: usize = 1_048_576;
 
+/// (lru_array, total_files, unique_files, total_size, res_counts)
+type RescanResult = (Box<[u16; LRU_CACHE_SIZE]>, usize, u32, u64, HashMap<String, u64>);
+
 #[derive(Debug)]
 pub struct CacheHandler {
     pub config: Arc<Config>,
@@ -141,9 +144,7 @@ impl CacheHandler {
     }
 
     /// Full rescan: iterates all cache directories, validates files, builds LRU state.
-    fn full_rescan(config: &Config, stats: &Stats) -> Result<(
-        Box<[u16; LRU_CACHE_SIZE]>, usize, u32, u64, HashMap<String, u64>,
-    )> {
+    fn full_rescan(config: &Config, stats: &Stats) -> Result<RescanResult> {
         tracing::info!("Loading cache...");
         let lru = Box::new([0u16; LRU_CACHE_SIZE]);
         let mut count = 0u32;
@@ -194,7 +195,7 @@ impl CacheHandler {
                         .unwrap_or(0);
                     oldest_modified = oldest_modified.min(modified);
 
-                    if count % 10000 == 0 {
+                    if count.is_multiple_of(10000) {
                         tracing::info!("Loaded {} files so far...", count);
                     }
                 }

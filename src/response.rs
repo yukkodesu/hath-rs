@@ -8,7 +8,6 @@ use rand::Rng;
 
 /// Build a Hyper Response with proper headers (not raw byte injection).
 /// Server and Date headers are set at the Hyper service layer.
-
 pub fn ok_response(body: Vec<u8>, content_type: &str) -> Result<Response<Full<Bytes>>> {
     let len = body.len();
     let resp = Response::builder()
@@ -18,7 +17,7 @@ pub fn ok_response(body: Vec<u8>, content_type: &str) -> Result<Response<Full<By
         .header(header::CONTENT_LENGTH, len)
         .header(header::CONNECTION, "close")
         .body(Full::new(Bytes::from(body)))
-        .map_err(|e| HathError::Http(e))?;
+        .map_err(HathError::Http)?;
     Ok(resp)
 }
 
@@ -42,7 +41,7 @@ pub fn text_response(status: StatusCode, text: &str) -> Result<Response<Full<Byt
         .header(header::CONTENT_LENGTH, len)
         .header(header::CONNECTION, "close")
         .body(Full::new(Bytes::from(text.as_bytes().to_vec())))
-        .map_err(|e| HathError::Http(e))
+        .map_err(HathError::Http)
 }
 
 pub fn redirect_response(location: &str) -> Result<Response<Full<Bytes>>> {
@@ -52,7 +51,7 @@ pub fn redirect_response(location: &str) -> Result<Response<Full<Bytes>>> {
         .header(header::CONTENT_LENGTH, 0)
         .header(header::CONNECTION, "close")
         .body(Full::new(Bytes::new()))
-        .map_err(|e| HathError::Http(e))
+        .map_err(HathError::Http)
 }
 
 pub fn robots_response() -> Result<Response<Full<Bytes>>> {
@@ -64,7 +63,7 @@ pub fn robots_response() -> Result<Response<Full<Bytes>>> {
         .header(header::CONTENT_LENGTH, len)
         .header(header::CONNECTION, "close")
         .body(Full::new(Bytes::from(body.to_vec())))
-        .map_err(|e| HathError::Http(e))
+        .map_err(HathError::Http)
 }
 
 pub fn speedtest_response(size: usize) -> Result<Response<Full<Bytes>>> {

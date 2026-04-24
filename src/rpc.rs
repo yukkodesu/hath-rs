@@ -25,6 +25,14 @@ pub enum Action {
     Overload,
 }
 
+impl Action {
+    /// server_stat 是第一个调用的 RPC，用于校时。
+    /// 此时还没有 server_time_delta，所以不带 cid/acttime/actkey 签名。
+    fn needs_signing(self) -> bool {
+        !matches!(self, Self::ServerStat)
+    }
+}
+
 impl fmt::Display for Action {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -49,6 +57,9 @@ impl fmt::Display for Action {
 /// Construct the signed RPC URL query string.
 /// Replicates Java: actkey = SHA1("hentai@home-" + act + "-" + add + "-" + cid + "-" + time + "-" + key)
 pub fn make_rpc_query(act: Action, add: &str, config: &Config) -> String {
+    if !act.needs_signing() {
+        return format!("clientbuild={}&act={}", CLIENT_BUILD, act);
+    }
     let corrected_time = config.server_time();
     let act_str = act.to_string();
     let plain = format!(
@@ -132,6 +143,14 @@ mod tests {
             "hath-rs", "--client-id", "12345", "--client-key", "abcde12345abcde12345",
         ]).unwrap();
         Config::load(args).unwrap()
+    }
+
+    #[test]
+    fn test_server_stat_unsigned() {
+        let config = test_config();
+        let q = make_rpc_query(Action::ServerStat, "", &config);
+        assert_eq!(q, "clientbuild=178&act=server_stat");
+        assert!(!q.contains("actkey="));
     }
 
     #[test]

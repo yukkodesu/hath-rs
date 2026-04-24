@@ -248,16 +248,14 @@ impl Config {
     fn apply_setting(&mut self, setting: &str, value: &str) {
         match setting {
             "min_client_build" => {
-                if let Ok(build) = value.parse::<i32>() {
-                    if build > 178 {
+                if let Ok(build) = value.parse::<i32>()
+                    && build > 178 {
                         tracing::error!("Client too old! Required build: {}, our build: 178", build);
                     }
-                }
             }
             "cur_client_build" => {
-                if let Ok(build) = value.parse::<i32>() {
-                    if build > 178 { self.warn_new_client = true; }
-                }
+                if let Ok(build) = value.parse::<i32>()
+                    && build > 178 { self.warn_new_client = true; }
             }
             "server_time" => {
                 if let Ok(st) = value.parse::<i64>() {

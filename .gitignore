@@ -1,2 +1,5 @@
 /target
 .worktrees/
+.idea/
+*.p12
+*.log
