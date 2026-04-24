@@ -1,4 +1,5 @@
 pub mod persistent;
+pub mod pruner;
 
 use crate::config::Config;
 use crate::error::Result;
