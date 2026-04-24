@@ -33,11 +33,10 @@ pub fn parse_additional(additional: &str) -> HashMap<String, String> {
         return map;
     }
     for kv_pair in additional.trim().split(';') {
-        if kv_pair.len() > 2 {
-            if let Some((k, v)) = kv_pair.split_once('=') {
+        if kv_pair.len() > 2
+            && let Some((k, v)) = kv_pair.split_once('=') {
                 map.insert(k.trim().to_string(), v.trim().to_string());
             }
-        }
     }
     map
 }
@@ -75,20 +74,18 @@ pub fn list_sorted_files(dir: &Path) -> Vec<std::path::PathBuf> {
 
 /// Remove a file, logging a warning on failure (never silently swallow).
 pub fn remove_file(path: &Path) {
-    if let Err(e) = fs::remove_file(path) {
-        if e.kind() != io::ErrorKind::NotFound {
+    if let Err(e) = fs::remove_file(path)
+        && e.kind() != io::ErrorKind::NotFound {
             tracing::warn!("Failed to remove file {}: {}", path.display(), e);
         }
-    }
 }
 
 /// Remove a directory, logging a warning on failure.
 pub fn remove_dir(path: &Path) {
-    if let Err(e) = fs::remove_dir(path) {
-        if e.kind() != io::ErrorKind::NotFound {
+    if let Err(e) = fs::remove_dir(path)
+        && e.kind() != io::ErrorKind::NotFound {
             tracing::warn!("Failed to remove dir {}: {}", path.display(), e);
         }
-    }
 }
 
 #[cfg(test)]

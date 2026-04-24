@@ -75,7 +75,7 @@ fn parse_file_serve(url_parts: &[&str], config: &Config) -> RequestType {
 }
 
 fn parse_server_command(url_parts: &[&str], client_ip: IpAddr, config: &Config) -> RequestType {
-    let is_from_rpc = config.rpc_servers.iter().any(|s| *s == client_ip) || config.disable_ip_origin_check;
+    let is_from_rpc = config.rpc_servers.contains(&client_ip) || config.disable_ip_origin_check;
 
     if url_parts.len() < 6 {
         return RequestType::ServerCommand { command: String::new(), additional: String::new(), valid: false };

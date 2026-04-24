@@ -82,11 +82,10 @@ impl FileDownloader {
         }
 
         // Check size limits
-        if content_length > 10_485_760 {
-            if matches!(self.mode, DownloadMode::Memory) {
+        if content_length > 10_485_760
+            && matches!(self.mode, DownloadMode::Memory) {
                 return Err(HathError::Network("content too large for memory buffer".into()));
             }
-        }
 
         self.content_length.store(content_length, Ordering::Relaxed);
 

@@ -53,11 +53,10 @@ impl Stats {
 
     pub fn record_bytes_sent(&self, bytes: u64) {
         self.bytes_sent.fetch_add(bytes, Ordering::Relaxed);
-        if self.client_running.load(Ordering::Relaxed) {
-            if let Ok(mut hist) = self.bytes_sent_history.write() {
+        if self.client_running.load(Ordering::Relaxed)
+            && let Ok(mut hist) = self.bytes_sent_history.write() {
                 hist[0] = hist[0].wrapping_add(bytes as u32);
             }
-        }
     }
 
     pub fn record_bytes_rcvd(&self, bytes: u64) {

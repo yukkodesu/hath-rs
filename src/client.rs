@@ -192,15 +192,14 @@ pub async fn run() -> Result<()> {
             let rpc_client = rpc_client.clone();
             let cache = cache.clone();
             async move {
-                if let Ok(resp) = rpc_client.get_blacklist(43200).await {
-                    if resp.status == ResponseStatus::Ok {
+                if let Ok(resp) = rpc_client.get_blacklist(43200).await
+                    && resp.status == ResponseStatus::Ok {
                         for fileid in &resp.lines {
                             if let Ok(mut c) = cache.try_lock() {
                                 let _ = c.delete_file_from_cache(fileid);
                             }
                         }
                     }
-                }
             }
         }));
     }

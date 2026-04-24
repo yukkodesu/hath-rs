@@ -50,7 +50,7 @@ pub struct FloodControlEntry {
 
 impl FloodControlEntry {
     pub fn is_blocked(&self) -> bool {
-        self.block_until.map_or(false, |b| b > Instant::now())
+        self.block_until.is_some_and(|b| b > Instant::now())
     }
 
     pub fn is_stale(&self, now: Instant) -> bool {
@@ -244,12 +244,12 @@ pub async fn start_server(
     let tls_config = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
-        .map_err(|e| crate::error::HathError::Tls(e))?;
+        .map_err(crate::error::HathError::Tls)?;
 
     let tls_acceptor = TlsAcceptor::from(Arc::new(tls_config));
 
     let addr = SocketAddr::from(([0, 0, 0, 0], state.config.client_port));
-    let listener = TcpListener::bind(addr).await.map_err(|e| crate::error::HathError::Io(e))?;
+    let listener = TcpListener::bind(addr).await.map_err(crate::error::HathError::Io)?;
 
     tracing::info!("HTTPServer listening on port {}", state.config.client_port);
 
@@ -303,11 +303,9 @@ pub async fn start_server(
                     if let Err(e) = http1::Builder::new()
                         .serve_connection(io, service)
                         .await
-                    {
-                        if !e.to_string().contains("connection closed") {
+                        && !e.to_string().contains("connection closed") {
                             tracing::debug!("HTTP connection error: {}", e);
                         }
-                    }
                 });
             }
         }
