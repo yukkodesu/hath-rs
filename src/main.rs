@@ -13,6 +13,7 @@ pub mod proxy_downloader;
 pub mod request;
 pub mod response;
 pub mod cache;
+pub mod server;
 
 fn main() {
     println!("Hentai@Home Rust client starting...");
