@@ -2,9 +2,9 @@ use crate::bandwidth::BandwidthMonitor;
 use crate::error::{HathError, Result};
 use bytes::BytesMut;
 use reqwest::{Client, Url};
-use std::cell::Cell;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicI32, AtomicU64, Ordering};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
@@ -21,13 +21,12 @@ pub struct FileDownloader {
     source: Url,
     timeout_ms: u64,
     max_dl_time_ms: u64,
-    retries: Cell<u32>,
+    retries: AtomicU32,
     mode: DownloadMode,
     allow_proxy: bool,
     download_limiter: Option<Arc<BandwidthMonitor>>,
-    // Results — use Cell for mutation through &self in attempt_download
-    pub content_length: Cell<i32>,
-    pub download_time_millis: Cell<u64>,
+    pub content_length: AtomicI32,
+    pub download_time_millis: AtomicU64,
 }
 
 impl FileDownloader {
@@ -36,12 +35,12 @@ impl FileDownloader {
             source,
             timeout_ms,
             max_dl_time_ms,
-            retries: Cell::new(3),
+            retries: AtomicU32::new(3),
             mode,
             allow_proxy,
             download_limiter: None,
-            content_length: Cell::new(0),
-            download_time_millis: Cell::new(0),
+            content_length: AtomicI32::new(0),
+            download_time_millis: AtomicU64::new(0),
         }
     }
 
@@ -56,11 +55,11 @@ impl FileDownloader {
             .map_err(|e| HathError::Network(e.to_string()))?;
 
         loop {
-            let remaining = self.retries.get();
+            let remaining = self.retries.load(Ordering::Relaxed);
             if remaining == 0 {
                 return Err(HathError::Network(format!("exhausted retries for {}", self.source)));
             }
-            self.retries.set(remaining - 1);
+            self.retries.store(remaining - 1, Ordering::Relaxed);
 
             match self.attempt_download(&client).await {
                 Ok(data) => return Ok(data),
@@ -89,7 +88,7 @@ impl FileDownloader {
             }
         }
 
-        self.content_length.set(content_length);
+        self.content_length.store(content_length, Ordering::Relaxed);
 
         let mut buffer = match &self.mode {
             DownloadMode::Memory => Some(BytesMut::with_capacity(content_length as usize)),
@@ -135,7 +134,7 @@ impl FileDownloader {
             return Err(HathError::Network(format!("incomplete: got {} of {}", total_bytes, content_length)));
         }
 
-        self.download_time_millis.set(download_start.elapsed().as_millis() as u64);
+        self.download_time_millis.store(download_start.elapsed().as_millis() as u64, Ordering::Relaxed);
         Ok(buffer)
     }
 }

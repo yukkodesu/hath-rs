@@ -15,7 +15,12 @@ pub mod response;
 pub mod cache;
 pub mod server;
 pub mod scheduler;
+pub mod client;
 
-fn main() {
-    println!("Hentai@Home Rust client starting...");
+#[tokio::main]
+async fn main() {
+    if let Err(e) = client::run().await {
+        eprintln!("Fatal error: {}", e);
+        std::process::exit(1);
+    }
 }
