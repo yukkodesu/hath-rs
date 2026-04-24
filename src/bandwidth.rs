@@ -5,12 +5,14 @@ const TIME_RESOLUTION: usize = 50;
 const WINDOW_LENGTH: usize = 5;
 const MILLIS_PER_TICK: u64 = 20;
 
+#[derive(Debug)]
 pub struct BandwidthMonitor {
     bytes_per_tick: u32,
     millis_per_tick: u64,
     inner: Mutex<BwmInner>,
 }
 
+#[derive(Debug)]
 struct BwmInner {
     tick_bytes: [u32; TIME_RESOLUTION],
     tick_seconds: [u64; TIME_RESOLUTION],
