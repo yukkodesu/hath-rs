@@ -7,6 +7,7 @@ use crate::cache::CacheHandler;
 use crate::rpc_client::RpcClient;
 use crate::rpc::{self, Action};
 
+use arc_swap::ArcSwap;
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::Service;
@@ -32,7 +33,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 /// Shared state accessible from all request handlers.
 #[derive(Clone)]
 pub struct AppState {
-    pub config: Arc<Config>,
+    pub config: Arc<ArcSwap<Config>>,
     pub stats: Arc<Stats>,
     pub cache: Arc<Mutex<CacheHandler>>,
     pub rpc_client: Arc<RpcClient>,
@@ -94,6 +95,8 @@ impl Service<Request<Incoming>> for HathService {
 
         Box::pin(async move {
             let client_ip = remote_addr.map(|a| a.ip()).unwrap_or_else(|| "0.0.0.0".parse().unwrap());
+            // Load config once for this request (owned Arc, safe across .await)
+            let config = state.config.load_full();
 
             // Build request line for parsing
             let request_line = format!(
@@ -103,17 +106,17 @@ impl Service<Request<Incoming>> for HathService {
                 req.version()
             );
 
-            let request_type = request::parse_request(&request_line, client_ip, &state.config);
+            let request_type = request::parse_request(&request_line, client_ip, &config);
 
             let mut resp = match request_type {
                 RequestType::FileServe { keystamp_valid, hv_file, .. } => {
                     if !keystamp_valid {
                         response::forbidden_response()
                     } else if let Some(hv) = hv_file {
-                        let cache_path = hv.cache_path(&state.config.cache_dir);
+                        let cache_path = hv.cache_path(&config.cache_dir);
                         if cache_path.exists() {
                             state.stats.record_file_sent();
-                            response::file_response(&hv, &state.config.cache_dir).await
+                            response::file_response(&hv, &config.cache_dir).await
                         } else {
                             response::not_found_response()
                         }
@@ -180,6 +183,15 @@ async fn handle_server_command(command: &str, state: &AppState) -> crate::error:
         "refresh_settings" => {
             match state.rpc_client.refresh_settings().await {
                 Ok(sr) if sr.status == crate::rpc::ResponseStatus::Ok => {
+                    state.config.rcu(|current| {
+                        let mut new = (**current).clone();
+                        for line in &sr.lines {
+                            if let Some((key, value)) = line.split_once('=') {
+                                new.apply_setting(&key.to_lowercase(), value);
+                            }
+                        }
+                        Arc::new(new)
+                    });
                     response::text_response(hyper::StatusCode::OK, "")
                 }
                 _ => response::text_response(hyper::StatusCode::OK, ""),
@@ -215,11 +227,13 @@ pub async fn start_server(
     ready_tx: Option<tokio::sync::oneshot::Sender<std::result::Result<u16, String>>>,
 ) -> Result<()> {
     let setup_result = async {
-        let cert_path = state.config.data_dir.join("hathcert.p12");
+        let config = state.config.load_full();
+
+        let cert_path = config.data_dir.join("hathcert.p12");
 
         // Download cert if not present
         if !cert_path.exists() {
-            let cert_url = rpc::make_rpc_url(Action::GetCertificate, "", &state.config)?;
+            let cert_url = rpc::make_rpc_url(Action::GetCertificate, "", &config)?;
             let downloader = crate::downloader::FileDownloader::new(
                 cert_url, 10000, 300000,
                 crate::downloader::DownloadMode::File(cert_path.clone()),
@@ -229,7 +243,7 @@ pub async fn start_server(
         }
 
         let cert_data = std::fs::read(&cert_path)?;
-        let keystore = p12_keystore::KeyStore::from_pkcs12(&cert_data, state.config.client_key.as_str(),p12_keystore::Pkcs12ImportPolicy::Strict)
+        let keystore = p12_keystore::KeyStore::from_pkcs12(&cert_data, config.client_key.as_str(), p12_keystore::Pkcs12ImportPolicy::Strict)
             .map_err(|e| crate::error::HathError::Tls(rustls::Error::General(e.to_string())))?;
 
         let (_, keychain) = keystore.private_key_chain()
@@ -250,10 +264,10 @@ pub async fn start_server(
 
         let tls_acceptor = TlsAcceptor::from(Arc::new(tls_config));
 
-        let addr = SocketAddr::from(([0, 0, 0, 0], state.config.client_port));
+        let addr = SocketAddr::from(([0, 0, 0, 0], config.client_port));
         let listener = TcpListener::bind(addr).await.map_err(crate::error::HathError::Io)?;
 
-        Ok::<_, crate::error::HathError>((listener, tls_acceptor, state.config.client_port))
+        Ok::<_, crate::error::HathError>((listener, tls_acceptor, config.client_port))
     }.await;
 
     let (listener, tls_acceptor, port) = match setup_result {
@@ -286,18 +300,22 @@ pub async fn start_server(
                 let state = state.clone();
                 let allow = state.allow_normal_connections.load(std::sync::atomic::Ordering::Relaxed);
 
+                // Load config for flood control / connection checks
+                let cfg = state.config.load();
+
                 // Flood control check for non-local, non-RPC traffic
                 let host_addr = remote_addr.ip().to_string().to_lowercase();
                 let is_local = LOCAL_NETWORK_RE.is_match(&host_addr)
-                    || state.config.client_host.replace("::ffff:", "") == host_addr;
-                let is_rpc = state.config.rpc_servers.iter().any(|s| s.to_string().to_lowercase() == host_addr);
+                    || cfg.client_host.replace("::ffff:", "") == host_addr;
+                let is_rpc = cfg.rpc_servers.iter().any(|s| s.to_string().to_lowercase() == host_addr);
 
                 if !allow && !is_rpc {
                     drop(stream);
                     continue;
                 }
 
-                if !is_local && !is_rpc && !state.config.disable_flood_control {
+                if !is_local && !is_rpc && !cfg.disable_flood_control {
+                    drop(cfg); // release Guard before .await
                     let mut fc = state.flood_control.lock().await;
                     let entry = fc.entry(host_addr.clone()).or_insert_with(|| FloodControlEntry {
                         connect_count: 0,

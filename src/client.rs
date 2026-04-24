@@ -6,6 +6,7 @@ use crate::rpc_client::RpcClient;
 use crate::server::{self, AppState, prune_flood_control};
 use crate::stats::Stats;
 
+use arc_swap::ArcSwap;
 use clap::Parser;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -53,8 +54,10 @@ pub async fn run() -> Result<()> {
         return Err(HathError::Config("Invalid credentials".into()));
     }
 
-    // 4. Server stat: get time and min build
-    let config = Arc::new(config);
+    // 4. Wrap config in ArcSwap for sharing
+    let config = Arc::new(ArcSwap::from(Arc::new(config)));
+
+    // 5. Server stat: get time and min build
     let rpc_client = Arc::new(RpcClient::new(config.clone())?);
     tracing::info!("Getting initial stat from server...");
 
@@ -63,7 +66,7 @@ pub async fn run() -> Result<()> {
         return Err(HathError::Rpc("Failed to get initial stat from server".into()));
     }
 
-    // 5. Client login: get full settings
+    // 6. Client login: get full settings
     tracing::info!("Reading client settings from server...");
     let login_resp = rpc_client.client_login().await?;
     if login_resp.status != ResponseStatus::Ok {
@@ -71,17 +74,22 @@ pub async fn run() -> Result<()> {
         return Err(HathError::Rpc(format!("Login failed: {}", code)));
     }
 
-    // Apply server settings (unsafe save my life)
-    {
-        let config_ptr = Arc::as_ptr(&config) as *mut Config;
-        unsafe { &mut *config_ptr }.apply_server_settings(&login_resp.lines);
-    }
+    // Apply server settings via rcu (clone → modify → atomic swap, zero unsafe)
+    config.rcu(|current| {
+        let mut new = (**current).clone();
+        for line in &login_resp.lines {
+            if let Some((key, value)) = line.split_once('=') {
+                new.apply_setting(&key.to_lowercase(), value);
+            }
+        }
+        Arc::new(new)
+    });
 
-    // 6. Init cache
+    // 7. Init cache
     let stats = Arc::new(Stats::new());
     let cache = Arc::new(Mutex::new(CacheHandler::new(config.clone(), stats.clone())?));
 
-    // 7. Download cert + start HTTP server
+    // 8. Download cert + start HTTP server
     let allow_connections = Arc::new(AtomicBool::new(false));
     let flood_control = Arc::new(Mutex::new(HashMap::new()));
 
@@ -114,7 +122,7 @@ pub async fn run() -> Result<()> {
         }
     }
 
-    // 8. notifyStart: tell server we're ready (this triggers connectivity test)
+    // 9. notifyStart: tell server we're ready (this triggers connectivity test)
     let start_resp = rpc_client.client_start().await?;
     if start_resp.status != ResponseStatus::Ok {
         let code = start_resp.fail_code.unwrap_or_default();
@@ -125,13 +133,13 @@ pub async fn run() -> Result<()> {
         return Err(HathError::Fatal(format!("Unexpected client_start failure: {}", code)));
     }
 
-    // 9. Allow normal connections
+    // 10. Allow normal connections
     allow_connections.store(true, Ordering::SeqCst);
     stats.program_started();
 
     tracing::info!("Startup completed successfully. Starting normal operation");
 
-    // 10. Spawn periodic background tasks
+    // 11. Spawn periodic background tasks
 
     // 10s: LRU cycle + shift stats
     {
@@ -181,7 +189,7 @@ pub async fn run() -> Result<()> {
         tokio::spawn(tick_every(shutdown.clone(), Duration::from_secs(300), move || {
             let config = config.clone();
             async move {
-                if config.server_time_delta.abs() > 86400 {
+                if config.load().server_time_delta.abs() > 86400 {
                     tracing::warn!("System time off by >24h. Correct your system clock.");
                 }
             }
@@ -193,7 +201,15 @@ pub async fn run() -> Result<()> {
         let config = config.clone();
         tokio::spawn(tick_every(shutdown.clone(), Duration::from_secs(14400), move || {
             let config = config.clone();
-            async move { config.clear_rpc_server_failure() }
+            async move {
+                let cfg = config.load();
+                if cfg.rpc_last_failed.is_some() {
+                    let mut new = (**cfg).clone();
+                    new.rpc_last_failed = None;
+                    new.rpc_current = None;
+                    config.store(Arc::new(new));
+                }
+            }
         }));
     }
 
@@ -223,7 +239,10 @@ pub async fn run() -> Result<()> {
     // Graceful shutdown
     tracing::info!("Shutting down...");
     rpc_client.client_stop().await.ok();
-    config.save_client_login().ok();
+    {
+        let cfg = config.load();
+        cfg.save_client_login().ok();
+    }
 
     Ok(())
 }

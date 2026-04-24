@@ -7,9 +7,9 @@ use crate::hvfile::HVFile;
 use crate::stats::Stats;
 use crate::utils;
 use crate::cache::persistent::PersistentCacheState;
+use arc_swap::ArcSwap;
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 pub const LRU_CACHE_SIZE: usize = 1_048_576;
@@ -19,9 +19,8 @@ type RescanResult = (Box<[u16; LRU_CACHE_SIZE]>, usize, u32, u64, HashMap<String
 
 #[derive(Debug)]
 pub struct CacheHandler {
-    pub config: Arc<Config>,
+    pub config: Arc<ArcSwap<Config>>,
     pub stats: Arc<Stats>,
-    cache_dir: PathBuf,
     pub lru_cache_table: Box<[u16; LRU_CACHE_SIZE]>,
     pub lru_clear_pointer: usize,
     pub cache_count: u32,
@@ -32,11 +31,11 @@ pub struct CacheHandler {
 }
 
 impl CacheHandler {
-    pub fn new(config: Arc<Config>, stats: Arc<Stats>) -> Result<Self> {
-        let cache_dir = config.cache_dir.clone();
+    pub fn new(config: Arc<ArcSwap<Config>>, stats: Arc<Stats>) -> Result<Self> {
+        let cfg = config.load();
 
         // Clean up orphaned temp files (matching Java)
-        for entry in utils::list_sorted_files(&config.temp_dir) {
+        for entry in utils::list_sorted_files(&cfg.temp_dir) {
             if entry.is_file() {
                 let name = entry.file_name().and_then(|n| n.to_str()).unwrap_or("");
                 if !name.starts_with("log_") && !name.starts_with("pcache_") && name != "client_login" {
@@ -48,8 +47,8 @@ impl CacheHandler {
         // Try persistent load first
         let mut cache_loaded = false;
         let (lru_cache_table, lru_clear_pointer, cache_count, cache_size, static_range_oldest) =
-            if !config.rescan_cache {
-                if let Some(state) = Self::try_load_persistent(&config) {
+            if !cfg.rescan_cache {
+                if let Some(state) = Self::try_load_persistent(&cfg) {
                     tracing::info!("Successfully loaded persistent cache data");
                     cache_loaded = true;
                     let mut arr = Box::new([0u16; LRU_CACHE_SIZE]);
@@ -57,23 +56,22 @@ impl CacheHandler {
                     arr[..len].copy_from_slice(&state.lru_cache_table[..len]);
                     (arr, state.lru_clear_pointer, state.cache_count, state.cache_size, state.static_range_ages)
                 } else {
-                    Self::startup_cache_cleanup(&config)?;
-                    Self::full_rescan(&config, &stats)?
+                    Self::startup_cache_cleanup(&cfg)?;
+                    Self::full_rescan(&cfg, &stats)?
                 }
             } else {
-                Self::startup_cache_cleanup(&config)?;
-                Self::full_rescan(&config, &stats)?
+                Self::startup_cache_cleanup(&cfg)?;
+                Self::full_rescan(&cfg, &stats)?
             };
 
-        Self::delete_persistent_data(&config);
+        Self::delete_persistent_data(&cfg);
 
         stats.set_cache_count(cache_count);
-        stats.set_cache_size(Self::cache_size_with_overhead(cache_size, cache_count, &config));
+        stats.set_cache_size(Self::cache_size_with_overhead(cache_size, cache_count, &cfg));
 
         Ok(Self {
             config,
             stats,
-            cache_dir,
             lru_cache_table,
             lru_clear_pointer,
             cache_count,
@@ -218,7 +216,8 @@ impl CacheHandler {
     }
 
     pub fn get_cache_size_with_overhead(&self) -> u64 {
-        Self::cache_size_with_overhead(self.cache_size, self.cache_count, &self.config)
+        let cfg = self.config.load();
+        Self::cache_size_with_overhead(self.cache_size, self.cache_count, &cfg)
     }
 
     pub fn is_file_verification_on_cooldown(&mut self) -> bool {
@@ -247,7 +246,8 @@ impl CacheHandler {
 
     pub fn delete_file_from_cache(&mut self, fileid: &str) -> Result<()> {
         if let Some(hv) = HVFile::from_fileid(fileid) {
-            let path = hv.cache_path(&self.cache_dir);
+            let cfg = self.config.load();
+            let path = hv.cache_path(&cfg.cache_dir);
             if path.exists() {
                 fs::remove_file(&path)?;
                 self.cache_count = self.cache_count.saturating_sub(1);

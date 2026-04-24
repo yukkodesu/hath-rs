@@ -1,17 +1,18 @@
 use crate::config::Config;
 use crate::error::{HathError, Result};
 use crate::rpc::{self, ServerResponse, ResponseStatus, Action};
+use arc_swap::ArcSwap;
 use reqwest::Client;
 use std::sync::Arc;
 
 /// Shared HTTP client for RPC calls.
 pub struct RpcClient {
     http: Client,
-    config: Arc<Config>,
+    config: Arc<ArcSwap<Config>>,
 }
 
 impl RpcClient {
-    pub fn new(config: Arc<Config>) -> Result<Self> {
+    pub fn new(config: Arc<ArcSwap<Config>>) -> Result<Self> {
         let http = Client::builder()
             .user_agent(format!("Hentai@Home {}", rpc::CLIENT_VERSION))
             .build()
@@ -21,7 +22,8 @@ impl RpcClient {
 
     /// Execute an RPC call and return the parsed response.
     pub async fn call(&self, act: Action, add: &str) -> Result<ServerResponse> {
-        let url = rpc::make_rpc_url(act, add, &self.config)?;
+        let cfg = self.config.load();
+        let url = rpc::make_rpc_url(act, add, &cfg)?;
         let host = url.host_str().unwrap_or("unknown").to_string();
 
         let resp = self.http.get(url).send().await
@@ -33,7 +35,11 @@ impl RpcClient {
         let parsed = rpc::parse_server_response(&body, &host);
 
         if parsed.status == ResponseStatus::Null {
-            self.config.mark_rpc_server_failure(parsed.fail_host.as_deref().unwrap_or(&host));
+            let fail_host = parsed.fail_host.as_deref().unwrap_or(&host);
+            let mut new = (**cfg).clone();
+            new.rpc_last_failed = Some(fail_host.to_string());
+            new.rpc_current = None;
+            self.config.store(Arc::new(new));
         }
 
         Ok(parsed)

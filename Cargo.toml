@@ -33,6 +33,7 @@ http-body-util = "0.1"
 regex = "1"
 futures-util = "0.3"
 fs2 = "0.4"
+arc-swap = "1.9.1"
 
 [dev-dependencies]
 tempfile = "3"
