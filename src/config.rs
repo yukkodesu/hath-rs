@@ -1,0 +1,395 @@
+use crate::error::{HathError, Result};
+use crate::types::{ClientId, ClientKey};
+use clap::Parser;
+use rand::Rng;
+use std::collections::HashMap;
+use std::net::IpAddr;
+use std::path::PathBuf;
+
+#[derive(Parser, Debug)]
+#[command(name = "hath-rs", version = "1.6.5")]
+pub struct CliArgs {
+    #[arg(long, env = "HATH_CLIENT_ID")]
+    pub client_id: Option<u32>,
+    #[arg(long, env = "HATH_CLIENT_KEY")]
+    pub client_key: Option<String>,
+    #[arg(long, env = "HATH_DATA_DIR", default_value = "data")]
+    pub data_dir: String,
+    #[arg(long, env = "HATH_LOG_DIR", default_value = "log")]
+    pub log_dir: String,
+    #[arg(long, env = "HATH_CACHE_DIR", default_value = "cache")]
+    pub cache_dir: String,
+    #[arg(long, env = "HATH_TEMP_DIR", default_value = "tmp")]
+    pub temp_dir: String,
+    #[arg(long, env = "HATH_DOWNLOAD_DIR", default_value = "download")]
+    pub download_dir: String,
+    #[arg(long, env = "HATH_PORT")]
+    pub port: Option<u16>,
+    #[arg(long, env = "HATH_VERIFY_CACHE")]
+    pub verify_cache: Option<bool>,
+    #[arg(long, env = "HATH_USE_LESS_MEMORY")]
+    pub use_less_memory: Option<bool>,
+    #[arg(long, env = "HATH_DISABLE_LOGGING")]
+    pub disable_logging: Option<bool>,
+    #[arg(long, env = "HATH_DISABLE_BWM")]
+    pub disable_bwm: Option<bool>,
+    #[arg(long, env = "HATH_DISABLE_DOWNLOAD_BWM")]
+    pub disable_download_bwm: Option<bool>,
+    #[arg(long, env = "HATH_DISABLE_FILE_VERIFICATION")]
+    pub disable_file_verification: Option<bool>,
+    #[arg(long, env = "HATH_DISABLE_IP_ORIGIN_CHECK")]
+    pub disable_ip_origin_check: Option<bool>,
+    #[arg(long, env = "HATH_DISABLE_FLOOD_CONTROL")]
+    pub disable_flood_control: Option<bool>,
+    #[arg(long, env = "HATH_SKIP_FREE_SPACE_CHECK")]
+    pub skip_free_space_check: Option<bool>,
+    #[arg(long, env = "HATH_FLUSH_LOGS")]
+    pub flush_logs: Option<bool>,
+    #[arg(long, env = "HATH_MAX_CONNECTIONS")]
+    pub max_connections: Option<u32>,
+    #[arg(long, env = "HATH_FILESYSTEM_BLOCKSIZE")]
+    pub filesystem_blocksize: Option<u64>,
+    #[arg(long, env = "HATH_IMAGE_PROXY_TYPE")]
+    pub image_proxy_type: Option<String>,
+    #[arg(long, env = "HATH_IMAGE_PROXY_HOST")]
+    pub image_proxy_host: Option<String>,
+    #[arg(long, env = "HATH_IMAGE_PROXY_PORT")]
+    pub image_proxy_port: Option<u16>,
+}
+
+#[derive(Debug)]
+pub struct Config {
+    pub client_id: ClientId,
+    pub client_key: ClientKey,
+    pub data_dir: PathBuf,
+    pub log_dir: PathBuf,
+    pub cache_dir: PathBuf,
+    pub temp_dir: PathBuf,
+    pub download_dir: PathBuf,
+    pub client_port: u16,
+
+    pub server_time_delta: i64,
+    pub throttle_bytes: u32,
+    pub disklimit_bytes: u64,
+    pub diskremaining_bytes: u64,
+    pub filesystem_blocksize: u64,
+    pub max_allowed_filesize: u64,
+    pub max_filename_length: u32,
+
+    pub rpc_servers: Vec<IpAddr>,
+    pub rpc_port: u16,
+    pub rpc_path: String,
+    pub rpc_current: std::sync::RwLock<Option<String>>,
+    pub rpc_last_failed: std::sync::RwLock<Option<String>>,
+
+    pub static_ranges: HashMap<String, u8>,
+    pub static_range_count: u32,
+
+    pub verify_cache: bool,
+    pub rescan_cache: bool,
+    pub use_less_memory: bool,
+    pub disable_logging: bool,
+    pub disable_bwm: bool,
+    pub disable_download_bwm: bool,
+    pub disable_file_verification: bool,
+    pub disable_ip_origin_check: bool,
+    pub disable_flood_control: bool,
+    pub skip_free_space_check: bool,
+    pub flush_logs: bool,
+    pub warn_new_client: bool,
+
+    pub image_proxy_type: Option<String>,
+    pub image_proxy_host: Option<String>,
+    pub image_proxy_port: Option<u16>,
+
+    pub client_host: String,
+    pub override_conns: u32,
+}
+
+impl Config {
+    /// Load config from CLI args, env vars, and client_login file.
+    /// Priority: CLI args > env vars > client_login file.
+    pub fn load(args: CliArgs) -> Result<Self> {
+        // Resolve credentials: CLI/env > client_login file
+        let (client_id, client_key) = if let (Some(id), Some(ref key_str)) = (args.client_id, args.client_key) {
+            let key = ClientKey::new(key_str)
+                .ok_or_else(|| HathError::Config("client key must be exactly 20 alphanumeric characters".into()))?;
+            (ClientId(id), key)
+        } else {
+            // Fallback: try client_login file in data dir
+            let login_file = PathBuf::from(&args.data_dir).join("client_login");
+            if login_file.exists() {
+                let content = std::fs::read_to_string(&login_file)
+                    .map_err(|e| HathError::Config(format!("cannot read client_login: {}", e)))?;
+                if let Some((id_str, key_str)) = content.trim().split_once('-') {
+                    let id: u32 = id_str.parse()
+                        .map_err(|_| HathError::Config("invalid client ID in client_login".into()))?;
+                    let key = ClientKey::new(key_str.trim())
+                        .ok_or_else(|| HathError::Config("invalid client key in client_login".into()))?;
+                    (ClientId(id), key)
+                } else {
+                    return Err(HathError::Config("malformed client_login file".into()));
+                }
+            } else {
+                return Err(HathError::Config(
+                    "No credentials found. Provide --client-id/--client-key or place client_login file in data dir.".into()
+                ));
+            }
+        };
+
+        Ok(Self {
+            client_id,
+            client_key,
+            data_dir: PathBuf::from(&args.data_dir),
+            log_dir: PathBuf::from(&args.log_dir),
+            cache_dir: PathBuf::from(&args.cache_dir),
+            temp_dir: PathBuf::from(&args.temp_dir),
+            download_dir: PathBuf::from(&args.download_dir),
+            client_port: args.port.unwrap_or(0),
+            server_time_delta: 0,
+            throttle_bytes: 0,
+            disklimit_bytes: 0,
+            diskremaining_bytes: 0,
+            filesystem_blocksize: args.filesystem_blocksize.unwrap_or(4096),
+            max_allowed_filesize: 1073741824,
+            max_filename_length: 125,
+            rpc_servers: Vec::new(),
+            rpc_port: 80,
+            rpc_path: "15/rpc?".to_string(),
+            rpc_current: std::sync::RwLock::new(None),
+            rpc_last_failed: std::sync::RwLock::new(None),
+            static_ranges: HashMap::new(),
+            static_range_count: 0,
+            verify_cache: args.verify_cache.unwrap_or(false),
+            rescan_cache: args.verify_cache.unwrap_or(false),
+            use_less_memory: args.use_less_memory.unwrap_or(false),
+            disable_logging: args.disable_logging.unwrap_or(false),
+            disable_bwm: args.disable_bwm.unwrap_or(false),
+            disable_download_bwm: args.disable_download_bwm.unwrap_or(false),
+            disable_file_verification: args.disable_file_verification.unwrap_or(false),
+            disable_ip_origin_check: args.disable_ip_origin_check.unwrap_or(false),
+            disable_flood_control: args.disable_flood_control.unwrap_or(false),
+            skip_free_space_check: args.skip_free_space_check.unwrap_or(false),
+            flush_logs: args.flush_logs.unwrap_or(false),
+            warn_new_client: false,
+            image_proxy_type: args.image_proxy_type,
+            image_proxy_host: args.image_proxy_host,
+            image_proxy_port: args.image_proxy_port,
+            client_host: String::new(),
+            override_conns: args.max_connections.unwrap_or(0),
+        })
+    }
+
+    pub fn server_time(&self) -> i64 {
+        chrono::Utc::now().timestamp() + self.server_time_delta
+    }
+
+    pub fn max_connections(&self) -> u32 {
+        if self.override_conns > 0 {
+            self.override_conns
+        } else {
+            20 + (self.throttle_bytes / 10000).min(480)
+        }
+    }
+
+    pub fn get_rpc_host(&self) -> String {
+        let mut current = self.rpc_current.write().unwrap();
+        if current.is_none() {
+            if self.rpc_servers.is_empty() {
+                return "rpc.hentaiathome.net".to_string();
+            }
+            let idx = rand::rng().next_u32() as usize % self.rpc_servers.len();
+            let idx = {
+                let last_failed = self.rpc_last_failed.read().unwrap();
+                if let Some(ref failed) = *last_failed {
+                    if self.rpc_servers[idx].to_string().to_lowercase() == *failed && self.rpc_servers.len() > 1 {
+                        (idx + 1) % self.rpc_servers.len()
+                    } else {
+                        idx
+                    }
+                } else {
+                    idx
+                }
+            };
+            let selected = self.rpc_servers[idx].to_string().to_lowercase();
+            *current = Some(if self.rpc_port == 80 {
+                selected
+            } else {
+                format!("{}:{}", selected, self.rpc_port)
+            });
+        }
+        current.clone().unwrap_or_else(|| "rpc.hentaiathome.net".to_string())
+    }
+
+    pub fn mark_rpc_server_failure(&self, fail_host: &str) {
+        let mut last_failed = self.rpc_last_failed.write().unwrap();
+        *last_failed = Some(fail_host.to_string());
+        let mut current = self.rpc_current.write().unwrap();
+        *current = None;
+    }
+
+    pub fn clear_rpc_server_failure(&self) {
+        let mut last_failed = self.rpc_last_failed.write().unwrap();
+        if last_failed.is_some() {
+            *last_failed = None;
+            let mut current = self.rpc_current.write().unwrap();
+            *current = None;
+        }
+    }
+
+    pub fn apply_server_settings(&mut self, lines: &[String]) {
+        for line in lines {
+            if let Some((key, value)) = line.split_once('=') {
+                self.apply_setting(&key.to_lowercase(), value);
+            }
+        }
+    }
+
+    fn apply_setting(&mut self, setting: &str, value: &str) {
+        match setting {
+            "min_client_build" => {
+                if let Ok(build) = value.parse::<i32>() {
+                    if build > 178 {
+                        tracing::error!("Client too old! Required build: {}, our build: 178", build);
+                    }
+                }
+            }
+            "cur_client_build" => {
+                if let Ok(build) = value.parse::<i32>() {
+                    if build > 178 { self.warn_new_client = true; }
+                }
+            }
+            "server_time" => {
+                if let Ok(st) = value.parse::<i64>() {
+                    self.server_time_delta = st - chrono::Utc::now().timestamp();
+                }
+            }
+            "rpc_server_port" => self.rpc_port = value.parse().unwrap_or(80),
+            "rpc_server_ip" => {
+                self.rpc_servers = value.split(';')
+                    .filter_map(|s| s.trim().parse::<IpAddr>().ok())
+                    .collect();
+            }
+            "rpc_path" => self.rpc_path = value.to_string(),
+            "host" => self.client_host = value.to_string(),
+            "port" => { if self.client_port == 0 { self.client_port = value.parse().unwrap_or(0); } }
+            "throttle_bytes" => self.throttle_bytes = value.parse().unwrap_or(0),
+            "disklimit_bytes" => {
+                let new_limit: u64 = value.parse().unwrap_or(0);
+                if new_limit >= self.disklimit_bytes { self.disklimit_bytes = new_limit; }
+            }
+            "diskremaining_bytes" => self.diskremaining_bytes = value.parse().unwrap_or(0),
+            "filesystem_blocksize" => {
+                let bs: u64 = value.parse().unwrap_or(4096);
+                self.filesystem_blocksize = bs.clamp(1, 65536);
+            }
+            "rescan_cache" => self.rescan_cache = value == "true",
+            "verify_cache" => { self.verify_cache = value == "true"; self.rescan_cache = value == "true"; }
+            "use_less_memory" => self.use_less_memory = value == "true",
+            "disable_logging" => self.disable_logging = value == "true",
+            "disable_bwm" => { self.disable_bwm = value == "true"; self.disable_download_bwm = value == "true"; }
+            "disable_download_bwm" => self.disable_download_bwm = value == "true",
+            "disable_file_verification" => self.disable_file_verification = value == "true",
+            "disable_ip_origin_check" => self.disable_ip_origin_check = value == "true",
+            "disable_flood_control" => self.disable_flood_control = value == "true",
+            "skip_free_space_check" => self.skip_free_space_check = value == "true",
+            "flush_logs" => self.flush_logs = value == "true",
+            "max_connections" => self.override_conns = value.parse().unwrap_or(0),
+            "max_allowed_filesize" => self.max_allowed_filesize = value.parse().unwrap_or(1073741824),
+            "max_filename_length" => self.max_filename_length = value.parse().unwrap_or(125),
+            "static_ranges" => {
+                self.static_ranges.clear();
+                for s in value.split(';') {
+                    if s.len() == 4 { self.static_ranges.insert(s.to_string(), 1); }
+                }
+                self.static_range_count = self.static_ranges.len() as u32;
+            }
+            "static_range_count" => self.static_range_count = value.parse().unwrap_or(self.static_range_count),
+            "cache_dir" => self.cache_dir = PathBuf::from(value),
+            "temp_dir" => self.temp_dir = PathBuf::from(value),
+            "data_dir" => self.data_dir = PathBuf::from(value),
+            "log_dir" => self.log_dir = PathBuf::from(value),
+            "download_dir" => self.download_dir = PathBuf::from(value),
+            "image_proxy_type" => self.image_proxy_type = Some(value.to_lowercase()),
+            "image_proxy_host" => self.image_proxy_host = Some(value.to_lowercase()),
+            "image_proxy_port" => self.image_proxy_port = value.parse().ok(),
+            _ => tracing::warn!("Unknown setting {} = {}", setting, value),
+        }
+        tracing::debug!("Setting altered: {}={}", setting, value);
+    }
+
+    pub fn is_static_range(&self, range: &str) -> bool {
+        self.static_ranges.contains_key(range)
+    }
+
+    pub fn load_client_login(&self) -> Result<Option<(ClientId, ClientKey)>> {
+        let login_file = self.data_dir.join("client_login");
+        if !login_file.exists() { return Ok(None); }
+        let content = crate::utils::read_string_file(&login_file)?;
+        if let Some((id_str, key_str)) = content.trim().split_once('-') {
+            let id: u32 = id_str.parse().map_err(|_| HathError::Config("invalid client ID".into()))?;
+            let key = ClientKey::new(key_str.trim())
+                .ok_or_else(|| HathError::Config("invalid client key format".into()))?;
+            Ok(Some((ClientId(id), key)))
+        } else {
+            Err(HathError::Config("malformed client_login file".into()))
+        }
+    }
+
+    pub fn save_client_login(&self) -> Result<()> {
+        crate::utils::ensure_dir(&self.data_dir)?;
+        crate::utils::write_string_file(
+            &self.data_dir.join("client_login"),
+            &format!("{}-{}", self.client_id.0, self.client_key.as_str()),
+        )?;
+        Ok(())
+    }
+
+    pub fn initialize_directories(&self) -> Result<()> {
+        for dir in [&self.data_dir, &self.log_dir, &self.cache_dir, &self.temp_dir, &self.download_dir] {
+            crate::utils::ensure_dir(dir)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    fn test_cli() -> CliArgs {
+        CliArgs::try_parse_from([
+            "hath-rs", "--client-id", "12345", "--client-key", "abcde12345abcde12345",
+        ]).unwrap()
+    }
+
+    #[test]
+    fn test_load_valid() {
+        let config = Config::load(test_cli()).unwrap();
+        assert_eq!(config.client_id.0, 12345);
+    }
+
+    #[test]
+    fn test_apply_server_time() {
+        let mut config = Config::load(test_cli()).unwrap();
+        let st = chrono::Utc::now().timestamp();
+        config.apply_server_settings(&[format!("server_time={}", st)]);
+        assert!(config.server_time_delta.abs() < 5);
+    }
+
+    #[test]
+    fn test_static_ranges() {
+        let mut config = Config::load(test_cli()).unwrap();
+        config.apply_server_settings(&["static_ranges=abcd;ef01".to_string()]);
+        assert!(config.is_static_range("abcd"));
+        assert!(!config.is_static_range("9999"));
+    }
+
+    #[test]
+    fn test_max_connections() {
+        let mut config = Config::load(test_cli()).unwrap();
+        config.throttle_bytes = 1_000_000;
+        assert_eq!(config.max_connections(), 120);
+    }
+}
