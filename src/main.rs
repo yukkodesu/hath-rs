@@ -6,6 +6,7 @@ pub mod logging;
 pub mod stats;
 pub mod config;
 pub mod rpc;
+pub mod rpc_client;
 
 fn main() {
     println!("Hentai@Home Rust client starting...");
