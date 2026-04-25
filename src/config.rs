@@ -194,25 +194,44 @@ impl Config {
         }
     }
 
-    /// Pick an RPC host. Uses cached `rpc_current` if set, otherwise selects
-    /// a random server from `rpc_servers`. Callers should use rcu to persist
-    /// the chosen host back into `rpc_current`.
+    /// Pick an RPC host. Uses cached `rpc_current` if set and not last-failed,
+    /// otherwise selects a random server from `rpc_servers`.
     pub fn get_rpc_host(&self) -> String {
+        // If we have a cached host and it hasn't failed, reuse it.
         if let Some(ref host) = self.rpc_current {
-            return host.clone();
+            if let Some(ref failed) = self.rpc_last_failed
+                && *host == *failed {
+                    // Cached host is the failed one — fall through to random selection
+                    tracing::debug!("{} was marked as last failed (from cache)", failed);
+                } else {
+                    return host.clone();
+                }
         }
         if self.rpc_servers.is_empty() {
             return "rpc.hentaiathome.net".to_string();
         }
-        // Pick a random server, avoiding the last failed one if possible
-        let mut idx = rand::rng().next_u32() as usize % self.rpc_servers.len();
-        if let Some(ref failed) = self.rpc_last_failed
-            && self.rpc_servers[idx].to_string().to_lowercase() == *failed
-            && self.rpc_servers.len() > 1
-        {
-            idx = (idx + 1) % self.rpc_servers.len();
+        // Pick a random server and random scan direction, avoiding last failed.
+        // Java: rpcServerSelector = random index, scanDirection = Math.random() < 0.5 ? -1 : 1
+        let mut idx: isize = (rand::rng().next_u32() as usize % self.rpc_servers.len()) as isize;
+        let dir: isize = if rand::rng().next_u32() & 1 == 0 { -1 } else { 1 };
+        let len = self.rpc_servers.len() as isize;
+        let selected;
+
+        loop {
+            let candidate = self.rpc_servers[((len + idx) % len) as usize].to_string().to_lowercase();
+
+            if let Some(ref failed) = self.rpc_last_failed
+                && candidate == *failed {
+                    tracing::debug!("{} was marked as last failed", failed);
+                    idx += dir;
+                    continue;
+                }
+
+            selected = candidate;
+            tracing::debug!("Selected rpcServerCurrent={}", selected);
+            break;
         }
-        let selected = self.rpc_servers[idx].to_string().to_lowercase();
+
         if self.rpc_port == 80 {
             selected
         } else {
@@ -228,8 +247,13 @@ impl Config {
         match setting {
             "min_client_build" => {
                 if let Ok(build) = value.parse::<i32>()
-                    && build > 178 {
-                        tracing::error!("Client too old! Required build: {}, our build: 178", build);
+                    && build > crate::rpc::CLIENT_BUILD {
+                        tracing::error!(
+                            "Your client is too old to connect to the Hentai@Home Network. \
+                             Required build: {}, our build: {}. Please download a newer version.",
+                            build, crate::rpc::CLIENT_BUILD
+                        );
+                        std::process::exit(1);
                     }
             }
             "cur_client_build" => {

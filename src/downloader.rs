@@ -49,9 +49,19 @@ impl FileDownloader {
     }
 
     pub async fn download(&self) -> Result<Option<BytesMut>> {
-        let client = Client::builder()
+        let mut builder = Client::builder()
             .user_agent(format!("Hentai@Home {}", crate::rpc::CLIENT_VERSION))
-            .build()
+            // Java: setConnectTimeout(5000) — 5s connect timeout
+            .connect_timeout(std::time::Duration::from_secs(5));
+
+        // Java: SOCKS/HTTP proxy support via Settings.getImageProxy()
+        if self.allow_proxy
+            && let Ok(proxy_url) = std::env::var("HATH_PROXY")
+                && let Ok(proxy) = reqwest::Proxy::all(&proxy_url) {
+                    builder = builder.proxy(proxy);
+                }
+
+        let client = builder.build()
             .map_err(|e| HathError::Network(e.to_string()))?;
 
         loop {
@@ -70,6 +80,8 @@ impl FileDownloader {
 
     async fn attempt_download(&self, client: &Client) -> Result<Option<BytesMut>> {
         let mut resp = client.get(self.source.clone())
+            // Java: setRequestProperty("Connection", "Close")
+            .header("Connection", "Close")
             .timeout(std::time::Duration::from_millis(self.timeout_ms))
             .send().await
             .map_err(|e| HathError::Network(e.to_string()))?;

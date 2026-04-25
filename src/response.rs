@@ -40,6 +40,16 @@ pub fn bad_request_response() -> Result<Response<StreamingBody>> {
     text_response(StatusCode::BAD_REQUEST, "Bad Request")
 }
 
+pub fn method_not_allowed_response() -> Result<Response<StreamingBody>> {
+    Response::builder()
+        .status(StatusCode::METHOD_NOT_ALLOWED)
+        .header(header::ALLOW, "GET, HEAD")
+        .header(header::CONTENT_TYPE, "text/html; charset=iso-8859-1")
+        .header(header::CONNECTION, "close")
+        .body(StreamingBody::new(b"Method Not Allowed".to_vec(), None))
+        .map_err(HathError::Http)
+}
+
 pub fn text_response(status: StatusCode, text: &str) -> Result<Response<StreamingBody>> {
     let len = text.len();
     let mut builder = Response::builder()
@@ -57,9 +67,11 @@ pub fn text_response(status: StatusCode, text: &str) -> Result<Response<Streamin
 }
 
 pub fn redirect_response(location: &str) -> Result<Response<StreamingBody>> {
-    // Java: empty body with 301 + Location header, no Content-Length
+    // Java: HTTPSession always sends Content-Type regardless of status code.
+    // Content-Type: text/html; charset=iso-8859-1 even on 301 redirect.
     Response::builder()
         .status(StatusCode::MOVED_PERMANENTLY)
+        .header(header::CONTENT_TYPE, "text/html; charset=iso-8859-1")
         .header(header::LOCATION, location)
         .header(header::CONNECTION, "close")
         .body(StreamingBody::new(vec![], None))
@@ -71,7 +83,7 @@ pub fn robots_response() -> Result<Response<StreamingBody>> {
     let len = body.len();
     Response::builder()
         .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/plain")
+        .header(header::CONTENT_TYPE, "text/plain; charset=iso-8859-1")
         .header(header::CONTENT_LENGTH, len)
         .header(header::CONNECTION, "close")
         .body(StreamingBody::new(body.to_vec(), None))

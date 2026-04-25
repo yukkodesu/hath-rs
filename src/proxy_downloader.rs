@@ -1,7 +1,9 @@
+use crate::cache::CacheHandler;
 use crate::config::Config;
 use crate::error::{HathError, Result};
 use crate::hvfile::HVFile;
 use crate::utils;
+use rand::Rng;
 use reqwest::{Client, Url};
 use sha1::Digest;
 use std::io::{Read, Seek, SeekFrom};
@@ -36,23 +38,51 @@ pub struct ProxyFileDownloader {
 impl ProxyFileDownloader {
     /// Initialize with a list of upstream source URLs.
     /// Returns a handle that can be used to stream data to the client.
-    pub async fn new(fileid: &str, sources: &[Url], config: &Config) -> Result<Self> {
+    pub async fn new(
+        fileid: &str,
+        sources: &[Url],
+        config: &Config,
+        cache_handler: Option<Arc<CacheHandler>>,
+    ) -> Result<Self> {
         let hv_file = HVFile::from_fileid(fileid)
             .ok_or_else(|| HathError::Parse(format!("invalid fileid: {}", fileid)))?;
 
-        let client = Client::builder()
+        let mut builder = Client::builder()
             .user_agent(format!("Hentai@Home {}", crate::rpc::CLIENT_VERSION))
-            .build()
+            .connect_timeout(std::time::Duration::from_secs(5));
+
+        // Java: proxy support via Settings.getImageProxy()
+        if let (Some(proxy_type), Some(proxy_host), Some(proxy_port)) =
+            (&config.image_proxy_type, &config.image_proxy_host, config.image_proxy_port)
+        {
+            let proxy_url = format!("{}://{}:{}", proxy_type, proxy_host, proxy_port);
+            if let Ok(proxy) = reqwest::Proxy::all(&proxy_url) {
+                builder = builder.proxy(proxy);
+            }
+        }
+
+        let client = builder.build()
             .map_err(|e| HathError::Network(e.to_string()))?;
 
         let mut last_err = None;
 
         for source in sources {
-            match Self::try_source(&client, source, &hv_file, config).await {
-                Ok(this) => return Ok(this),
-                Err(e) => {
-                    last_err = Some(e);
-                    continue;
+            // Java: ProxyFileDownloader has inner retry loop (3 attempts per source)
+            for attempt in 0..3u32 {
+                match Self::try_source(&client, source, &hv_file, config, cache_handler.clone()).await {
+                    Ok(this) => return Ok(this),
+                    Err(e) => {
+                        if attempt < 2 {
+                            tracing::debug!(
+                                "Proxy download attempt {} failed for {}: {}, retrying...",
+                                attempt + 1, source, e
+                            );
+                        }
+                        last_err = Some(e);
+                        if attempt < 2 {
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        }
+                    }
                 }
             }
         }
@@ -65,6 +95,7 @@ impl ProxyFileDownloader {
         source: &Url,
         hv_file: &HVFile,
         config: &Config,
+        cache_handler: Option<Arc<CacheHandler>>,
     ) -> Result<Self> {
         // Hath-Request header: "{cid}-{SHA1(clientKey + fileid)}"
         let hath_request = format!(
@@ -101,10 +132,12 @@ impl ProxyFileDownloader {
             )));
         }
 
-        // Create temp file
+        // Java: File.createTempFile("proxyfile_", "", tempDir) — random suffix prevents
+        // concurrent requests for the same fileid from clobbering each other.
+        let random_suffix: u32 = rand::rng().next_u32();
         let temp_file = config
             .temp_dir
-            .join(format!("proxyfile_{}", hv_file.fileid().as_str()));
+            .join(format!("proxyfile_{}_{:08x}", hv_file.fileid().as_str(), random_suffix));
         let write_offset = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let notify = Arc::new(Notify::new());
         let body_done_notify = Arc::new(Notify::new());
@@ -125,7 +158,6 @@ impl ProxyFileDownloader {
         let wo = write_offset.clone();
         let tf = temp_file.clone();
         let not = notify.clone();
-        let succ = this.success.clone();
         let bdn = body_done_notify.clone();
         let hash = hv_file.hash.clone();
         let expected_size = hv_file.size as u64;
@@ -161,20 +193,7 @@ impl ProxyFileDownloader {
 
             drop(file);
 
-            // Verify hash and import to cache (before deleting temp).
-            let digest = utils::hex_encode(&sha1.finalize());
-            if downloaded == expected_size
-                && digest == hash.as_str()
-                && let Some(hv) = HVFile::from_fileid(fileid_owned.as_str())
-            {
-                let cache_path = hv.cache_path(&cache_dir);
-                let _ = utils::ensure_dir(cache_path.parent().unwrap());
-                if std::fs::copy(&tf, &cache_path).is_ok() {
-                    *succ.lock().unwrap() = true;
-                }
-            }
-
-            // Wake the body so it can read remaining chunks.
+            // Final wake so the body can read any remaining chunks.
             not.notify_waiters();
 
             // Wait for the body to finish reading, then delete temp.
@@ -189,6 +208,21 @@ impl ProxyFileDownloader {
                         fileid_owned
                     );
                 }
+            }
+
+            // Java: checkFinalizeDownloadedFile — import to cache after body finishes reading.
+            // Use copy (not rename) so the body can still read from temp while we import.
+            let digest = utils::hex_encode(&sha1.finalize());
+            if downloaded == expected_size
+                && digest == hash.as_str()
+                && let Some(hv) = HVFile::from_fileid(fileid_owned.as_str())
+            {
+                let cache_path = hv.cache_path(&cache_dir);
+                if let Ok(()) = utils::ensure_dir(cache_path.parent().unwrap())
+                    && std::fs::copy(&tf, &cache_path).is_ok()
+                        && let Some(ref cache) = cache_handler {
+                            cache.register_proxy_file(&hv);
+                        }
             }
             utils::remove_file(&tf);
         });
