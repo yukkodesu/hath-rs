@@ -6,13 +6,15 @@ use arc_swap::ArcSwap;
 use std::fs;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 /// Java: CachePruner — runs in a background task, periodically checking
 /// whether the cache has exceeded the disk limit and pruning old files.
+///
+/// Takes `Arc<CacheHandler>` directly — no outer Mutex needed because
+/// CacheHandler manages its own fine-grained locks internally.
 pub struct CachePruner {
-    cache: Arc<Mutex<CacheHandler>>,
+    cache: Arc<CacheHandler>,
     config: Arc<ArcSwap<Config>>,
     /// Seconds between cache checks when not over limit.
     /// Adjusted dynamically based on free space.
@@ -21,7 +23,7 @@ pub struct CachePruner {
 }
 
 impl CachePruner {
-    pub fn new(cache: Arc<Mutex<CacheHandler>>, config: Arc<ArcSwap<Config>>, shutdown: CancellationToken) -> Self {
+    pub fn new(cache: Arc<CacheHandler>, config: Arc<ArcSwap<Config>>, shutdown: CancellationToken) -> Self {
         Self { cache, config, check_frequency: 60, shutdown }
     }
 
@@ -35,31 +37,29 @@ impl CachePruner {
                 _ = tokio::time::sleep(Duration::from_secs(1)) => {}
             }
 
-            // Phase 1: lock → check cache state → get action → unlock.
+            // Phase 1: check cache state (brief internal locks on static_range_oldest).
             let cfg = self.config.load();
             let action = {
-                let cache = self.cache.lock().await;
-                let cache_size = cache.get_cache_size_with_overhead();
+                let cache_size = self.cache.get_cache_size_with_overhead();
                 if cache_size > cfg.disklimit_bytes {
                     let pct = 100.0 * (cache_size as f64 / cfg.disklimit_bytes as f64) - 100.0;
                     tracing::info!("Cache is {:.3}% over limit, aggressive pruning", pct);
-                    cache.check_prune_action(&cfg)
+                    self.cache.check_prune_action(&cfg)
                 } else if cache_check_ticks < self.check_frequency {
                     cache_check_ticks += 1;
                     PruneAction::NoPrune { frequency: self.check_frequency }
                 } else {
                     cache_check_ticks = 0;
-                    cache.check_prune_action(&cfg)
+                    self.cache.check_prune_action(&cfg)
                 }
-            }; // lock released here
+            };
 
             match action {
                 PruneAction::Prune(plan) => {
-                    // Phase 2: execute I/O without holding the lock.
+                    // Phase 2: execute I/O without holding any locks.
                     let result = Self::execute_prune(&plan);
-                    // Phase 3: lock → apply result → unlock.
-                    let mut cache = self.cache.lock().await;
-                    cache.apply_prune_result(result);
+                    // Phase 3: apply result (brief internal lock on static_range_oldest).
+                    self.cache.apply_prune_result(result);
                     self.check_frequency = 0; // Re-check immediately after pruning.
                 }
                 PruneAction::NoPrune { frequency } => {
@@ -88,7 +88,7 @@ impl CachePruner {
         tracing::debug!("CacheHandler: Pruner task exited due to client shutdown");
     }
 
-    /// Delete files matching the prune plan. Called outside the cache lock
+    /// Delete files matching the prune plan. Called without any cache locks
     /// so file I/O and sleep delays don't block other cache operations.
     fn execute_prune(plan: &PrunePlan) -> PruneResult {
         let mut files_deleted = 0usize;

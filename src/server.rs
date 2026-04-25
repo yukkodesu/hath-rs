@@ -39,7 +39,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 pub struct AppState {
     pub config: Arc<ArcSwap<Config>>,
     pub stats: Arc<Stats>,
-    pub cache: Arc<Mutex<CacheHandler>>,
+    pub cache: Arc<CacheHandler>,
     pub rpc_client: Arc<RpcClient>,
     pub allow_normal_connections: Arc<std::sync::atomic::AtomicBool>,
     /// Flood control table (IP -> entry). Uses Arc<Mutex> for shared access.

@@ -88,7 +88,7 @@ pub async fn run() -> Result<()> {
 
     // 7. Init cache
     let stats = Arc::new(Stats::new());
-    let cache = Arc::new(Mutex::new(CacheHandler::new(config.clone(), stats.clone())?));
+    let cache = Arc::new(CacheHandler::new(config.clone(), stats.clone())?);
 
     // 8. Download cert + start HTTP server
     let allow_connections = Arc::new(AtomicBool::new(false));
@@ -161,8 +161,8 @@ pub async fn run() -> Result<()> {
             let cache = cache.clone();
             let stats = stats.clone();
             async move {
-                if let Ok(mut c) = cache.try_lock() {
-                    c.cycle_lru_cache_table();
+                if let Ok(mut lru) = cache.lru.try_lock() {
+                    lru.cycle();
                 }
                 stats.shift_bytes_sent_history();
             }
@@ -236,9 +236,7 @@ pub async fn run() -> Result<()> {
                 if let Ok(resp) = rpc_client.get_blacklist(43200).await
                     && resp.status == ResponseStatus::Ok {
                         for fileid in &resp.lines {
-                            if let Ok(mut c) = cache.try_lock() {
-                                let _ = c.delete_file_from_cache(fileid);
-                            }
+                            let _ = cache.delete_file_from_cache(fileid);
                         }
                     }
             }

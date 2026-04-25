@@ -8,22 +8,25 @@ use crate::stats::Stats;
 use crate::utils;
 use crate::cache::persistent::PersistentCacheState;
 use arc_swap::ArcSwap;
+use sha1::{Digest, Sha1};
 use std::collections::HashMap;
 use std::fs;
+use std::io::Read;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
 /// Time constants for pruning age cutoffs.
-const SIX_MONTHS: Duration = Duration::from_secs(15_552_000);
-const THREE_MONTHS: Duration = Duration::from_secs(7_776_000);
-const ONE_MONTH: Duration = Duration::from_secs(2_592_000);
-const THIRTY_DAYS: Duration = Duration::from_secs(2_592_000);
-const SEVEN_DAYS: Duration = Duration::from_secs(604_800);
-const THREE_DAYS: Duration = Duration::from_secs(259_200);
-const ONE_DAY: Duration = Duration::from_secs(86_400);
+const ONE_DAY: Duration = Duration::from_secs(86400);
+const THREE_DAYS: Duration = Duration::from_secs(3 * 86400);
+const SEVEN_DAYS: Duration = Duration::from_secs(7 * 86400);
+const THIRTY_DAYS: Duration = Duration::from_secs(30 * 86400);
+const ONE_MONTH: Duration = Duration::from_secs(30 * 86400);
+const THREE_MONTHS: Duration = Duration::from_secs(90 * 86400);
+const SIX_MONTHS: Duration = Duration::from_secs(180 * 86400);
 
 /// Information needed to execute a prune pass without holding the cache lock.
 pub struct PrunePlan {
@@ -68,20 +71,72 @@ fn prune_frequency(cache_limit: u64, cache_size_with_overhead: u64, want_free: u
 
 pub const LRU_CACHE_SIZE: usize = 1_048_576;
 
-/// (lru_array, total_files, unique_files, total_size, res_counts)
-type RescanResult = (Box<[u16; LRU_CACHE_SIZE]>, usize, u32, u64, HashMap<String, u64>);
+/// Per-file LRU tracking. Protected by its own [`std::sync::Mutex`] because it is
+/// accessed on every HTTP request (via [`LruState::mark_recently_accessed`]) and
+/// periodically cycled (via [`LruState::cycle`]).
+#[derive(Debug)]
+pub struct LruState {
+    pub lru_cache_table: Box<[u16; LRU_CACHE_SIZE]>,
+    pub lru_clear_pointer: usize,
+}
 
+impl Default for LruState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LruState {
+    pub fn new() -> Self {
+        Self {
+            lru_cache_table: Box::new([0u16; LRU_CACHE_SIZE]),
+            lru_clear_pointer: 0,
+        }
+    }
+
+    /// Java: `CacheHandler.markRecentlyAccessed()`
+    ///
+    /// Returns `true` if the caller should update the file's last-modified timestamp.
+    pub fn mark_recently_accessed(&mut self, fileid: &str, skip_meta_update: bool) -> bool {
+        if fileid.len() < 10 {
+            return false;
+        }
+        let array_index = usize::from_str_radix(&fileid[4..9], 16).unwrap_or(0);
+        let bit_mask: u16 = 1u16 << u16::from_str_radix(&fileid[9..10], 16).unwrap_or(0);
+        if (self.lru_cache_table[array_index] & bit_mask) != 0 {
+            return false;
+        }
+        self.lru_cache_table[array_index] |= bit_mask;
+        !skip_meta_update
+    }
+
+    /// Java: `CacheHandler.cycleLRUCacheTable()`
+    pub fn cycle(&mut self) {
+        let clear_until = (self.lru_clear_pointer + 17).min(LRU_CACHE_SIZE);
+        self.lru_cache_table[self.lru_clear_pointer..clear_until].fill(0);
+        self.lru_clear_pointer = if clear_until >= LRU_CACHE_SIZE { 0 } else { clear_until };
+    }
+}
+
+/// Cache metadata and operations.
+///
+/// Locking strategy (matches Java's thread-ownership model):
+/// - [`LruState`] → own `std::sync::Mutex` (frequent HTTP-request access)
+/// - `cache_count` / `cache_size` → atomics (read by many, written by pruner + init)
+/// - `static_range_oldest` → `std::sync::Mutex` (pruner-only, no contention)
+/// - `last_file_verification_cooldown` → `std::sync::Mutex` (rarely accessed)
+///
+/// All methods take `&self` — no outer `Mutex<CacheHandler>` needed.
 #[derive(Debug)]
 pub struct CacheHandler {
     pub config: Arc<ArcSwap<Config>>,
     pub stats: Arc<Stats>,
-    pub lru_cache_table: Box<[u16; LRU_CACHE_SIZE]>,
-    pub lru_clear_pointer: usize,
-    pub cache_count: u32,
-    pub cache_size: u64,
-    pub static_range_oldest: HashMap<String, u64>,
+    pub lru: std::sync::Mutex<LruState>,
+    pub cache_count: AtomicU32,
+    pub cache_size: AtomicU64,
+    pub static_range_oldest: std::sync::Mutex<HashMap<String, u64>>,
     pub cache_loaded: bool,
-    last_file_verification_cooldown: std::time::Instant,
+    last_file_verification_cooldown: std::sync::Mutex<std::time::Instant>,
 }
 
 impl CacheHandler {
@@ -100,22 +155,25 @@ impl CacheHandler {
 
         // Try persistent load first
         let mut cache_loaded = false;
-        let (lru_cache_table, lru_clear_pointer, cache_count, cache_size, static_range_oldest) =
+        let (lru, cache_count, cache_size, static_range_oldest) =
             if !cfg.rescan_cache {
                 if let Some(state) = Self::try_load_persistent(&cfg) {
                     tracing::info!("Successfully loaded persistent cache data");
                     cache_loaded = true;
-                    let mut arr = Box::new([0u16; LRU_CACHE_SIZE]);
+                    let mut lru = LruState::new();
                     let len = state.lru_cache_table.len().min(LRU_CACHE_SIZE);
-                    arr[..len].copy_from_slice(&state.lru_cache_table[..len]);
-                    (arr, state.lru_clear_pointer, state.cache_count, state.cache_size, state.static_range_ages)
+                    lru.lru_cache_table[..len].copy_from_slice(&state.lru_cache_table[..len]);
+                    lru.lru_clear_pointer = state.lru_clear_pointer;
+                    (lru, state.cache_count, state.cache_size, state.static_range_ages)
                 } else {
                     Self::startup_cache_cleanup(&cfg)?;
-                    Self::full_rescan(&cfg, &stats)?
+                    let (count, size, ages) = Self::full_rescan(&cfg, &stats, cfg.verify_cache)?;
+                    (LruState::new(), count, size, ages)
                 }
             } else {
                 Self::startup_cache_cleanup(&cfg)?;
-                Self::full_rescan(&cfg, &stats)?
+                let (count, size, ages) = Self::full_rescan(&cfg, &stats, cfg.verify_cache)?;
+                (LruState::new(), count, size, ages)
             };
 
         Self::delete_persistent_data(&cfg);
@@ -126,13 +184,12 @@ impl CacheHandler {
         Ok(Self {
             config,
             stats,
-            lru_cache_table,
-            lru_clear_pointer,
-            cache_count,
-            cache_size,
-            static_range_oldest,
+            lru: std::sync::Mutex::new(lru),
+            cache_count: AtomicU32::new(cache_count),
+            cache_size: AtomicU64::new(cache_size),
+            static_range_oldest: std::sync::Mutex::new(static_range_oldest),
             cache_loaded,
-            last_file_verification_cooldown: std::time::Instant::now(),
+            last_file_verification_cooldown: std::sync::Mutex::new(std::time::Instant::now()),
         })
     }
 
@@ -195,10 +252,20 @@ impl CacheHandler {
         }
     }
 
-    /// Full rescan: iterates all cache directories, validates files, builds LRU state.
-    fn full_rescan(config: &Config, stats: &Stats) -> Result<RescanResult> {
-        tracing::info!("Loading cache...");
-        let lru = Box::new([0u16; LRU_CACHE_SIZE]);
+    /// Full rescan: iterates all cache directories, validates files, builds initial state.
+    /// Returns (count, size, range_ages). LRU always starts fresh (all zeros) after a rescan.
+    fn full_rescan(config: &Config, stats: &Stats, verify_cache: bool) -> Result<(u32, u64, HashMap<String, u64>)> {
+        // Java: create a single MessageDigest + ByteBuffer and reuse across all files
+        let mut hasher = Sha1::new();
+        let mut read_buf = vec![0u8; 65536];
+        let print_freq: u32 = if verify_cache { 1000 } else { 10000 };
+
+        if verify_cache {
+            tracing::info!("CacheHandler: Loading cache with full file verification. Depending on the size of your cache, this can take a long time.");
+        } else {
+            tracing::info!("Loading cache...");
+        }
+
         let mut count = 0u32;
         let mut size = 0u64;
         let mut range_ages = HashMap::new();
@@ -226,10 +293,40 @@ impl CacheHandler {
                         None => { utils::remove_file(file); continue; }
                     };
 
-                    // Size validation
+                    // Size validation (Java: HVFile.getHVFileFromFile checks this first)
                     if file.metadata().map(|m| m.len()).unwrap_or(0) != hv.size as u64 {
                         utils::remove_file(file);
                         continue;
+                    }
+
+                    // SHA-1 verification (Java: FileValidator.validateFile)
+                    if verify_cache {
+                        let expected = hv.hash.as_str();
+                        let mut sha1_ok = false;
+                        hasher.reset();
+
+                        if let Ok(mut f) = fs::File::open(file) {
+                            let mut read_ok = true;
+                            loop {
+                                match f.read(&mut read_buf) {
+                                    Ok(0) => break,
+                                    Ok(n) => hasher.update(&read_buf[..n]),
+                                    Err(_) => { read_ok = false; break; }
+                                }
+                            }
+                            if read_ok {
+                                let actual = utils::hex_encode(&hasher.finalize_reset());
+                                sha1_ok = actual == expected;
+                            } else {
+                                // IO error during read — clean up partial hasher state
+                                hasher.reset();
+                            }
+                        }
+
+                        if !sha1_ok {
+                            utils::remove_file(file);
+                            continue;
+                        }
                     }
 
                     // Static range check
@@ -244,8 +341,8 @@ impl CacheHandler {
                     let modified = utils::modified_millis(file);
                     oldest_modified = oldest_modified.min(modified);
 
-                    if count.is_multiple_of(10000) {
-                        tracing::info!("Loaded {} files so far...", count);
+                    if count.is_multiple_of(print_freq) {
+                        tracing::info!("CacheHandler: Loaded {} files so far...", count);
                     }
                 }
 
@@ -259,7 +356,7 @@ impl CacheHandler {
         tracing::info!("Cache init complete: {} files, {} apparent bytes, {} estimated on disk",
             count, size, Self::cache_size_with_overhead(size, count, config));
 
-        Ok((lru, 0, count, size, range_ages))
+        Ok((count, size, range_ages))
     }
 
     pub fn cache_size_with_overhead(actual: u64, count: u32, config: &Config) -> u64 {
@@ -268,42 +365,33 @@ impl CacheHandler {
 
     pub fn get_cache_size_with_overhead(&self) -> u64 {
         let cfg = self.config.load();
-        Self::cache_size_with_overhead(self.cache_size, self.cache_count, &cfg)
+        Self::cache_size_with_overhead(
+            self.cache_size.load(Ordering::Relaxed),
+            self.cache_count.load(Ordering::Relaxed),
+            &cfg,
+        )
     }
 
-    pub fn is_file_verification_on_cooldown(&mut self) -> bool {
-        let elapsed = self.last_file_verification_cooldown.elapsed();
+    pub fn is_file_verification_on_cooldown(&self) -> bool {
+        let mut guard = self.last_file_verification_cooldown.lock().unwrap();
+        let elapsed = guard.elapsed();
         if elapsed.as_millis() < 2000 {
             return true;
         }
-        self.last_file_verification_cooldown = std::time::Instant::now();
+        *guard = std::time::Instant::now();
         false
     }
 
-    pub fn mark_recently_accessed(&mut self, fileid: &str, skip_meta_update: bool) -> bool {
-        if fileid.len() < 10 { return false; }
-        let array_index = usize::from_str_radix(&fileid[4..9], 16).unwrap_or(0);
-        let bit_mask: u16 = 1u16 << u16::from_str_radix(&fileid[9..10], 16).unwrap_or(0);
-        if (self.lru_cache_table[array_index] & bit_mask) != 0 { return false; }
-        self.lru_cache_table[array_index] |= bit_mask;
-        !skip_meta_update
-    }
-
-    pub fn cycle_lru_cache_table(&mut self) {
-        let clear_until = (self.lru_clear_pointer + 17).min(LRU_CACHE_SIZE);
-        self.lru_cache_table[self.lru_clear_pointer..clear_until].fill(0);
-        self.lru_clear_pointer = if clear_until >= LRU_CACHE_SIZE { 0 } else { clear_until };
-    }
-
-    pub fn delete_file_from_cache(&mut self, fileid: &str) -> Result<()> {
+    pub fn delete_file_from_cache(&self, fileid: &str) -> Result<()> {
         if let Some(hv) = HVFile::from_fileid(fileid) {
             let cfg = self.config.load();
             let path = hv.cache_path(&cfg.cache_dir);
             if path.exists() {
                 fs::remove_file(&path)?;
-                self.cache_count = self.cache_count.saturating_sub(1);
-                self.cache_size = self.cache_size.saturating_sub(hv.size as u64);
-                self.stats.set_cache_count(self.cache_count);
+                self.cache_count.fetch_sub(1, Ordering::Relaxed);
+                self.cache_size.fetch_sub(hv.size as u64, Ordering::Relaxed);
+                let count = self.cache_count.load(Ordering::Relaxed);
+                self.stats.set_cache_count(count);
                 self.stats.set_cache_size(self.get_cache_size_with_overhead());
             }
         }
@@ -317,19 +405,22 @@ impl CacheHandler {
     pub fn check_prune_action(&self, config: &Config) -> PruneAction {
         let want_free = 104_857_600u64;
         let cache_limit = config.disklimit_bytes;
+        let count = self.cache_count.load(Ordering::Relaxed);
+        let raw_size = self.cache_size.load(Ordering::Relaxed);
         let cache_size_with_overhead = self.get_cache_size_with_overhead();
 
         tracing::debug!(
             "CacheHandler: cacheSize={}, cacheSizeWithOverhead={}, cacheLimit={}, cacheFree={}",
-            self.cache_size,
+            raw_size,
             cache_size_with_overhead,
             cache_limit,
             cache_limit.saturating_sub(cache_size_with_overhead)
         );
 
+        let range_ages = self.static_range_oldest.lock().unwrap();
         if cache_size_with_overhead <= cache_limit
-            || self.cache_count == 0
-            || self.static_range_oldest.is_empty()
+            || count == 0
+            || range_ages.is_empty()
         {
             return PruneAction::NoPrune {
                 frequency: prune_frequency(cache_limit, cache_size_with_overhead, want_free),
@@ -340,8 +431,7 @@ impl CacheHandler {
         let fast_delete = bytes_to_free > config.disklimit_bytes / 4;
 
         // Find the oldest static range and its age in one HashMap traversal.
-        let (prune_static_range, oldest_range_age) = match self
-            .static_range_oldest
+        let (prune_static_range, oldest_range_age) = match range_ages
             .iter()
             .min_by_key(|(_, age)| **age)
         {
@@ -390,28 +480,30 @@ impl CacheHandler {
     ///
     /// Applies the results of a prune pass that was executed outside the lock.
     /// Updates [`static_range_oldest`], cache counters, and stats.
-    pub fn apply_prune_result(&mut self, result: PruneResult) {
-        if result.file_count > 0 {
-            self.static_range_oldest
-                .insert(result.static_range.clone(), result.oldest_last_modified);
-            tracing::debug!(
-                "CacheHandler: Updated age cache for range {}, oldest={}",
-                result.static_range,
-                result.oldest_last_modified
-            );
-        } else {
-            let _ = fs::remove_dir(&result.range_dir);
-            self.static_range_oldest.remove(&result.static_range);
-            tracing::debug!(
-                "CacheHandler: Removed empty static range dir {}",
-                result.static_range
-            );
-        }
+    pub fn apply_prune_result(&self, result: PruneResult) {
+        {
+            let mut range_ages = self.static_range_oldest.lock().unwrap();
+            if result.file_count > 0 {
+                range_ages.insert(result.static_range.clone(), result.oldest_last_modified);
+                tracing::debug!(
+                    "CacheHandler: Updated age cache for range {}, oldest={}",
+                    result.static_range,
+                    result.oldest_last_modified
+                );
+            } else {
+                let _ = fs::remove_dir(&result.range_dir);
+                range_ages.remove(&result.static_range);
+                tracing::debug!(
+                    "CacheHandler: Removed empty static range dir {}",
+                    result.static_range
+                );
+            }
+        } // release range_ages lock
 
-        self.cache_count = self.cache_count.saturating_sub(result.files_deleted as u32);
-        self.cache_size = self.cache_size.saturating_sub(result.bytes_deleted);
-        self.stats.set_cache_count(self.cache_count);
+        self.cache_count.fetch_sub(result.files_deleted as u32, Ordering::Relaxed);
+        self.cache_size.fetch_sub(result.bytes_deleted, Ordering::Relaxed);
+        let count = self.cache_count.load(Ordering::Relaxed);
+        self.stats.set_cache_count(count);
         self.stats.set_cache_size(self.get_cache_size_with_overhead());
     }
-
 }
