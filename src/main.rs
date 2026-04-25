@@ -8,6 +8,7 @@ pub mod config;
 pub mod rpc;
 pub mod rpc_client;
 pub mod bandwidth;
+pub mod body;
 pub mod downloader;
 pub mod proxy_downloader;
 pub mod request;

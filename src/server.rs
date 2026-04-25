@@ -1,3 +1,4 @@
+use crate::bandwidth::BandwidthMonitor;
 use crate::config::Config;
 use crate::error::{HathError, Result};
 use crate::request::{self, RequestType};
@@ -14,8 +15,7 @@ use hyper::server::conn::http1;
 use hyper::service::Service;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
-use http_body_util::Full;
-use bytes::Bytes;
+use crate::body::StreamingBody;
 use hyper::header;
 use std::collections::HashMap;
 use std::future::Future;
@@ -44,6 +44,11 @@ pub struct AppState {
     pub flood_control: Arc<Mutex<HashMap<String, FloodControlEntry>>>,
     /// TLS acceptor that can be swapped at runtime (e.g. cert refresh).
     pub tls_acceptor: Arc<ArcSwapOption<TlsAcceptor>>,
+    /// Bandwidth throttling monitor (shared across all connections).
+    /// If throttle_bytes is 0, no throttling is applied (None).
+    pub bandwidth_monitor: Arc<ArcSwapOption<BandwidthMonitor>>,
+    /// Count of currently active connections (for max_connections enforcement).
+    pub active_connections: Arc<std::sync::atomic::AtomicU32>,
 }
 
 #[derive(Debug, Clone)]
@@ -78,6 +83,20 @@ impl FloodControlEntry {
     }
 }
 
+/// RAII guard that decrements active_connections and updates Stats on drop.
+/// Java: HTTPServer.removeHTTPSession() / connectionFinished()
+struct ConnectionGuard {
+    active_connections: Arc<std::sync::atomic::AtomicU32>,
+    stats: Arc<Stats>,
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        let prev = self.active_connections.fetch_sub(1, Ordering::Relaxed);
+        self.stats.set_open_connections(prev.saturating_sub(1));
+    }
+}
+
 static LOCAL_NETWORK_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|169\.254\.|::1|0:0:0:0:0:0:0:1|fc|fd)")
         .expect("invalid regex")
@@ -88,7 +107,7 @@ pub struct HathService {
 }
 
 impl Service<Request<Incoming>> for HathService {
-    type Response = Response<Full<Bytes>>;
+    type Response = Response<StreamingBody>;
     type Error = hyper::Error;
     type Future = Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Self::Error>> + Send>>;
 
@@ -102,6 +121,20 @@ impl Service<Request<Incoming>> for HathService {
             // Load config once for this request (owned Arc, safe across .await)
             let config = state.config.load_full();
 
+            // Determine if this is a local/RPC connection (skip bandwidth throttling)
+            let host_addr = client_ip.to_string().to_lowercase();
+            let is_local = LOCAL_NETWORK_RE.is_match(&host_addr)
+                || config.client_host.replace("::ffff:", "") == host_addr;
+            let is_rpc = config.rpc_servers.iter().any(|s| s.to_string().to_lowercase() == host_addr);
+
+            // Determine bandwidth monitor for this request.
+            // Local/RPC connections skip throttling; others use the shared BWM.
+            let bwm_for_request = if is_local || is_rpc {
+                None
+            } else {
+                state.bandwidth_monitor.load_full().clone()
+            };
+
             // Build request line for parsing
             let request_line = format!(
                 "{} {} {:?}",
@@ -112,15 +145,23 @@ impl Service<Request<Incoming>> for HathService {
 
             let request_type = request::parse_request(&request_line, client_ip, &config);
 
+            // Header throttling (Java: bwm.waitForQuota before writing header bytes)
+            if let Some(ref bwm) = bwm_for_request {
+                bwm.wait_for_quota(100).await;
+            }
+
             let mut resp = match request_type {
                 RequestType::FileServe { keystamp_valid, hv_file, .. } => {
                     if !keystamp_valid {
                         response::forbidden_response()
-                    } else if let Some(hv) = hv_file {
+                    } else if let Some(ref hv) = hv_file {
                         let cache_path = hv.cache_path(&config.cache_dir);
                         if cache_path.exists() {
                             state.stats.record_file_sent();
-                            response::file_response(&hv, &config.cache_dir).await
+                            if !is_local && !is_rpc {
+                                state.stats.record_bytes_sent(hv.size as u64);
+                            }
+                            response::file_response(hv, &config.cache_dir, bwm_for_request).await
                         } else {
                             response::not_found_response()
                         }
@@ -130,14 +171,17 @@ impl Service<Request<Incoming>> for HathService {
                 }
                 RequestType::ServerCommand { command, additional, valid } => {
                     if valid {
-                        handle_server_command(&command, &additional, &state).await
+                        handle_server_command(&command, &additional, &state, bwm_for_request).await
                     } else {
                         response::forbidden_response()
                     }
                 }
                 RequestType::SpeedTest { testsize, valid, forbidden, .. } => {
                     if valid {
-                        response::speedtest_response(testsize as usize)
+                        if !is_local && !is_rpc {
+                            state.stats.record_bytes_sent(testsize as u64);
+                        }
+                        response::speedtest_response(testsize as usize, bwm_for_request)
                     } else if forbidden {
                         // Java: responseStatusCode = 403 for expired/invalid key
                         response::forbidden_response()
@@ -150,6 +194,8 @@ impl Service<Request<Incoming>> for HathService {
                 RequestType::Robots => response::robots_response(),
                 RequestType::NotFound => response::not_found_response(),
             };
+
+            // Body chunk throttling is handled inside StreamingBody::poll_frame.
 
             // Add Server header to every response
             if let Ok(ref mut r) = resp {
@@ -170,7 +216,7 @@ impl Service<Request<Incoming>> for HathService {
                     tracing::error!("Error building response: {}", e);
                     Ok(Response::builder()
                         .status(500)
-                        .body(Full::new(Bytes::from("Internal Server Error")))
+                        .body(StreamingBody::new(b"Internal Server Error".to_vec(), None))
                         .unwrap())
                 }
             }
@@ -183,7 +229,8 @@ async fn handle_server_command(
     command: &str,
     additional: &str,
     state: &AppState,
-) -> crate::error::Result<Response<Full<Bytes>>> {
+    bwm: Option<Arc<BandwidthMonitor>>,
+) -> crate::error::Result<Response<StreamingBody>> {
     match command.to_lowercase().as_str() {
         "still_alive" => {
             response::text_response(hyper::StatusCode::OK, "I feel FANTASTIC and I'm still alive")
@@ -231,7 +278,7 @@ async fn handle_server_command(
             let testsize: usize = add_table.get("testsize")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1_000_000);
-            response::speedtest_response(testsize)
+            response::speedtest_response(testsize, bwm)
         }
         "refresh_settings" => {
             match state.rpc_client.refresh_settings().await {
@@ -245,6 +292,15 @@ async fn handle_server_command(
                         }
                         Arc::new(new)
                     });
+                    // Recreate bandwidth monitor if throttle_bytes changed
+                    let cfg = state.config.load_full();
+                    if cfg.throttle_bytes > 0 {
+                        state.bandwidth_monitor.store(Some(Arc::new(
+                            BandwidthMonitor::new(cfg.throttle_bytes)
+                        )));
+                    } else {
+                        state.bandwidth_monitor.store(None);
+                    }
                     response::text_response(hyper::StatusCode::OK, "")
                 }
                 _ => response::text_response(hyper::StatusCode::OK, ""),
@@ -418,6 +474,13 @@ pub async fn start_server(
         }
     };
 
+    // Create bandwidth monitor if throttling is enabled
+    if config.throttle_bytes > 0 {
+        state.bandwidth_monitor.store(Some(Arc::new(
+            BandwidthMonitor::new(config.throttle_bytes)
+        )));
+    }
+
     // Store in AppState so it can be refreshed at runtime
     state.tls_acceptor.store(Some(Arc::new(tls_acceptor.clone())));
 
@@ -471,11 +534,45 @@ pub async fn start_server(
                     }
                 }
 
+                // Connection limiting for non-local, non-RPC traffic
+                // Java: HTTPServer.run() checks sessionCount vs maxConnections
+                if !is_local && !is_rpc {
+                    let max_conns = state.config.load().max_connections();
+                    let active = state.active_connections.load(Ordering::Relaxed);
+
+                    if active >= max_conns {
+                        tracing::warn!(
+                            "Exceeded the maximum allowed number of incoming connections ({}).",
+                            max_conns
+                        );
+                        drop(stream);
+                        continue;
+                    }
+
+                    if active >= (max_conns as f64 * 0.8) as u32 && active > 0 {
+                        tracing::warn!(
+                            "Near connection limit: {} / {} active connections",
+                            active, max_conns
+                        );
+                        // TODO: notify dispatcher of overload (HTTPResponse.notifyOverload)
+                    }
+                }
+
+                // Increment active connections
+                let prev = state.active_connections.fetch_add(1, Ordering::Relaxed);
+                state.stats.set_open_connections(prev + 1);
+
                 // Load current TLS acceptor (may have been refreshed)
                 let acceptor = state.tls_acceptor.load_full()
                     .expect("TLS acceptor not initialized");
 
+                let conn_state = state.clone();
                 tokio::spawn(async move {
+                    let _guard = ConnectionGuard {
+                        active_connections: conn_state.active_connections.clone(),
+                        stats: conn_state.stats.clone(),
+                    };
+
                     let tls_stream = match acceptor.accept(stream).await {
                         Ok(s) => s,
                         Err(_) => return,
@@ -483,7 +580,7 @@ pub async fn start_server(
 
                     let io = TokioIo::new(tls_stream);
 
-                    let service = HathService { state };
+                    let service = HathService { state: conn_state };
 
                     if let Err(e) = http1::Builder::new()
                         .serve_connection(io, service)
