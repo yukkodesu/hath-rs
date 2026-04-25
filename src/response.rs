@@ -4,8 +4,10 @@ use crate::error::{HathError, Result};
 use crate::hvfile::HVFile;
 use hyper::{Response, StatusCode, header};
 use rand::Rng;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use tokio::sync::Notify;
 
 /// Build a Hyper Response with proper headers.
 /// Java: Cache-Control + Content-Length only added when contentLength > 0.
@@ -97,6 +99,37 @@ pub fn speedtest_response(
     }
     builder
         .body(StreamingBody::new(data, bwm))
+        .map_err(HathError::Http)
+}
+
+/// Build a response for a proxy file download in progress.
+/// The body will stream data from the temp file as the background download
+/// task writes to it. Java: HTTPResponseProcessorProxy + ProxyFileDownloader.
+pub fn proxy_response(
+    content_type: &str,
+    total_size: usize,
+    temp_file: PathBuf,
+    write_offset: Arc<AtomicU64>,
+    notify: Arc<Notify>,
+    bwm: Option<Arc<BandwidthMonitor>>,
+) -> Result<Response<StreamingBody>> {
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CONNECTION, "close");
+    if total_size > 0 {
+        builder = builder
+            .header(header::CACHE_CONTROL, "public, max-age=31536000")
+            .header(header::CONTENT_LENGTH, total_size);
+    }
+    builder
+        .body(StreamingBody::new_proxy(
+            total_size,
+            temp_file,
+            write_offset,
+            notify,
+            bwm,
+        ))
         .map_err(HathError::Http)
 }
 

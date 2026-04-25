@@ -8,6 +8,7 @@ use crate::cache::CacheHandler;
 use crate::rpc_client::RpcClient;
 use crate::rpc::{self, Action};
 use crate::utils;
+use crate::proxy_downloader::ProxyFileDownloader;
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use hyper::body::Incoming;
@@ -17,6 +18,7 @@ use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use crate::body::StreamingBody;
 use hyper::header;
+use reqwest::Url;
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -154,7 +156,7 @@ impl Service<Request<Incoming>> for HathService {
             }
 
             let mut resp = match request_type {
-                RequestType::FileServe { keystamp_valid, hv_file, .. } => {
+                RequestType::FileServe { fileid, hv_file, additional, keystamp_valid } => {
                     if !keystamp_valid {
                         response::forbidden_response()
                     } else if let Some(ref hv) = hv_file {
@@ -166,7 +168,49 @@ impl Service<Request<Incoming>> for HathService {
                             }
                             response::file_response(hv, &config.cache_dir, bwm_for_request).await
                         } else {
-                            response::not_found_response()
+                            // Cache miss — try proxy fallback.
+                            // Java: HTTPResponse.parseRequest() creates
+                            // HTTPResponseProcessorProxy(fileid, sources).
+                            let fileindex = additional.get("fileindex");
+                            let xres = additional.get("xres");
+                            if let (Some(fileindex), Some(xres)) = (fileindex, xres) {
+                                match state.rpc_client.static_range_fetch(fileindex, xres, &fileid).await {
+                                    Ok(sr) if sr.status == crate::rpc::ResponseStatus::Ok => {
+                                        let sources: Vec<Url> = sr.lines.iter()
+                                            .filter(|s| !s.is_empty())
+                                            .filter_map(|s| Url::parse(s).ok())
+                                            .collect();
+                                        if !sources.is_empty() {
+                                            match ProxyFileDownloader::new(&fileid, &sources, &config).await {
+                                                Ok(proxy) => {
+                                                    let mime = hv.mime_type();
+                                                    state.stats.record_file_sent();
+                                                    if !is_local && !is_rpc {
+                                                        state.stats.record_bytes_sent(hv.size as u64);
+                                                    }
+                                                    response::proxy_response(
+                                                        mime,
+                                                        proxy.total_size as usize,
+                                                        proxy.temp_file,
+                                                        proxy.write_offset,
+                                                        proxy.notify,
+                                                        bwm_for_request,
+                                                    )
+                                                }
+                                                Err(e) => {
+                                                    tracing::warn!("Proxy download failed for {}: {}", fileid, e);
+                                                    response::not_found_response()
+                                                }
+                                            }
+                                        } else {
+                                            response::not_found_response()
+                                        }
+                                    }
+                                    _ => response::not_found_response(),
+                                }
+                            } else {
+                                response::not_found_response()
+                            }
                         }
                     } else {
                         response::not_found_response()

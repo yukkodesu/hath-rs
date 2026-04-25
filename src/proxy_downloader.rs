@@ -12,14 +12,22 @@ use tokio::sync::Notify;
 
 /// Streaming proxy download: downloads from an upstream image server
 /// while simultaneously serving data to the requesting HTTPSession.
+///
+/// After construction, the download runs in a background tokio task.
+/// The caller can create a [`crate::body::StreamingBody`] via
+/// [`StreamingBody::new_proxy`] to stream data to the client as it arrives.
 #[allow(dead_code)]
 pub struct ProxyFileDownloader {
     pub content_length: usize,
     pub content_type: String,
-    temp_file: PathBuf,
-    write_offset: Arc<std::sync::atomic::AtomicU64>,
-    total_size: u64,
-    notify: Arc<Notify>,
+    /// Path to the temp file where downloaded data is written.
+    pub temp_file: PathBuf,
+    /// Atomic counter: bytes written so far by the download task.
+    pub write_offset: Arc<std::sync::atomic::AtomicU64>,
+    /// Expected total file size in bytes.
+    pub total_size: u64,
+    /// Notified each time new data is written to the temp file.
+    pub notify: Arc<Notify>,
     success: Arc<std::sync::Mutex<bool>>,
 }
 
