@@ -111,6 +111,7 @@ pub fn proxy_response(
     temp_file: PathBuf,
     write_offset: Arc<AtomicU64>,
     notify: Arc<Notify>,
+    body_done_notify: Arc<Notify>,
     bwm: Option<Arc<BandwidthMonitor>>,
 ) -> Result<Response<StreamingBody>> {
     let mut builder = Response::builder()
@@ -128,6 +129,7 @@ pub fn proxy_response(
             temp_file,
             write_offset,
             notify,
+            body_done_notify,
             bwm,
         ))
         .map_err(HathError::Http)

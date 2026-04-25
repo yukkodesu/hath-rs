@@ -1,6 +1,7 @@
 use crate::config::{Config, CliArgs};
 use crate::error::{HathError, Result};
 use crate::cache::CacheHandler;
+use crate::cache::pruner::CachePruner;
 use crate::rpc::{self, ResponseStatus};
 use crate::rpc_client::RpcClient;
 use crate::server::{self, AppState, prune_flood_control};
@@ -87,7 +88,7 @@ pub async fn run() -> Result<()> {
 
     // 7. Init cache
     let stats = Arc::new(Stats::new());
-    let cache = Arc::new(Mutex::new(CacheHandler::new(config.clone(), stats.clone())?));
+    let cache = Arc::new(CacheHandler::new(config.clone(), stats.clone())?);
 
     // 8. Download cert + start HTTP server
     let allow_connections = Arc::new(AtomicBool::new(false));
@@ -101,6 +102,7 @@ pub async fn run() -> Result<()> {
         allow_normal_connections: allow_connections.clone(),
         flood_control: flood_control.clone(),
         tls_acceptor: Arc::new(ArcSwapOption::const_empty()),
+        cert_expiry: Arc::new(Mutex::new(None)),
         bandwidth_monitor: Arc::new(ArcSwapOption::const_empty()),
         active_connections: Arc::new(AtomicU32::new(0)),
         last_overload_notification: Arc::new(Mutex::new(None)),
@@ -145,6 +147,13 @@ pub async fn run() -> Result<()> {
 
     // 11. Spawn periodic background tasks
 
+    // Cache pruner: checks disk usage and prunes old files.
+    // Java: CachePruner runs in its own thread with a 1-second tick.
+    {
+        let pruner = CachePruner::new(cache.clone(), config.clone(), shutdown.clone());
+        tokio::spawn(async move { pruner.run().await });
+    }
+
     // 10s: LRU cycle + shift stats
     {
         let cache = cache.clone();
@@ -153,8 +162,8 @@ pub async fn run() -> Result<()> {
             let cache = cache.clone();
             let stats = stats.clone();
             async move {
-                if let Ok(mut c) = cache.try_lock() {
-                    c.cycle_lru_cache_table();
+                if let Ok(mut lru) = cache.lru.try_lock() {
+                    lru.cycle();
                 }
                 stats.shift_bytes_sent_history();
             }
@@ -187,14 +196,33 @@ pub async fn run() -> Result<()> {
         }));
     }
 
-    // 5min: time check
+    // 5min: time check + cert expiry
     {
         let config = config.clone();
+        let app_state = app_state.clone();
+        let shutdown_signal = shutdown.clone();
         tokio::spawn(tick_every(shutdown.clone(), Duration::from_secs(300), move || {
             let config = config.clone();
+            let app_state = app_state.clone();
+            let shutdown_signal = shutdown_signal.clone();
             async move {
                 if config.load().server_time_delta.abs() > 86400 {
                     tracing::warn!("System time off by >24h. Correct your system clock.");
+                }
+                // Java: httpServer.isCertExpired() — cert must not expire within 24h
+                if let Some(expiry) = *app_state.cert_expiry.lock().await {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64;
+                    if expiry - now < 86400 {
+                        tracing::error!(
+                            "Either the system clock is significantly wrong, or something has \
+                             gone wrong with certificate renewal. Check your system clock and \
+                             internet connection, then restart the client manually."
+                        );
+                        shutdown_signal.cancel();
+                    }
                 }
             }
         }));
@@ -228,9 +256,7 @@ pub async fn run() -> Result<()> {
                 if let Ok(resp) = rpc_client.get_blacklist(43200).await
                     && resp.status == ResponseStatus::Ok {
                         for fileid in &resp.lines {
-                            if let Ok(mut c) = cache.try_lock() {
-                                let _ = c.delete_file_from_cache(fileid);
-                            }
+                            let _ = cache.delete_file_from_cache(fileid);
                         }
                     }
             }
@@ -242,6 +268,7 @@ pub async fn run() -> Result<()> {
 
     // Graceful shutdown
     tracing::info!("Shutting down...");
+    cache.save_persistent_data();
     rpc_client.client_stop().await.ok();
     {
         let cfg = config.load();
