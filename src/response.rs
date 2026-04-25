@@ -1,60 +1,72 @@
+use crate::bandwidth::BandwidthMonitor;
+use crate::body::StreamingBody;
 use crate::error::{HathError, Result};
 use crate::hvfile::HVFile;
 use hyper::{Response, StatusCode, header};
-use http_body_util::Full;
-use bytes::Bytes;
-use std::path::Path;
 use rand::Rng;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use tokio::sync::Notify;
 
-/// Build a Hyper Response with proper headers (not raw byte injection).
+/// Build a Hyper Response with proper headers.
+/// Java: Cache-Control + Content-Length only added when contentLength > 0.
 /// Server and Date headers are set at the Hyper service layer.
-pub fn ok_response(body: Vec<u8>, content_type: &str) -> Result<Response<Full<Bytes>>> {
+pub fn ok_response(body: Vec<u8>, content_type: &str) -> Result<Response<StreamingBody>> {
     let len = body.len();
-    let resp = Response::builder()
+    let mut builder = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, content_type)
-        .header(header::CACHE_CONTROL, "public, max-age=31536000")
-        .header(header::CONTENT_LENGTH, len)
-        .header(header::CONNECTION, "close")
-        .body(Full::new(Bytes::from(body)))
-        .map_err(HathError::Http)?;
-    Ok(resp)
+        .header(header::CONNECTION, "close");
+    if len > 0 {
+        builder = builder
+            .header(header::CACHE_CONTROL, "public, max-age=31536000")
+            .header(header::CONTENT_LENGTH, len);
+    }
+    builder
+        .body(StreamingBody::new(body, None))
+        .map_err(HathError::Http)
 }
 
-pub fn not_found_response() -> Result<Response<Full<Bytes>>> {
+pub fn not_found_response() -> Result<Response<StreamingBody>> {
     text_response(StatusCode::NOT_FOUND, "Not Found")
 }
 
-pub fn forbidden_response() -> Result<Response<Full<Bytes>>> {
+pub fn forbidden_response() -> Result<Response<StreamingBody>> {
     text_response(StatusCode::FORBIDDEN, "Permission Denied")
 }
 
-pub fn bad_request_response() -> Result<Response<Full<Bytes>>> {
+pub fn bad_request_response() -> Result<Response<StreamingBody>> {
     text_response(StatusCode::BAD_REQUEST, "Bad Request")
 }
 
-pub fn text_response(status: StatusCode, text: &str) -> Result<Response<Full<Bytes>>> {
+pub fn text_response(status: StatusCode, text: &str) -> Result<Response<StreamingBody>> {
     let len = text.len();
-    Response::builder()
+    let mut builder = Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, "text/html; charset=iso-8859-1")
-        .header(header::CONTENT_LENGTH, len)
-        .header(header::CONNECTION, "close")
-        .body(Full::new(Bytes::from(text.as_bytes().to_vec())))
+        .header(header::CONNECTION, "close");
+    if len > 0 {
+        builder = builder
+            .header(header::CACHE_CONTROL, "public, max-age=31536000")
+            .header(header::CONTENT_LENGTH, len);
+    }
+    builder
+        .body(StreamingBody::new(text.as_bytes().to_vec(), None))
         .map_err(HathError::Http)
 }
 
-pub fn redirect_response(location: &str) -> Result<Response<Full<Bytes>>> {
+pub fn redirect_response(location: &str) -> Result<Response<StreamingBody>> {
+    // Java: empty body with 301 + Location header, no Content-Length
     Response::builder()
         .status(StatusCode::MOVED_PERMANENTLY)
         .header(header::LOCATION, location)
-        .header(header::CONTENT_LENGTH, 0)
         .header(header::CONNECTION, "close")
-        .body(Full::new(Bytes::new()))
+        .body(StreamingBody::new(vec![], None))
         .map_err(HathError::Http)
 }
 
-pub fn robots_response() -> Result<Response<Full<Bytes>>> {
+pub fn robots_response() -> Result<Response<StreamingBody>> {
     let body = b"User-agent: *\nDisallow: /";
     let len = body.len();
     Response::builder()
@@ -62,17 +74,71 @@ pub fn robots_response() -> Result<Response<Full<Bytes>>> {
         .header(header::CONTENT_TYPE, "text/plain")
         .header(header::CONTENT_LENGTH, len)
         .header(header::CONNECTION, "close")
-        .body(Full::new(Bytes::from(body.to_vec())))
+        .body(StreamingBody::new(body.to_vec(), None))
         .map_err(HathError::Http)
 }
 
-pub fn speedtest_response(size: usize) -> Result<Response<Full<Bytes>>> {
+/// Build a speedtest response with optional bandwidth throttling.
+/// Java: HTTPResponseProcessorSpeedtest inherits getContentType() from
+/// HTTPResponseProcessor → Settings.CONTENT_TYPE_DEFAULT = "text/html; charset=iso-8859-1"
+pub fn speedtest_response(
+    size: usize,
+    bwm: Option<Arc<BandwidthMonitor>>,
+) -> Result<Response<StreamingBody>> {
     let mut data = vec![0u8; size];
     rand::rng().fill_bytes(&mut data);
-    ok_response(data, "application/octet-stream")
+    let len = data.len();
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/html; charset=iso-8859-1")
+        .header(header::CONNECTION, "close");
+    if len > 0 {
+        builder = builder
+            .header(header::CACHE_CONTROL, "public, max-age=31536000")
+            .header(header::CONTENT_LENGTH, len);
+    }
+    builder
+        .body(StreamingBody::new(data, bwm))
+        .map_err(HathError::Http)
 }
 
-pub async fn file_response(hv_file: &HVFile, cache_dir: &Path) -> Result<Response<Full<Bytes>>> {
+/// Build a response for a proxy file download in progress.
+/// The body will stream data from the temp file as the background download
+/// task writes to it. Java: HTTPResponseProcessorProxy + ProxyFileDownloader.
+pub fn proxy_response(
+    content_type: &str,
+    total_size: usize,
+    temp_file: PathBuf,
+    write_offset: Arc<AtomicU64>,
+    notify: Arc<Notify>,
+    bwm: Option<Arc<BandwidthMonitor>>,
+) -> Result<Response<StreamingBody>> {
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CONNECTION, "close");
+    if total_size > 0 {
+        builder = builder
+            .header(header::CACHE_CONTROL, "public, max-age=31536000")
+            .header(header::CONTENT_LENGTH, total_size);
+    }
+    builder
+        .body(StreamingBody::new_proxy(
+            total_size,
+            temp_file,
+            write_offset,
+            notify,
+            bwm,
+        ))
+        .map_err(HathError::Http)
+}
+
+/// Serve a cached file with optional bandwidth throttling.
+pub async fn file_response(
+    hv_file: &HVFile,
+    cache_dir: &Path,
+    bwm: Option<Arc<BandwidthMonitor>>,
+) -> Result<Response<StreamingBody>> {
     let path = hv_file.cache_path(cache_dir);
     let data = tokio::fs::read(&path).await
         .map_err(|e| HathError::Cache(format!("cannot read {}: {}", path.display(), e)))?;
@@ -84,5 +150,18 @@ pub async fn file_response(hv_file: &HVFile, cache_dir: &Path) -> Result<Respons
         )));
     }
 
-    ok_response(data, hv_file.mime_type())
+    let mime = hv_file.mime_type().to_string();
+    let len = data.len();
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, mime)
+        .header(header::CONNECTION, "close");
+    if len > 0 {
+        builder = builder
+            .header(header::CACHE_CONTROL, "public, max-age=31536000")
+            .header(header::CONTENT_LENGTH, len);
+    }
+    builder
+        .body(StreamingBody::new(data, bwm))
+        .map_err(HathError::Http)
 }

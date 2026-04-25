@@ -6,11 +6,11 @@ use crate::rpc_client::RpcClient;
 use crate::server::{self, AppState, prune_flood_control};
 use crate::stats::Stats;
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use clap::Parser;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
 
@@ -100,6 +100,10 @@ pub async fn run() -> Result<()> {
         rpc_client: rpc_client.clone(),
         allow_normal_connections: allow_connections.clone(),
         flood_control: flood_control.clone(),
+        tls_acceptor: Arc::new(ArcSwapOption::const_empty()),
+        bandwidth_monitor: Arc::new(ArcSwapOption::const_empty()),
+        active_connections: Arc::new(AtomicU32::new(0)),
+        last_overload_notification: Arc::new(Mutex::new(None)),
     };
 
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
