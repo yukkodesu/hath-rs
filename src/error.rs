@@ -51,4 +51,10 @@ impl From<openssl::ssl::Error> for HathError {
     }
 }
 
+impl From<rustls::Error> for HathError {
+    fn from(e: rustls::Error) -> Self {
+        HathError::Tls(e.to_string())
+    }
+}
+
 pub type Result<T> = std::result::Result<T, HathError>;

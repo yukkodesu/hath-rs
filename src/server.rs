@@ -20,8 +20,8 @@ use crate::body::StreamingBody;
 use hyper::header;
 use openssl::asn1::Asn1Time;
 use openssl::pkcs12::Pkcs12;
-use openssl::ssl::{Ssl, SslAcceptor, SslMethod};
-use tokio_openssl::SslStream as TokioSslStream;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use tokio_rustls::TlsAcceptor;
 use reqwest::Url;
 use std::collections::HashMap;
 use std::future::Future;
@@ -46,7 +46,7 @@ pub struct AppState {
     /// Flood control table (IP -> entry). Uses Arc<Mutex> for shared access.
     pub flood_control: Arc<Mutex<HashMap<String, FloodControlEntry>>>,
     /// TLS acceptor that can be swapped at runtime (e.g. cert refresh).
-    pub tls_acceptor: Arc<ArcSwapOption<SslAcceptor>>,
+    pub tls_acceptor: Arc<ArcSwapOption<TlsAcceptor>>,
     /// Certificate expiry as a Unix timestamp (seconds). Checked periodically;
     /// if the cert expires within 24 hours, the client shuts down (matches Java).
     pub cert_expiry: Arc<Mutex<Option<i64>>>,
@@ -455,9 +455,11 @@ async fn run_threaded_proxy_test(
 }
 
 /// Build a TLS acceptor from the PKCS12 certificate.
+/// Uses OpenSSL for PKCS12 parsing and cert expiry checking,
+/// then converts to rustls types for the Hyper HTTP server.
 /// If `force_download` is true, always re-download the cert from the RPC server.
 /// Returns (acceptor, cert_expiry_unix_seconds).
-async fn build_tls_acceptor(config: &Config, force_download: bool) -> Result<(SslAcceptor, i64)> {
+async fn build_tls_acceptor(config: &Config, force_download: bool) -> Result<(TlsAcceptor, i64)> {
     let cert_path = config.data_dir.join("hathcert.p12");
 
     if force_download || !cert_path.exists() {
@@ -491,22 +493,37 @@ async fn build_tls_acceptor(config: &Config, force_download: bool) -> Result<(Ss
     }
 
     // Compute cert expiry as a Unix timestamp for periodic checks.
-    // not_after is relative — compare against now to get absolute timestamp.
     let now_asn1 = Asn1Time::days_from_now(0)?;
     let diff = not_after.diff(&now_asn1)?;
     let now_unix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
     let cert_expiry_unix = now_unix + diff.days as i64 * 86400 + diff.secs as i64;
 
-    let mut acceptor = SslAcceptor::mozilla_intermediate(SslMethod::tls())?;
-    acceptor.set_private_key(key)?;
-    acceptor.set_certificate(cert)?;
+    // Convert cert and chain from OpenSSL X509 → DER → rustls CertificateDer
+    let cert_der = cert.to_der()?;
+    let mut cert_chain = vec![CertificateDer::from(cert_der)];
     if let Some(chain) = pkcs12.ca {
         for ca in chain {
-            acceptor.add_extra_chain_cert(ca)?;
+            let ca_der = ca.to_der()?;
+            cert_chain.push(CertificateDer::from(ca_der));
         }
     }
 
-    let acceptor = acceptor.build();
+    // Convert private key: OpenSSL PKey → PEM PKCS#8 → rustls PrivatePkcs8KeyDer
+    let key_pem = key.private_key_to_pem_pkcs8()?;
+    let mut pem_reader = std::io::BufReader::new(key_pem.as_slice());
+    let key_der = rustls_pemfile::pkcs8_private_keys(&mut pem_reader)
+        .next()
+        .ok_or_else(|| HathError::Tls("No private key found in PEM".into()))?
+        .map_err(|e| HathError::Tls(format!("Failed to parse private key: {}", e)))?;
+    let private_key = PrivateKeyDer::Pkcs8(key_der);
+
+    // Build rustls ServerConfig with TLS 1.2 + 1.3 (matching Java)
+    let config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(cert_chain, private_key)
+        .map_err(|e| HathError::Tls(format!("Failed to build TLS config: {}", e)))?;
+
+    let acceptor = TlsAcceptor::from(Arc::new(config));
     Ok((acceptor, cert_expiry_unix))
 }
 
@@ -650,24 +667,13 @@ pub async fn start_server(
                         stats: conn_state.stats.clone(),
                     };
 
-                    let ssl = match Ssl::new(acceptor.context()) {
+                    let tls_stream = match acceptor.accept(stream).await {
                         Ok(s) => s,
                         Err(e) => {
-                            tracing::warn!("Failed to create Ssl: {}", e);
+                            tracing::warn!("TLS accept failed: {}", e);
                             return;
                         }
                     };
-                    let mut tls_stream = match TokioSslStream::new(ssl, stream) {
-                        Ok(s) => Box::pin(s),
-                        Err(e) => {
-                            tracing::warn!("Failed to create SslStream: {}", e);
-                            return;
-                        }
-                    };
-                    if let Err(e) = tls_stream.as_mut().accept().await {
-                        tracing::warn!("TLS accept failed: {}", e);
-                        return;
-                    }
 
                     let io = TokioIo::new(tls_stream);
 
