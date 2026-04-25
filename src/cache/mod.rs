@@ -10,7 +10,61 @@ use crate::cache::persistent::PersistentCacheState;
 use arc_swap::ArcSwap;
 use std::collections::HashMap;
 use std::fs;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
+
+/// Time constants for pruning age cutoffs.
+const SIX_MONTHS: Duration = Duration::from_secs(15_552_000);
+const THREE_MONTHS: Duration = Duration::from_secs(7_776_000);
+const ONE_MONTH: Duration = Duration::from_secs(2_592_000);
+const THIRTY_DAYS: Duration = Duration::from_secs(2_592_000);
+const SEVEN_DAYS: Duration = Duration::from_secs(604_800);
+const THREE_DAYS: Duration = Duration::from_secs(259_200);
+const ONE_DAY: Duration = Duration::from_secs(86_400);
+
+/// Information needed to execute a prune pass without holding the cache lock.
+pub struct PrunePlan {
+    pub static_range: String,
+    pub range_dir: PathBuf,
+    /// Files with `last_modified < cutoff` should be deleted.
+    pub cutoff: u64,
+    pub fast_delete: bool,
+}
+
+/// Result of executing a prune pass.
+pub struct PruneResult {
+    pub static_range: String,
+    pub range_dir: PathBuf,
+    /// Number of files remaining in the directory after pruning.
+    pub file_count: usize,
+    /// Oldest last-modified timestamp among remaining files.
+    pub oldest_last_modified: u64,
+    pub files_deleted: usize,
+    pub bytes_deleted: u64,
+}
+
+/// The recommended action after checking cache state.
+pub enum PruneAction {
+    /// Cache is over limit — prune this range.
+    Prune(PrunePlan),
+    /// Cache is within limit — adjust check frequency.
+    NoPrune { frequency: u32 },
+}
+
+/// Compute the recommended pruner check frequency based on free space.
+fn prune_frequency(cache_limit: u64, cache_size_with_overhead: u64, want_free: u64) -> u32 {
+    let free = cache_limit.saturating_sub(cache_size_with_overhead);
+    if free > want_free * 10 {
+        600
+    } else if free > want_free {
+        60
+    } else {
+        10
+    }
+}
 
 pub const LRU_CACHE_SIZE: usize = 1_048_576;
 
@@ -187,10 +241,7 @@ impl CacheHandler {
                     count += 1;
                     size += hv.size as u64;
 
-                    let modified = file.metadata()
-                        .and_then(|m| m.modified())
-                        .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64)
-                        .unwrap_or(0);
+                    let modified = utils::modified_millis(file);
                     oldest_modified = oldest_modified.min(modified);
 
                     if count.is_multiple_of(10000) {
@@ -258,4 +309,109 @@ impl CacheHandler {
         }
         Ok(())
     }
+
+    /// Java: checkAndPruneCache() — phase 1 (lock held, read-only).
+    ///
+    /// Checks if the cache is over the disk limit and returns a [`PruneAction`].
+    /// The actual file deletion (I/O with sleeps) happens outside the lock.
+    pub fn check_prune_action(&self, config: &Config) -> PruneAction {
+        let want_free = 104_857_600u64;
+        let cache_limit = config.disklimit_bytes;
+        let cache_size_with_overhead = self.get_cache_size_with_overhead();
+
+        tracing::debug!(
+            "CacheHandler: cacheSize={}, cacheSizeWithOverhead={}, cacheLimit={}, cacheFree={}",
+            self.cache_size,
+            cache_size_with_overhead,
+            cache_limit,
+            cache_limit.saturating_sub(cache_size_with_overhead)
+        );
+
+        if cache_size_with_overhead <= cache_limit
+            || self.cache_count == 0
+            || self.static_range_oldest.is_empty()
+        {
+            return PruneAction::NoPrune {
+                frequency: prune_frequency(cache_limit, cache_size_with_overhead, want_free),
+            };
+        }
+
+        let bytes_to_free = cache_size_with_overhead - cache_limit + 100_000_000;
+        let fast_delete = bytes_to_free > config.disklimit_bytes / 4;
+
+        // Find the oldest static range and its age in one HashMap traversal.
+        let (prune_static_range, oldest_range_age) = match self
+            .static_range_oldest
+            .iter()
+            .min_by_key(|(_, age)| **age)
+        {
+            Some((r, age)) => (r.clone(), *age),
+            None => return PruneAction::NoPrune {
+                frequency: prune_frequency(cache_limit, cache_size_with_overhead, want_free),
+            },
+        };
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        // Determine the last-modified cutoff based on file age.
+        let cutoff = if oldest_range_age < now.saturating_sub(SIX_MONTHS.as_millis() as u64) {
+            oldest_range_age + THIRTY_DAYS.as_millis() as u64
+        } else if oldest_range_age < now.saturating_sub(THREE_MONTHS.as_millis() as u64) {
+            oldest_range_age + SEVEN_DAYS.as_millis() as u64
+        } else if oldest_range_age < now.saturating_sub(ONE_MONTH.as_millis() as u64) {
+            oldest_range_age + THREE_DAYS.as_millis() as u64
+        } else {
+            oldest_range_age + ONE_DAY.as_millis() as u64
+        };
+
+        let range_dir = config
+            .cache_dir
+            .join(&prune_static_range[0..2])
+            .join(&prune_static_range[2..4]);
+
+        tracing::debug!(
+            "CacheHandler: Trying to free {} bytes from range {}",
+            bytes_to_free,
+            prune_static_range
+        );
+
+        PruneAction::Prune(PrunePlan {
+            static_range: prune_static_range,
+            range_dir,
+            cutoff,
+            fast_delete,
+        })
+    }
+
+    /// Java: checkAndPruneCache() — phase 3 (lock held, write).
+    ///
+    /// Applies the results of a prune pass that was executed outside the lock.
+    /// Updates [`static_range_oldest`], cache counters, and stats.
+    pub fn apply_prune_result(&mut self, result: PruneResult) {
+        if result.file_count > 0 {
+            self.static_range_oldest
+                .insert(result.static_range.clone(), result.oldest_last_modified);
+            tracing::debug!(
+                "CacheHandler: Updated age cache for range {}, oldest={}",
+                result.static_range,
+                result.oldest_last_modified
+            );
+        } else {
+            let _ = fs::remove_dir(&result.range_dir);
+            self.static_range_oldest.remove(&result.static_range);
+            tracing::debug!(
+                "CacheHandler: Removed empty static range dir {}",
+                result.static_range
+            );
+        }
+
+        self.cache_count = self.cache_count.saturating_sub(result.files_deleted as u32);
+        self.cache_size = self.cache_size.saturating_sub(result.bytes_deleted);
+        self.stats.set_cache_count(self.cache_count);
+        self.stats.set_cache_size(self.get_cache_size_with_overhead());
+    }
+
 }

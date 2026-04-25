@@ -3,6 +3,7 @@ use std::path::Path;
 use std::collections::HashMap;
 use std::fs;
 use std::io;
+use std::time::{UNIX_EPOCH};
 use tracing;
 
 /// Compute SHA-1 hex digest of a string.
@@ -86,6 +87,15 @@ pub fn remove_dir(path: &Path) {
         && e.kind() != io::ErrorKind::NotFound {
             tracing::warn!("Failed to remove dir {}: {}", path.display(), e);
         }
+}
+
+/// Get the last-modified timestamp of a file as milliseconds since Unix epoch.
+/// Returns 0 if the timestamp can't be read.
+pub fn modified_millis(path: &Path) -> u64 {
+    path.metadata()
+        .and_then(|m| m.modified())
+        .map(|t| t.duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

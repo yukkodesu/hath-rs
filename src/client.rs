@@ -1,6 +1,7 @@
 use crate::config::{Config, CliArgs};
 use crate::error::{HathError, Result};
 use crate::cache::CacheHandler;
+use crate::cache::pruner::CachePruner;
 use crate::rpc::{self, ResponseStatus};
 use crate::rpc_client::RpcClient;
 use crate::server::{self, AppState, prune_flood_control};
@@ -144,6 +145,13 @@ pub async fn run() -> Result<()> {
     tracing::info!("Startup completed successfully. Starting normal operation");
 
     // 11. Spawn periodic background tasks
+
+    // Cache pruner: checks disk usage and prunes old files.
+    // Java: CachePruner runs in its own thread with a 1-second tick.
+    {
+        let pruner = CachePruner::new(cache.clone(), config.clone(), shutdown.clone());
+        tokio::spawn(async move { pruner.run().await });
+    }
 
     // 10s: LRU cycle + shift stats
     {
