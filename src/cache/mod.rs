@@ -94,10 +94,9 @@ impl LruState {
         }
     }
 
-    /// Java: `CacheHandler.markRecentlyAccessed()`
-    ///
-    /// Returns `true` if the caller should update the file's last-modified timestamp.
-    pub fn mark_recently_accessed(&mut self, fileid: &str, skip_meta_update: bool) -> bool {
+    /// Low-level LRU bit check/set. Returns `true` if the file's LRU bit was
+    /// NOT previously set (i.e., the file hasn't been accessed recently).
+    pub fn mark_recently_accessed(&mut self, fileid: &str) -> bool {
         if fileid.len() < 10 {
             return false;
         }
@@ -107,7 +106,7 @@ impl LruState {
             return false;
         }
         self.lru_cache_table[array_index] |= bit_mask;
-        !skip_meta_update
+        true
     }
 
     /// Java: `CacheHandler.cycleLRUCacheTable()`
@@ -600,6 +599,31 @@ impl CacheHandler {
 
     /// Java: CacheHandler.importFileToCache() — add a verified file to active cache.
     /// Increments cacheCount, cacheSize, updates LRU and staticRangeOldest.
+    /// Java: `CacheHandler.markRecentlyAccessed(hvFile, skipMetaUpdate)`
+    ///
+    /// Marks the LRU bit for the file. Returns `true` if the bit was NOT
+    /// previously set (i.e., the file hasn't been accessed recently).
+    /// If `skip_meta_update` is false and the file's last-modified time
+    /// is older than 7 days, updates it to now.
+    pub fn mark_recently_accessed(&self, hv: &HVFile, skip_meta_update: bool) -> bool {
+        let fileid_str = hv.fileid();
+        let mut lru = self.lru.lock().unwrap();
+        let mark_file = lru.mark_recently_accessed(fileid_str.as_str());
+        drop(lru);
+        if mark_file && !skip_meta_update {
+            let cache_path = hv.cache_path(&self.config.load().cache_dir);
+            let week = std::time::Duration::from_secs(7 * 24 * 3600);
+            if let Ok(meta) = std::fs::metadata(&cache_path)
+                && let Ok(mtime) = meta.modified()
+                && mtime < std::time::SystemTime::now() - week
+                && let Ok(file) = std::fs::File::open(&cache_path)
+            {
+                let _ = file.set_modified(std::time::SystemTime::now());
+            }
+        }
+        mark_file
+    }
+
     pub fn register_proxy_file(&self, hv_file: &HVFile) {
         // addFileToActiveCache
         self.cache_count.fetch_add(1, Ordering::Relaxed);
@@ -610,7 +634,7 @@ impl CacheHandler {
 
         // markRecentlyAccessed with skipMetaUpdate=true
         if let Ok(mut lru) = self.lru.try_lock() {
-            lru.mark_recently_accessed(hv_file.fileid().as_str(), true);
+            lru.mark_recently_accessed(hv_file.fileid().as_str());
         }
 
         // Create staticRangeOldest entry if missing

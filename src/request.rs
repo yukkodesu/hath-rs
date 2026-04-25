@@ -28,8 +28,9 @@ pub enum RequestType {
     Favicon,
     Robots,
     NotFound,
+    BadRequest,
+    MethodNotAllowed,
 }
-
 pub fn parse_request(request_line: &str, client_ip: IpAddr, config: &Config) -> RequestType {
     let parts: Vec<&str> = request_line.trim().split(' ').collect();
     if parts.len() != 3 { return RequestType::NotFound; }
@@ -37,7 +38,7 @@ pub fn parse_request(request_line: &str, client_ip: IpAddr, config: &Config) -> 
     let (method, uri, _ver) = (parts[0], parts[1], parts[2]);
 
     if !matches!(method.to_uppercase().as_str(), "GET" | "HEAD") {
-        return RequestType::NotFound;
+        return RequestType::MethodNotAllowed;
     }
 
     // Strip absolute URI prefix (section 5.1.2 RFC 2616)
@@ -71,8 +72,7 @@ pub fn parse_request(request_line: &str, client_ip: IpAddr, config: &Config) -> 
 }
 
 fn parse_file_serve(url_parts: &[&str], config: &Config) -> RequestType {
-    if url_parts.len() < 4 { return RequestType::NotFound; }
-
+    if url_parts.len() < 4 { return RequestType::BadRequest; }
     let fileid = url_parts[2].to_string();
     let hv_file = HVFile::from_fileid(&fileid);
     let additional = parse_additional(url_parts[3]);

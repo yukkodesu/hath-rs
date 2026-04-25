@@ -194,12 +194,18 @@ impl Config {
         }
     }
 
-    /// Pick an RPC host. Uses cached `rpc_current` if set, otherwise selects
-    /// a random server from `rpc_servers`. Callers should use rcu to persist
-    /// the chosen host back into `rpc_current`.
+    /// Pick an RPC host. Uses cached `rpc_current` if set and not last-failed,
+    /// otherwise selects a random server from `rpc_servers`.
     pub fn get_rpc_host(&self) -> String {
+        // If we have a cached host and it hasn't failed, reuse it.
         if let Some(ref host) = self.rpc_current {
-            return host.clone();
+            if let Some(ref failed) = self.rpc_last_failed
+                && *host == *failed {
+                    // Cached host is the failed one — fall through to random selection
+                    tracing::debug!("{} was marked as last failed (from cache)", failed);
+                } else {
+                    return host.clone();
+                }
         }
         if self.rpc_servers.is_empty() {
             return "rpc.hentaiathome.net".to_string();
@@ -241,8 +247,13 @@ impl Config {
         match setting {
             "min_client_build" => {
                 if let Ok(build) = value.parse::<i32>()
-                    && build > 178 {
-                        tracing::error!("Client too old! Required build: {}, our build: 178", build);
+                    && build > crate::rpc::CLIENT_BUILD {
+                        tracing::error!(
+                            "Your client is too old to connect to the Hentai@Home Network. \
+                             Required build: {}, our build: {}. Please download a newer version.",
+                            build, crate::rpc::CLIENT_BUILD
+                        );
+                        std::process::exit(1);
                     }
             }
             "cur_client_build" => {

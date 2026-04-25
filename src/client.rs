@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 /// Run `f` on each tick of an interval, until `shutdown` fires.
 async fn tick_every<F, Fut>(shutdown: tokio_util::sync::CancellationToken, every: Duration, mut f: F)
@@ -108,16 +108,32 @@ pub async fn run() -> Result<()> {
         bandwidth_monitor: Arc::new(ArcSwapOption::const_empty()),
         active_connections: Arc::new(AtomicU32::new(0)),
         last_overload_notification: Arc::new(Mutex::new(None)),
+        do_cert_refresh: Arc::new(AtomicBool::new(false)),
+        cert_refresh_notify: Arc::new(Notify::new()),
+        server_restart_token: Arc::new(ArcSwapOption::const_empty()),
+        server_terminated: Arc::new(AtomicBool::new(false)),
     };
 
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-    let server_shutdown = shutdown.clone();
+    let server_restart_token = tokio_util::sync::CancellationToken::new();
     let server_state = app_state.clone();
+    let server_restart_clone = server_restart_token.clone();
+    let global_shutdown_clone = shutdown.clone();
     tokio::spawn(async move {
-        if let Err(e) = server::start_server(server_state, server_shutdown, Some(ready_tx)).await {
+        if let Err(e) = server::start_server(
+            server_state,
+            global_shutdown_clone,
+            server_restart_clone,
+            Some(ready_tx),
+        )
+        .await
+        {
             tracing::error!("Server error: {}", e);
         }
     });
+    app_state
+        .server_restart_token
+        .store(Some(Arc::new(server_restart_token)));
 
     // Wait for server to bind before notifying the RPC server
     match ready_rx.await {
@@ -128,6 +144,139 @@ pub async fn run() -> Result<()> {
         Err(_) => {
             return Err(HathError::Config("Server startup failed unexpectedly".into()));
         }
+    }
+
+    // Cert refresh watcher: watches for refresh_certs RPC commands and
+    // performs a full server restart (suspend → reject new connections →
+    // drain → shutdown old listener → restart → resume).
+    // Java: HentaiAtHomeClient main loop handles doCertRefresh.
+    {
+        let state = app_state.clone();
+        let rpc = rpc_client.clone();
+        let global_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = state.cert_refresh_notify.notified() => {},
+                    _ = global_shutdown.cancelled() => break,
+                }
+                if !state.do_cert_refresh.load(Ordering::Acquire) {
+                    continue;
+                }
+                tracing::info!("Starting certificate refresh (full server restart)...");
+
+                // 1. Suspend traffic
+                match rpc.client_suspend().await {
+                    Ok(resp) if resp.status == ResponseStatus::Ok => {
+                        tracing::info!("Suspend notification successful");
+                    }
+                    _ => {
+                        tracing::warn!(
+                            "Failed to contact server to suspend client traffic; will retry"
+                        );
+                        tokio::time::sleep(Duration::from_secs(10)).await;
+                        state.cert_refresh_notify.notify_one();
+                        continue;
+                    }
+                }
+
+                // 2. Stop accepting new connections
+                state.allow_normal_connections.store(false, Ordering::SeqCst);
+
+                // 3. Wait 5s for in-flight requests to drain
+                tokio::time::sleep(Duration::from_secs(5)).await;
+
+                // 4. Reset terminated flag, then cancel restart token to stop old accept loop
+                state.server_terminated.store(false, Ordering::Release);
+                if let Some(token) = state.server_restart_token.load_full() {
+                    token.cancel();
+                }
+
+                // 5. Wait for old server to terminate (Java: up to 300s)
+                let mut wait_cycles = 0u32;
+                loop {
+                    if state.server_terminated.load(Ordering::Acquire) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    wait_cycles += 1;
+                    if wait_cycles >= 60 {
+                        tracing::warn!(
+                            "Server did not terminate after 300s, forcing restart"
+                        );
+                        break;
+                    }
+                    if wait_cycles > 1 {
+                        tracing::info!(
+                            "Waiting for HTTPServer to fully terminate... (waited {} seconds)",
+                            wait_cycles * 5
+                        );
+                    }
+                }
+
+                // 6. Wait 1s (Java: brief pause before restart)
+                tokio::time::sleep(Duration::from_secs(1)).await;
+
+                // 7. Restart server with new restart token
+                let new_restart = tokio_util::sync::CancellationToken::new();
+                let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+                let server_state = state.clone();
+                let new_restart_clone = new_restart.clone();
+                let global_shutdown_clone = global_shutdown.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = server::start_server(
+                        server_state,
+                        global_shutdown_clone,
+                        new_restart_clone,
+                        Some(ready_tx),
+                    )
+                    .await
+                    {
+                        tracing::error!("Server restart error: {}", e);
+                    }
+                });
+                state
+                    .server_restart_token
+                    .store(Some(Arc::new(new_restart)));
+
+                // 8. Wait for new server to bind
+                match ready_rx.await {
+                    Ok(Ok(port)) => {
+                        tracing::info!(
+                            "Server restarted successfully on port {}", port
+                        );
+                    }
+                    Ok(Err(e)) => {
+                        tracing::error!("Server restart failed to bind: {}", e);
+                        global_shutdown.cancel();
+                        break;
+                    }
+                    Err(_) => {
+                        tracing::error!(
+                            "Server restart failed unexpectedly (oneshot dropped)"
+                        );
+                        global_shutdown.cancel();
+                        break;
+                    }
+                }
+
+                // 9. Re-allow connections
+                state.allow_normal_connections.store(true, Ordering::SeqCst);
+
+                // 10. Resume traffic
+                match rpc.still_alive(true).await {
+                    Ok(resp) if resp.status == ResponseStatus::Ok => {
+                        tracing::info!("Resume notification successful");
+                    }
+                    _ => {
+                        tracing::warn!("Resume notification returned non-OK");
+                    }
+                }
+
+                state.do_cert_refresh.store(false, Ordering::Release);
+                tracing::info!("Certificate refresh completed successfully");
+            }
+        });
     }
 
     // 9. notifyStart: tell server we're ready (this triggers connectivity test)
@@ -162,6 +311,27 @@ pub async fn run() -> Result<()> {
     // 10. Allow normal connections
     allow_connections.store(true, Ordering::SeqCst);
     stats.program_started();
+
+    // Java: refreshServerSettings() after notifyStart to check schedule.
+    match rpc_client.refresh_settings().await {
+        Ok(refresh_resp) if refresh_resp.status == ResponseStatus::Ok => {
+            config.rcu(|current| {
+                let mut new = (**current).clone();
+                for line in &refresh_resp.lines {
+                    if let Some((key, value)) = line.split_once('=') {
+                        new.apply_setting(&key.to_lowercase(), value);
+                    }
+                }
+                Arc::new(new)
+            });
+        }
+        Ok(_) => {
+            tracing::warn!("refresh_settings returned non-OK status after startup");
+        }
+        Err(e) => {
+            tracing::warn!("Failed to refresh settings after startup: {}", e);
+        }
+    }
 
     // Java: initial blacklist fetch with 3-day delta at startup
     {

@@ -3,6 +3,7 @@ use crate::config::Config;
 use crate::error::{HathError, Result};
 use crate::hvfile::HVFile;
 use crate::utils;
+use rand::Rng;
 use reqwest::{Client, Url};
 use sha1::Digest;
 use std::io::{Read, Seek, SeekFrom};
@@ -46,9 +47,21 @@ impl ProxyFileDownloader {
         let hv_file = HVFile::from_fileid(fileid)
             .ok_or_else(|| HathError::Parse(format!("invalid fileid: {}", fileid)))?;
 
-        let client = Client::builder()
+        let mut builder = Client::builder()
             .user_agent(format!("Hentai@Home {}", crate::rpc::CLIENT_VERSION))
-            .build()
+            .connect_timeout(std::time::Duration::from_secs(5));
+
+        // Java: proxy support via Settings.getImageProxy()
+        if let (Some(proxy_type), Some(proxy_host), Some(proxy_port)) =
+            (&config.image_proxy_type, &config.image_proxy_host, config.image_proxy_port)
+        {
+            let proxy_url = format!("{}://{}:{}", proxy_type, proxy_host, proxy_port);
+            if let Ok(proxy) = reqwest::Proxy::all(&proxy_url) {
+                builder = builder.proxy(proxy);
+            }
+        }
+
+        let client = builder.build()
             .map_err(|e| HathError::Network(e.to_string()))?;
 
         let mut last_err = None;
@@ -119,10 +132,12 @@ impl ProxyFileDownloader {
             )));
         }
 
-        // Create temp file
+        // Java: File.createTempFile("proxyfile_", "", tempDir) — random suffix prevents
+        // concurrent requests for the same fileid from clobbering each other.
+        let random_suffix: u32 = rand::rng().next_u32();
         let temp_file = config
             .temp_dir
-            .join(format!("proxyfile_{}", hv_file.fileid().as_str()));
+            .join(format!("proxyfile_{}_{:08x}", hv_file.fileid().as_str(), random_suffix));
         let write_offset = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let notify = Arc::new(Notify::new());
         let body_done_notify = Arc::new(Notify::new());

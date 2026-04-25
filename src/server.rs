@@ -28,10 +28,10 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use regex::Regex;
 use std::sync::LazyLock;
 
@@ -58,6 +58,17 @@ pub struct AppState {
     /// Timestamp of last overload notification (rate-limited to once per 30s).
     /// Java: ServerHandler.lastOverloadNotification
     pub last_overload_notification: Arc<Mutex<Option<Instant>>>,
+    /// Flag: true when cert refresh (full server restart) is requested.
+    /// Set by the refresh_certs RPC handler, cleared by the cert refresh watcher.
+    pub do_cert_refresh: Arc<AtomicBool>,
+    /// Wakes the cert refresh watcher when a refresh_certs command arrives.
+    pub cert_refresh_notify: Arc<Notify>,
+    /// Shutdown token for the currently-running server accept loop.
+    /// Swapped during cert refresh to terminate the old listener and start a new one.
+    pub server_restart_token: Arc<ArcSwapOption<tokio_util::sync::CancellationToken>>,
+    /// Set to true by start_server() after the accept loop exits.
+    /// The cert refresh watcher polls this to wait for the old server to terminate.
+    pub server_terminated: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone)]
@@ -164,7 +175,16 @@ impl Service<Request<Incoming>> for HathService {
                         response::forbidden_response()
                     } else if let Some(ref hv) = hv_file {
                         let cache_path = hv.cache_path(&config.cache_dir);
-                        if cache_path.exists() {
+                        // Java: check exists AND file.length() == expectedSize before serving.
+                        // Wrong-sized files fall through to proxy fallback, not error.
+                        let cache_hit = cache_path.exists()
+                            && cache_path.metadata()
+                                .map(|m| m.len() == hv.size as u64)
+                                .unwrap_or(false);
+                        if cache_hit {
+                            // Java: markRecentlyAccessed — update LRU + file mtime.
+                            // Java: markRecentlyAccessed — updates LRU bit + file mtime.
+                            state.cache.mark_recently_accessed(hv, false);
                             state.stats.record_file_sent();
                             if !is_local && !is_rpc {
                                 state.stats.record_bytes_sent(hv.size as u64);
@@ -243,6 +263,8 @@ impl Service<Request<Incoming>> for HathService {
                 }
                 RequestType::Favicon => response::redirect_response("https://e-hentai.org/favicon.ico"),
                 RequestType::Robots => response::robots_response(),
+                RequestType::BadRequest => response::bad_request_response(),
+                RequestType::MethodNotAllowed => response::method_not_allowed_response(),
                 RequestType::NotFound => response::not_found_response(),
             };
 
@@ -376,22 +398,10 @@ async fn handle_server_command(
             response::text_response(hyper::StatusCode::OK, "")
         }
         "refresh_certs" => {
-            // Java: client.setCertRefresh() just sets a flag; actual refresh is async in main loop.
-            // Returns empty body with 200 OK regardless of outcome.
-            let cfg = state.config.load_full();
-            let state_clone = state.clone();
-            tokio::spawn(async move {
-                match build_tls_acceptor(&cfg, true).await {
-                    Ok((new_acceptor, cert_expiry)) => {
-                        state_clone.tls_acceptor.store(Some(Arc::new(new_acceptor)));
-                        *state_clone.cert_expiry.lock().await = Some(cert_expiry);
-                        tracing::info!("Certificate refreshed successfully");
-                    }
-                    Err(e) => {
-                        tracing::error!("Failed to refresh certificate: {}", e);
-                    }
-                }
-            });
+            // Java: client.setCertRefresh() — just set the flag, main loop does
+            // the actual work (suspend → shutdown → restart → resume).
+            state.do_cert_refresh.store(true, Ordering::Release);
+            state.cert_refresh_notify.notify_one();
             response::text_response(hyper::StatusCode::OK, "")
         }
         _ => response::text_response(hyper::StatusCode::OK, "INVALID_COMMAND"),
@@ -555,15 +565,18 @@ pub async fn nuke_old_connections(_state: &AppState) {
 }
 
 /// Start the TLS HTTP server. Sends readiness via `ready_tx` after successful bind.
+/// Listens for both `shutdown` (global/Ctrl+C) and `restart` (cert refresh).
 pub async fn start_server(
     state: AppState,
     shutdown: tokio_util::sync::CancellationToken,
+    restart: tokio_util::sync::CancellationToken,
     ready_tx: Option<tokio::sync::oneshot::Sender<std::result::Result<u16, String>>>,
 ) -> Result<()> {
     let config = state.config.load_full();
 
     // Build TLS acceptor (downloads cert if needed)
-    let (tls_acceptor, cert_expiry) = match build_tls_acceptor(&config, false).await {
+    // Java: always re-downloads the certificate on startup.
+    let (tls_acceptor, cert_expiry) = match build_tls_acceptor(&config, true).await {
         Ok((a, expiry)) => (a, expiry),
         Err(e) => {
             if let Some(tx) = ready_tx {
@@ -597,6 +610,7 @@ pub async fn start_server(
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
+            _ = restart.cancelled() => break,
             result = listener.accept() => {
                 let (stream, remote_addr) = match result {
                     Ok(c) => c,
@@ -707,5 +721,7 @@ pub async fn start_server(
         }
     }
 
+    // Signal that the server has fully terminated (for cert refresh watcher).
+    state.server_terminated.store(true, Ordering::Release);
     Ok(())
 }

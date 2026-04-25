@@ -80,6 +80,8 @@ impl FileDownloader {
 
     async fn attempt_download(&self, client: &Client) -> Result<Option<BytesMut>> {
         let mut resp = client.get(self.source.clone())
+            // Java: setRequestProperty("Connection", "Close")
+            .header("Connection", "Close")
             .timeout(std::time::Duration::from_millis(self.timeout_ms))
             .send().await
             .map_err(|e| HathError::Network(e.to_string()))?;

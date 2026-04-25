@@ -40,6 +40,16 @@ pub fn bad_request_response() -> Result<Response<StreamingBody>> {
     text_response(StatusCode::BAD_REQUEST, "Bad Request")
 }
 
+pub fn method_not_allowed_response() -> Result<Response<StreamingBody>> {
+    Response::builder()
+        .status(StatusCode::METHOD_NOT_ALLOWED)
+        .header(header::ALLOW, "GET, HEAD")
+        .header(header::CONTENT_TYPE, "text/html; charset=iso-8859-1")
+        .header(header::CONNECTION, "close")
+        .body(StreamingBody::new(b"Method Not Allowed".to_vec(), None))
+        .map_err(HathError::Http)
+}
+
 pub fn text_response(status: StatusCode, text: &str) -> Result<Response<StreamingBody>> {
     let len = text.len();
     let mut builder = Response::builder()

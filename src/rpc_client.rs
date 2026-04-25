@@ -62,7 +62,14 @@ impl RpcClient {
                 let fail_host = parsed.fail_host.as_deref().unwrap_or(&host);
                 let mut new = (**cfg).clone();
                 new.rpc_last_failed = Some(fail_host.to_string());
-                new.rpc_current = None;
+                // Don't clear rpc_current — get_rpc_host() checks last_failed
+                // against cached host and will skip it if it matches.
+                self.config.store(Arc::new(new));
+            } else {
+                // Java: persist the selected RPC host so subsequent calls reuse it.
+                // rpcServerCurrent is cached until cleared on failure or periodic reset.
+                let mut new = (**cfg).clone();
+                new.rpc_current = Some(host.clone());
                 self.config.store(Arc::new(new));
             }
 
