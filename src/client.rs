@@ -268,6 +268,7 @@ pub async fn run() -> Result<()> {
 
     // Graceful shutdown
     tracing::info!("Shutting down...");
+    cache.save_persistent_data();
     rpc_client.client_stop().await.ok();
     {
         let cfg = config.load();

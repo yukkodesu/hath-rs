@@ -2,7 +2,7 @@ pub mod persistent;
 pub mod pruner;
 
 use crate::config::Config;
-use crate::error::Result;
+use crate::error::{HathError, Result};
 use crate::hvfile::HVFile;
 use crate::stats::Stats;
 use crate::utils;
@@ -154,25 +154,27 @@ impl CacheHandler {
         }
 
         // Try persistent load first
-        let mut cache_loaded = false;
+        let cache_loaded;
         let (lru, cache_count, cache_size, static_range_oldest) =
             if !cfg.rescan_cache {
                 if let Some(state) = Self::try_load_persistent(&cfg) {
                     tracing::info!("Successfully loaded persistent cache data");
-                    cache_loaded = true;
                     let mut lru = LruState::new();
                     let len = state.lru_cache_table.len().min(LRU_CACHE_SIZE);
                     lru.lru_cache_table[..len].copy_from_slice(&state.lru_cache_table[..len]);
                     lru.lru_clear_pointer = state.lru_clear_pointer;
+                    cache_loaded = true;
                     (lru, state.cache_count, state.cache_size, state.static_range_ages)
                 } else {
                     Self::startup_cache_cleanup(&cfg)?;
                     let (count, size, ages) = Self::full_rescan(&cfg, &stats, cfg.verify_cache)?;
+                    cache_loaded = true;
                     (LruState::new(), count, size, ages)
                 }
             } else {
                 Self::startup_cache_cleanup(&cfg)?;
                 let (count, size, ages) = Self::full_rescan(&cfg, &stats, cfg.verify_cache)?;
+                cache_loaded = true;
                 (LruState::new(), count, size, ages)
             };
 
@@ -240,10 +242,208 @@ impl CacheHandler {
         Ok(())
     }
 
-    fn try_load_persistent(_config: &Config) -> Option<PersistentCacheState> {
-        // Stub: Phase 1 always does rescan (avoids Java serialization compat issue)
-        // Full impl would read pcache_info, verify SHA-1 of pcache_lru/pcache_ages
-        None
+    fn try_load_persistent(config: &Config) -> Option<PersistentCacheState> {
+        let info_path = config.data_dir.join("pcache_info");
+        let lru_path = config.data_dir.join("pcache_lru");
+        let ages_path = config.data_dir.join("pcache_ages");
+
+        if !info_path.exists() {
+            tracing::debug!("CacheHandler: Missing pcache_info, forcing rescan");
+            return None;
+        }
+
+        // Read and parse pcache_info (plain text key=value)
+        let info_content = utils::read_string_file(&info_path).ok()?;
+        let mut info_checksum: u32 = 0;
+        let mut ages_hash: Option<String> = None;
+        let mut lru_hash: Option<String> = None;
+        let mut cache_count: u32 = 0;
+        let mut cache_size: u64 = 0;
+        let mut lru_clear_pointer: usize = 0;
+
+        for line in info_content.lines() {
+            if let Some((key, value)) = line.split_once('=') {
+                match key {
+                    "cacheCount" => {
+                        cache_count = value.parse().ok()?;
+                        tracing::debug!("CacheHandler: Loaded persistent cacheCount={}", cache_count);
+                        info_checksum |= 1;
+                    }
+                    "cacheSize" => {
+                        cache_size = value.parse().ok()?;
+                        tracing::debug!("CacheHandler: Loaded persistent cacheSize={}", cache_size);
+                        info_checksum |= 2;
+                    }
+                    "lruClearPointer" => {
+                        lru_clear_pointer = value.parse().ok()?;
+                        tracing::debug!("CacheHandler: Loaded persistent lruClearPointer={}", lru_clear_pointer);
+                        info_checksum |= 4;
+                    }
+                    "agesHash" => {
+                        ages_hash = Some(value.to_string());
+                        tracing::debug!("CacheHandler: Found agesHash={}", value);
+                        info_checksum |= 8;
+                    }
+                    "lruHash" => {
+                        lru_hash = Some(value.to_string());
+                        tracing::debug!("CacheHandler: Found lruHash={}", value);
+                        info_checksum |= 16;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Safety: delete info file early. If the deserializer hangs or the process
+        // crashes, the next boot won't find pcache_info and will force a full rescan.
+        utils::remove_file(&info_path);
+
+        if info_checksum != 31 {
+            tracing::info!("CacheHandler: Persistent fields were missing, forcing rescan");
+            return None;
+        }
+
+        let ages_hash = ages_hash?;
+        let lru_hash = lru_hash?;
+
+        tracing::info!("CacheHandler: All persistent fields found, loading remaining objects");
+
+        // Verify SHA-1 and deserialize pcache_ages
+        let static_range_ages: HashMap<String, u64> =
+            match Self::read_persistent_object(&ages_path, &ages_hash) {
+                Ok(ages) => ages,
+                Err(e) => {
+                    tracing::warn!("CacheHandler: Failed to load pcache_ages: {}, forcing rescan", e);
+                    return None;
+                }
+            };
+        tracing::info!("CacheHandler: Loaded static range ages");
+
+        // Verify SHA-1 and deserialize pcache_lru
+        let lru_cache_table_vec: Vec<u16> =
+            match Self::read_persistent_object(&lru_path, &lru_hash) {
+                Ok(lru) => lru,
+                Err(e) => {
+                    tracing::warn!("CacheHandler: Failed to load pcache_lru: {}, forcing rescan", e);
+                    return None;
+                }
+            };
+        tracing::info!("CacheHandler: Loaded LRU cache");
+
+        Some(PersistentCacheState {
+            cache_count,
+            cache_size,
+            lru_clear_pointer,
+            static_range_ages,
+            lru_cache_table: lru_cache_table_vec,
+        })
+    }
+
+    /// Verify SHA-1 hash of a file and deserialize its contents with bincode.
+    /// Java: `CacheHandler.readCacheObject()`
+    fn read_persistent_object<T: serde::de::DeserializeOwned>(
+        file: &std::path::Path,
+        expected_hash: &str,
+    ) -> Result<T> {
+        if !file.exists() {
+            return Err(HathError::Cache(format!(
+                "Missing file: {}",
+                file.display()
+            )));
+        }
+
+        let actual_hash = utils::sha1_file(file).map_err(|e| {
+            HathError::Cache(format!(
+                "Failed to hash file {}: {}",
+                file.display(),
+                e
+            ))
+        })?;
+
+        if actual_hash != expected_hash {
+            return Err(HathError::Cache(format!(
+                "Incorrect file hash while reading {} (expected {}, got {})",
+                file.display(),
+                expected_hash,
+                actual_hash
+            )));
+        }
+
+        let data = fs::read(file).map_err(|e| {
+            HathError::Cache(format!(
+                "Failed to read file {}: {}",
+                file.display(),
+                e
+            ))
+        })?;
+
+        bincode::deserialize(&data).map_err(|e| {
+            HathError::Cache(format!(
+                "Failed to deserialize {}: {}",
+                file.display(),
+                e
+            ))
+        })
+    }
+
+    /// Save cache state to persistent files for fast restart.
+    /// Java: `CacheHandler.savePersistentData()`
+    ///
+    /// Writes three files:
+    /// - `pcache_ages`: bincode-serialized static range oldest timestamps
+    /// - `pcache_lru`: bincode-serialized LRU cache table
+    /// - `pcache_info`: plain-text metadata with SHA-1 hashes of the two files
+    pub fn save_persistent_data(&self) {
+        if !self.cache_loaded {
+            return;
+        }
+
+        let cfg = self.config.load();
+        let ages_path = cfg.data_dir.join("pcache_ages");
+        let lru_path = cfg.data_dir.join("pcache_lru");
+        let info_path = cfg.data_dir.join("pcache_info");
+
+        let result: std::result::Result<(), String> = (|| {
+            // 1. Serialize and write pcache_ages
+            {
+                let ages = self.static_range_oldest.lock().unwrap();
+                let ages_data = bincode::serialize(&*ages)
+                    .map_err(|e| format!("Failed to serialize ages: {}", e))?;
+                fs::write(&ages_path, &ages_data)
+                    .map_err(|e| format!("Failed to write ages: {}", e))?;
+            }
+            let ages_hash = utils::sha1_file(&ages_path)
+                .map_err(|e| format!("Failed to hash ages: {}", e))?;
+
+            // 2. Serialize and write pcache_lru
+            {
+                let lru = self.lru.lock().unwrap();
+                let lru_data = bincode::serialize(&lru.lru_cache_table[..])
+                    .map_err(|e| format!("Failed to serialize lru: {}", e))?;
+                fs::write(&lru_path, &lru_data)
+                    .map_err(|e| format!("Failed to write lru: {}", e))?;
+            }
+            let lru_hash = utils::sha1_file(&lru_path)
+                .map_err(|e| format!("Failed to hash lru: {}", e))?;
+
+            // 3. Write pcache_info (plain text key=value)
+            let cache_count = self.cache_count.load(Ordering::Relaxed);
+            let cache_size = self.cache_size.load(Ordering::Relaxed);
+            let lru_clear_pointer = self.lru.lock().unwrap().lru_clear_pointer;
+
+            let info = format!(
+                "cacheCount={}\ncacheSize={}\nlruClearPointer={}\nagesHash={}\nlruHash={}",
+                cache_count, cache_size, lru_clear_pointer, ages_hash, lru_hash
+            );
+            fs::write(&info_path, info.as_bytes())
+                .map_err(|e| format!("Failed to write info: {}", e))?;
+
+            Ok(())
+        })();
+
+        if let Err(e) = result {
+            tracing::warn!("Failed to save persistent cache data: {}", e);
+        }
     }
 
     fn delete_persistent_data(config: &Config) {
