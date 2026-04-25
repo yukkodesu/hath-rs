@@ -103,6 +103,7 @@ pub async fn run() -> Result<()> {
         tls_acceptor: Arc::new(ArcSwapOption::const_empty()),
         bandwidth_monitor: Arc::new(ArcSwapOption::const_empty()),
         active_connections: Arc::new(AtomicU32::new(0)),
+        last_overload_notification: Arc::new(Mutex::new(None)),
     };
 
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();

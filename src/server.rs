@@ -49,6 +49,9 @@ pub struct AppState {
     pub bandwidth_monitor: Arc<ArcSwapOption<BandwidthMonitor>>,
     /// Count of currently active connections (for max_connections enforcement).
     pub active_connections: Arc<std::sync::atomic::AtomicU32>,
+    /// Timestamp of last overload notification (rate-limited to once per 30s).
+    /// Java: ServerHandler.lastOverloadNotification
+    pub last_overload_notification: Arc<Mutex<Option<Instant>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -554,7 +557,15 @@ pub async fn start_server(
                             "Near connection limit: {} / {} active connections",
                             active, max_conns
                         );
-                        // TODO: notify dispatcher of overload (HTTPResponse.notifyOverload)
+                        // Java: ServerHandler.notifyOverload() — rate-limited to once per 30s
+                        let now = Instant::now();
+                        let mut last = state.last_overload_notification.lock().await;
+                        let should_notify = last.is_none_or(|t| now - t >= Duration::from_secs(30));
+                        if should_notify {
+                            *last = Some(now);
+                            drop(last);
+                            let _ = state.rpc_client.notify_overload().await;
+                        }
                     }
                 }
 
