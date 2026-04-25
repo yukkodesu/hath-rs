@@ -9,7 +9,7 @@ pub enum HathError {
     Http(#[from] http::Error),
 
     #[error("TLS error: {0}")]
-    Tls(#[from] rustls::Error),
+    Tls(String),
 
     #[error("Hyper error: {0}")]
     Hyper(#[from] hyper::Error),
@@ -37,6 +37,18 @@ pub enum HathError {
 
     #[error("{0}")]
     Fatal(String),
+}
+
+impl From<openssl::error::ErrorStack> for HathError {
+    fn from(e: openssl::error::ErrorStack) -> Self {
+        HathError::Tls(e.to_string())
+    }
+}
+
+impl From<openssl::ssl::Error> for HathError {
+    fn from(e: openssl::ssl::Error) -> Self {
+        HathError::Tls(e.to_string())
+    }
 }
 
 pub type Result<T> = std::result::Result<T, HathError>;

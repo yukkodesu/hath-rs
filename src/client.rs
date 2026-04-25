@@ -102,6 +102,7 @@ pub async fn run() -> Result<()> {
         allow_normal_connections: allow_connections.clone(),
         flood_control: flood_control.clone(),
         tls_acceptor: Arc::new(ArcSwapOption::const_empty()),
+        cert_expiry: Arc::new(Mutex::new(None)),
         bandwidth_monitor: Arc::new(ArcSwapOption::const_empty()),
         active_connections: Arc::new(AtomicU32::new(0)),
         last_overload_notification: Arc::new(Mutex::new(None)),
@@ -195,14 +196,33 @@ pub async fn run() -> Result<()> {
         }));
     }
 
-    // 5min: time check
+    // 5min: time check + cert expiry
     {
         let config = config.clone();
+        let app_state = app_state.clone();
+        let shutdown_signal = shutdown.clone();
         tokio::spawn(tick_every(shutdown.clone(), Duration::from_secs(300), move || {
             let config = config.clone();
+            let app_state = app_state.clone();
+            let shutdown_signal = shutdown_signal.clone();
             async move {
                 if config.load().server_time_delta.abs() > 86400 {
                     tracing::warn!("System time off by >24h. Correct your system clock.");
+                }
+                // Java: httpServer.isCertExpired() — cert must not expire within 24h
+                if let Some(expiry) = *app_state.cert_expiry.lock().await {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64;
+                    if expiry - now < 86400 {
+                        tracing::error!(
+                            "Either the system clock is significantly wrong, or something has \
+                             gone wrong with certificate renewal. Check your system clock and \
+                             internet connection, then restart the client manually."
+                        );
+                        shutdown_signal.cancel();
+                    }
                 }
             }
         }));

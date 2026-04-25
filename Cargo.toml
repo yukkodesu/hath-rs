@@ -7,12 +7,9 @@ edition = "2024"
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 hyper = { version = "1", features = ["full"] }
-hyper-rustls = "0.27"
 hyper-util = { version = "0.1", features = ["tokio"] }
-rustls = "0.23"
-rustls-pemfile = "2"
-tokio-rustls = "0.26"
-p12-keystore = "0.3.0-rc3"
+openssl = "0.10"
+tokio-openssl = "0.6"
 reqwest = { version = "0.13.2", default-features = false, features = ["rustls", "socks"] }
 clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
