@@ -194,6 +194,7 @@ impl Service<Request<Incoming>> for HathService {
                                                         proxy.temp_file,
                                                         proxy.write_offset,
                                                         proxy.notify,
+                                                        proxy.body_done_notify,
                                                         bwm_for_request,
                                                     )
                                                 }

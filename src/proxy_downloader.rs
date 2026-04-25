@@ -3,9 +3,9 @@ use crate::error::{HathError, Result};
 use crate::hvfile::HVFile;
 use crate::utils;
 use reqwest::{Client, Url};
+use sha1::Digest;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
-use sha1::Digest;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Notify;
@@ -28,17 +28,15 @@ pub struct ProxyFileDownloader {
     pub total_size: u64,
     /// Notified each time new data is written to the temp file.
     pub notify: Arc<Notify>,
+    /// Notified when the body finishes reading.
+    pub body_done_notify: Arc<Notify>,
     success: Arc<std::sync::Mutex<bool>>,
 }
 
 impl ProxyFileDownloader {
     /// Initialize with a list of upstream source URLs.
     /// Returns a handle that can be used to stream data to the client.
-    pub async fn new(
-        fileid: &str,
-        sources: &[Url],
-        config: &Config,
-    ) -> Result<Self> {
+    pub async fn new(fileid: &str, sources: &[Url], config: &Config) -> Result<Self> {
         let hv_file = HVFile::from_fileid(fileid)
             .ok_or_else(|| HathError::Parse(format!("invalid fileid: {}", fileid)))?;
 
@@ -52,7 +50,10 @@ impl ProxyFileDownloader {
         for source in sources {
             match Self::try_source(&client, source, &hv_file, config).await {
                 Ok(this) => return Ok(this),
-                Err(e) => { last_err = Some(e); continue; }
+                Err(e) => {
+                    last_err = Some(e);
+                    continue;
+                }
             }
         }
 
@@ -69,29 +70,44 @@ impl ProxyFileDownloader {
         let hath_request = format!(
             "{}-{}",
             config.client_id.0,
-            utils::sha1_string(&format!("{}{}", config.client_key.as_str(), hv_file.fileid().as_str()))
+            utils::sha1_string(&format!(
+                "{}{}",
+                config.client_key.as_str(),
+                hv_file.fileid().as_str()
+            ))
         );
 
-        let mut resp = client.get(source.clone())
+        let mut resp = client
+            .get(source.clone())
             .header("Hath-Request", &hath_request)
-            .header("User-Agent", format!("Hentai@Home {}", crate::rpc::CLIENT_VERSION))
+            .header(
+                "User-Agent",
+                format!("Hentai@Home {}", crate::rpc::CLIENT_VERSION),
+            )
             .timeout(std::time::Duration::from_secs(30))
-            .send().await
+            .send()
+            .await
             .map_err(|e| HathError::Network(e.to_string()))?;
 
-        let content_length = resp.content_length()
-            .ok_or_else(|| HathError::Network("missing Content-Length".into()))? as u64;
+        let content_length = resp
+            .content_length()
+            .ok_or_else(|| HathError::Network("missing Content-Length".into()))?
+            as u64;
 
         if content_length != hv_file.size as u64 {
             return Err(HathError::Network(format!(
-                "size mismatch: expected {}, got {}", hv_file.size, content_length
+                "size mismatch: expected {}, got {}",
+                hv_file.size, content_length
             )));
         }
 
         // Create temp file
-        let temp_file = config.temp_dir.join(format!("proxyfile_{}", hv_file.fileid().as_str()));
+        let temp_file = config
+            .temp_dir
+            .join(format!("proxyfile_{}", hv_file.fileid().as_str()));
         let write_offset = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let notify = Arc::new(Notify::new());
+        let body_done_notify = Arc::new(Notify::new());
         let success = Arc::new(std::sync::Mutex::new(false));
 
         let this = Self {
@@ -101,6 +117,7 @@ impl ProxyFileDownloader {
             write_offset: write_offset.clone(),
             total_size: content_length,
             notify: notify.clone(),
+            body_done_notify: body_done_notify.clone(),
             success,
         };
 
@@ -109,6 +126,7 @@ impl ProxyFileDownloader {
         let tf = temp_file.clone();
         let not = notify.clone();
         let succ = this.success.clone();
+        let bdn = body_done_notify.clone();
         let hash = hv_file.hash.clone();
         let expected_size = hv_file.size as u64;
         let fileid_owned = hv_file.fileid();
@@ -117,7 +135,10 @@ impl ProxyFileDownloader {
         tokio::spawn(async move {
             let mut file = match tokio::fs::File::create(&tf).await {
                 Ok(f) => f,
-                Err(_) => { not.notify_waiters(); return; }
+                Err(_) => {
+                    not.notify_waiters();
+                    return;
+                }
             };
 
             let mut sha1 = sha1::Sha1::new();
@@ -130,7 +151,9 @@ impl ProxyFileDownloader {
                     Err(_) => break,
                 };
                 sha1::Digest::update(&mut sha1, &chunk);
-                if file.write_all(&chunk).await.is_err() { break; }
+                if file.write_all(&chunk).await.is_err() {
+                    break;
+                }
                 downloaded += chunk.len() as u64;
                 wo.store(downloaded, std::sync::atomic::Ordering::SeqCst);
                 not.notify_waiters();
@@ -138,20 +161,36 @@ impl ProxyFileDownloader {
 
             drop(file);
 
-            // Verify hash
+            // Verify hash and import to cache (before deleting temp).
             let digest = utils::hex_encode(&sha1.finalize());
-            if downloaded == expected_size && digest == hash.as_str() {
-                // Import to cache
-                if let Some(hv) = HVFile::from_fileid(fileid_owned.as_str()) {
-                    let cache_path = hv.cache_path(&cache_dir);
-                    let _ = utils::ensure_dir(cache_path.parent().unwrap());
-                    let _ = std::fs::copy(&tf, &cache_path);
+            if downloaded == expected_size
+                && digest == hash.as_str()
+                && let Some(hv) = HVFile::from_fileid(fileid_owned.as_str())
+            {
+                let cache_path = hv.cache_path(&cache_dir);
+                let _ = utils::ensure_dir(cache_path.parent().unwrap());
+                if std::fs::copy(&tf, &cache_path).is_ok() {
+                    *succ.lock().unwrap() = true;
                 }
-                *succ.lock().unwrap() = true;
             }
 
-            utils::remove_file(&tf);
+            // Wake the body so it can read remaining chunks.
             not.notify_waiters();
+
+            // Wait for the body to finish reading, then delete temp.
+            // Java: checkFinalizeDownloadedFile — proxyThreadComplete
+            // notify_one() stores a permit, so even if body signaled first we'll wake.
+            let timeout = std::time::Duration::from_secs(300);
+            tokio::select! {
+                _ = bdn.notified() => {},
+                _ = tokio::time::sleep(timeout) => {
+                    tracing::warn!(
+                        "Proxy download: timeout waiting for body {}",
+                        fileid_owned
+                    );
+                }
+            }
+            utils::remove_file(&tf);
         });
 
         Ok(this)

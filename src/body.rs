@@ -36,6 +36,8 @@ enum DataSource {
         write_offset: Arc<AtomicU64>,
         notify: Arc<Notify>,
         start_time: Instant,
+        /// Wakes the download task when body finishes reading.
+        body_done_notify: Arc<Notify>,
     },
 }
 
@@ -90,12 +92,14 @@ impl StreamingBody {
     /// * `temp_file`  - Path to the temp file being written by the downloader.
     /// * `write_offset` - Atomic counter of bytes written so far.
     /// * `notify`     - Notified each time new data is written.
+    /// * `body_done_notify` - Wakes the download task when body signals completion.
     /// * `bwm`        - Optional bandwidth monitor.
     pub fn new_proxy(
         total_size: usize,
         temp_file: PathBuf,
         write_offset: Arc<AtomicU64>,
         notify: Arc<Notify>,
+        body_done_notify: Arc<Notify>,
         bwm: Option<Arc<BandwidthMonitor>>,
     ) -> Self {
         Self {
@@ -104,6 +108,7 @@ impl StreamingBody {
                 write_offset,
                 notify,
                 start_time: Instant::now(),
+                body_done_notify,
             },
             offset: 0,
             total_size,
@@ -112,6 +117,24 @@ impl StreamingBody {
             throttled: false,
             wait_fut: None,
         }
+    }
+}
+
+impl StreamingBody {
+    /// Signal the download task that the body has finished reading.
+    fn signal_body_done(&mut self) {
+        if let DataSource::Proxy { body_done_notify, .. } = &self.source {
+            body_done_notify.notify_one();
+        }
+    }
+}
+
+impl Drop for StreamingBody {
+    fn drop(&mut self) {
+        // Safety net: if the body is dropped without finishing normally
+        // (e.g. client disconnect), still signal the download task so it
+        // doesn't wait forever.
+        self.signal_body_done();
     }
 }
 
@@ -139,6 +162,9 @@ impl Body for StreamingBody {
 
             // Step 2: Check if done
             if self.offset >= self.total_size {
+                // Signal download task that body has finished reading.
+                // Java: proxyThreadCompleted() → proxyThreadComplete = true
+                self.signal_body_done();
                 return Poll::Ready(None);
             }
 
