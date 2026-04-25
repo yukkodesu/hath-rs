@@ -137,8 +137,9 @@ impl Service<Request<Incoming>> for HathService {
             let is_rpc = config.rpc_servers.iter().any(|s| s.to_string().to_lowercase() == host_addr);
 
             // Determine bandwidth monitor for this request.
-            // Local/RPC connections skip throttling; others use the shared BWM.
-            let bwm_for_request = if is_local || is_rpc {
+            // Java: Only local connections skip throttling.
+            // RPC servers on non-local IPs are still throttled.
+            let bwm_for_request = if is_local {
                 None
             } else {
                 state.bandwidth_monitor.load_full().clone()
@@ -154,10 +155,8 @@ impl Service<Request<Incoming>> for HathService {
 
             let request_type = request::parse_request(&request_line, client_ip, &config);
 
-            // Header throttling (Java: bwm.waitForQuota before writing header bytes)
-            if let Some(ref bwm) = bwm_for_request {
-                bwm.wait_for_quota(100).await;
-            }
+            // Clone BWM for later header throttling (bwm_for_request is consumed by response builders)
+            let bwm_for_header = bwm_for_request.clone();
 
             let mut resp = match request_type {
                 RequestType::FileServe { fileid, hv_file, additional, keystamp_valid } => {
@@ -185,7 +184,7 @@ impl Service<Request<Incoming>> for HathService {
                                             .filter_map(|s| Url::parse(s).ok())
                                             .collect();
                                         if !sources.is_empty() {
-                                            match ProxyFileDownloader::new(&fileid, &sources, &config).await {
+                                            match ProxyFileDownloader::new(&fileid, &sources, &config, Some(state.cache.clone())).await {
                                                 Ok(proxy) => {
                                                     let mime = hv.mime_type();
                                                     state.stats.record_file_sent();
@@ -261,6 +260,21 @@ impl Service<Request<Incoming>> for HathService {
                     r.headers_mut().insert(header::DATE, v);
                 }
             }
+
+            // Header throttling: deduct actual serialized header bytes.
+            // Java: bwm.waitForQuota(myThread, headerBytes.length) where headerBytes
+            // is the full serialized HTTP response header.
+            if let Some(ref bwm) = bwm_for_header
+                && let Ok(ref r) = resp {
+                    let reason_len = r.status().canonical_reason().map_or(0, |s| s.len());
+                    // Status line: "HTTP/1.1 XXX reason\r\n"
+                    let status_line_len = 13 + reason_len; // "HTTP/1.1 " + "XXX " + reason + "\r\n"
+                    let headers_len: usize = r.headers().iter()
+                        .map(|(k, v)| k.as_str().len() + 2 + v.as_bytes().len() + 2) // "Key: Value\r\n"
+                        .sum();
+                    let total_header_bytes = status_line_len + headers_len + 2; // + trailing \r\n
+                    bwm.wait_for_quota(total_header_bytes).await;
+                }
 
             match resp {
                 Ok(r) => Ok(r),
@@ -586,7 +600,10 @@ pub async fn start_server(
             result = listener.accept() => {
                 let (stream, remote_addr) = match result {
                     Ok(c) => c,
-                    Err(_) => continue,
+                    Err(e) => {
+                        tracing::warn!("Accept error: {}", e);
+                        continue;
+                    },
                 };
 
                 let state = state.clone();
@@ -626,7 +643,7 @@ pub async fn start_server(
                     let max_conns = state.config.load().max_connections();
                     let active = state.active_connections.load(Ordering::Relaxed);
 
-                    if active >= max_conns {
+                    if active > max_conns {
                         tracing::warn!(
                             "Exceeded the maximum allowed number of incoming connections ({}).",
                             max_conns
@@ -635,7 +652,7 @@ pub async fn start_server(
                         continue;
                     }
 
-                    if active >= (max_conns as f64 * 0.8) as u32 && active > 0 {
+                    if active > (max_conns as f64 * 0.8) as u32 && active > 0 {
                         tracing::warn!(
                             "Near connection limit: {} / {} active connections",
                             active, max_conns

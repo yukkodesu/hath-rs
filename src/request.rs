@@ -47,6 +47,11 @@ pub fn parse_request(request_line: &str, client_ip: IpAddr, config: &Config) -> 
         uri
     };
 
+    // Java: HTTPResponse.parseRequest() line 151 —
+    // requestParts[1].replace("%3d", "=") decodes URL-encoded equals signs
+    // in the additional segment before splitting into key=value pairs.
+    let uri = uri.replace("%3d", "=");
+
     let url_parts: Vec<&str> = uri.split('/').collect();
     if url_parts.len() < 2 || !url_parts[0].is_empty() {
         return RequestType::NotFound;

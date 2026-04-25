@@ -57,9 +57,11 @@ pub fn text_response(status: StatusCode, text: &str) -> Result<Response<Streamin
 }
 
 pub fn redirect_response(location: &str) -> Result<Response<StreamingBody>> {
-    // Java: empty body with 301 + Location header, no Content-Length
+    // Java: HTTPSession always sends Content-Type regardless of status code.
+    // Content-Type: text/html; charset=iso-8859-1 even on 301 redirect.
     Response::builder()
         .status(StatusCode::MOVED_PERMANENTLY)
+        .header(header::CONTENT_TYPE, "text/html; charset=iso-8859-1")
         .header(header::LOCATION, location)
         .header(header::CONNECTION, "close")
         .body(StreamingBody::new(vec![], None))
@@ -71,7 +73,7 @@ pub fn robots_response() -> Result<Response<StreamingBody>> {
     let len = body.len();
     Response::builder()
         .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/plain")
+        .header(header::CONTENT_TYPE, "text/plain; charset=iso-8859-1")
         .header(header::CONTENT_LENGTH, len)
         .header(header::CONNECTION, "close")
         .body(StreamingBody::new(body.to_vec(), None))

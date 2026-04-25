@@ -117,7 +117,7 @@ pub fn parse_server_response(body: &str, request_host: &str) -> ServerResponse {
             fail_code: Some("TEMPORARILY_UNAVAILABLE".into()),
             fail_host: Some(request_host.to_lowercase()),
         },
-        first if first.starts_with("KEY_EXPIRED") => ServerResponse {
+        "KEY_EXPIRED" => ServerResponse {
             status: ResponseStatus::Null,
             lines: vec![],
             fail_code: Some("KEY_EXPIRED".into()),

@@ -98,6 +98,14 @@ pub fn modified_millis(path: &Path) -> u64 {
         .unwrap_or(0)
 }
 
+/// Current time in milliseconds since UNIX epoch (matches Java System.currentTimeMillis())
+pub fn millis_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

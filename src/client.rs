@@ -42,6 +42,8 @@ pub async fn run() -> Result<()> {
     crate::logging::init_logging(&config.log_dir, !config.disable_logging)?;
 
     tracing::info!("Hentai@Home {} (Build {}) starting up", rpc::CLIENT_VERSION, rpc::CLIENT_BUILD);
+    tracing::info!("Copyright (c) 2008-2026, E-Hentai.org - all rights reserved.");
+    tracing::info!("This software comes with ABSOLUTELY NO WARRANTY. This is free software, and you are welcome to modify and redistribute it under the GPL v3 license.");
 
     let shutdown = tokio_util::sync::CancellationToken::new();
 
@@ -134,14 +136,47 @@ pub async fn run() -> Result<()> {
         let code = start_resp.fail_code.unwrap_or_default();
         tracing::error!("Startup failure: {}", code);
         if code.starts_with("FAIL_OTHER_CLIENT_CONNECTED") || code.starts_with("FAIL_CID_IN_USE") {
+            tracing::error!(
+                "Another client with the same ID ({}) is already connected to the server. \
+                 This can happen if the Java client is still running. \
+                 If you are switching from the Java client, make sure to stop it first, \
+                 then wait 5-10 minutes before starting this client.",
+                config.load().client_id.0
+            );
             return Err(HathError::Fatal(code));
         }
-        return Err(HathError::Fatal(format!("Unexpected client_start failure: {}", code)));
+        // Java: FAIL_CONNECT_TEST is non-fatal — prints troubleshooting info and keeps running
+        if code.starts_with("FAIL_CONNECT_TEST") {
+            tracing::error!(
+                "FAIL_CONNECT_TEST: The server was unable to verify your connection. \
+                 This usually means your port forwarding or firewall settings are incorrect. \
+                 Please ensure port {} is accessible from the internet.",
+                config.load().client_port
+            );
+            // Don't return error — continue running like Java does
+        } else {
+            return Err(HathError::Fatal(format!("Unexpected client_start failure: {}", code)));
+        }
     }
 
     // 10. Allow normal connections
     allow_connections.store(true, Ordering::SeqCst);
     stats.program_started();
+
+    // Java: initial blacklist fetch with 3-day delta at startup
+    {
+        let rpc_client = rpc_client.clone();
+        let cache = cache.clone();
+        tokio::spawn(async move {
+            if let Ok(resp) = rpc_client.get_blacklist(259200).await
+                && resp.status == ResponseStatus::Ok
+            {
+                for fileid in &resp.lines {
+                    let _ = cache.delete_file_from_cache(fileid);
+                }
+            }
+        });
+    }
 
     tracing::info!("Startup completed successfully. Starting normal operation");
 
@@ -253,12 +288,16 @@ pub async fn run() -> Result<()> {
             let rpc_client = rpc_client.clone();
             let cache = cache.clone();
             async move {
-                if let Ok(resp) = rpc_client.get_blacklist(43200).await
-                    && resp.status == ResponseStatus::Ok {
+                match rpc_client.get_blacklist(43200).await {
+                    Ok(resp) if resp.status == ResponseStatus::Ok => {
                         for fileid in &resp.lines {
                             let _ = cache.delete_file_from_cache(fileid);
                         }
                     }
+                    _ => {
+                        tracing::warn!("CacheHandler: Failed to retrieve file blacklist, will try again later.");
+                    }
+                }
             }
         }));
     }
@@ -266,10 +305,13 @@ pub async fn run() -> Result<()> {
     // Wait for shutdown signal
     shutdown.cancelled().await;
 
-    // Graceful shutdown
+    // Graceful shutdown (Java order: client_stop → drain connections → save data)
     tracing::info!("Shutting down...");
-    cache.save_persistent_data();
+    // Step 1: Notify server we're stopping
     rpc_client.client_stop().await.ok();
+    // Step 2: Save persistent cache data
+    cache.save_persistent_data();
+    // Step 3: Save client_login
     {
         let cfg = config.load();
         cfg.save_client_login().ok();

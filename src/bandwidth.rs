@@ -1,5 +1,5 @@
 use tokio::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const TIME_RESOLUTION: usize = 50;
 const WINDOW_LENGTH: usize = 5;
@@ -38,8 +38,10 @@ impl BandwidthMonitor {
         loop {
             let release = {
                 let mut inner = self.inner.lock().await;
-                let now = Instant::now();
-                let now_millis = now.elapsed().as_millis() as u64;
+                let now_millis = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
                 let epoch_seconds = now_millis / 1000;
                 let current_tick = ((now_millis - epoch_seconds * 1000) / self.millis_per_tick) as usize;
 

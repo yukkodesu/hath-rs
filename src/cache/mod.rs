@@ -598,6 +598,33 @@ impl CacheHandler {
         Ok(())
     }
 
+    /// Java: CacheHandler.importFileToCache() — add a verified file to active cache.
+    /// Increments cacheCount, cacheSize, updates LRU and staticRangeOldest.
+    pub fn register_proxy_file(&self, hv_file: &HVFile) {
+        // addFileToActiveCache
+        self.cache_count.fetch_add(1, Ordering::Relaxed);
+        self.cache_size.fetch_add(hv_file.size as u64, Ordering::Relaxed);
+        let count = self.cache_count.load(Ordering::Relaxed);
+        self.stats.set_cache_count(count);
+        self.stats.set_cache_size(self.get_cache_size_with_overhead());
+
+        // markRecentlyAccessed with skipMetaUpdate=true
+        if let Ok(mut lru) = self.lru.try_lock() {
+            lru.mark_recently_accessed(hv_file.fileid().as_str(), true);
+        }
+
+        // Create staticRangeOldest entry if missing
+        let static_range = hv_file.static_range();
+        let mut range_ages = self.static_range_oldest.lock().unwrap();
+        if !range_ages.contains_key(&static_range) {
+            tracing::debug!(
+                "CacheHandler: Created staticRangeOldest entry for {}",
+                static_range
+            );
+            range_ages.insert(static_range.to_string(), utils::millis_now());
+        }
+    }
+
     /// Java: checkAndPruneCache() — phase 1 (lock held, read-only).
     ///
     /// Checks if the cache is over the disk limit and returns a [`PruneAction`].
@@ -618,17 +645,26 @@ impl CacheHandler {
         );
 
         let range_ages = self.static_range_oldest.lock().unwrap();
-        if cache_size_with_overhead <= cache_limit
-            || count == 0
-            || range_ages.is_empty()
+        // Java: prune when over limit OR within 100 MB of limit
+        let mut bytes_to_free: u64 = 0;
+        let mut fast_delete = false;
+
+        if cache_size_with_overhead > cache_limit {
+            // the cache (with overhead) is larger than the limit
+            bytes_to_free = want_free + cache_size_with_overhead - cache_limit;
+            fast_delete = true;
+        } else if count > 0 && !range_ages.is_empty()
+            && cache_limit.saturating_sub(cache_size_with_overhead) < want_free
         {
+            // there is less than 100 MiB available cache space
+            bytes_to_free = want_free - (cache_limit - cache_size_with_overhead);
+        }
+
+        if bytes_to_free == 0 || count == 0 || range_ages.is_empty() {
             return PruneAction::NoPrune {
                 frequency: prune_frequency(cache_limit, cache_size_with_overhead, want_free),
             };
         }
-
-        let bytes_to_free = cache_size_with_overhead - cache_limit + 100_000_000;
-        let fast_delete = bytes_to_free > config.disklimit_bytes / 4;
 
         // Find the oldest static range and its age in one HashMap traversal.
         let (prune_static_range, oldest_range_age) = match range_ages
