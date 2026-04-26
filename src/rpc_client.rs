@@ -55,10 +55,19 @@ impl RpcClient {
                 key_expired_retries += 1;
                 tracing::info!("KEY_EXPIRED received, refreshing server stat and retrying ({}/{})...", key_expired_retries, 2);
                 // Inline server_stat to avoid recursive call()
-                if let Ok(stat_resp) = self.call_stat_inner().await
-                    && stat_resp.status == ResponseStatus::Ok {
+                match self.call_stat_inner().await {
+                    Ok(stat_resp) if stat_resp.status == ResponseStatus::Ok => {
                         crate::config::Config::apply_server_response(&self.config, &stat_resp);
                     }
+                    Ok(stat_resp) => {
+                        // Java: Null response → markRPCServerFailure
+                        let fail_host = stat_resp.fail_host.unwrap_or_else(|| "unknown".into());
+                        let mut new = (**cfg).clone();
+                        new.rpc_last_failed = Some(fail_host);
+                        self.config.store(Arc::new(new));
+                    }
+                    Err(_) => {} // network error already marked in call_stat_inner
+                }
                 continue; // retry the original request with corrected time
             }
 

@@ -85,7 +85,7 @@ pub async fn run() -> Result<()> {
 
     // 7. Init cache
     let stats = Arc::new(Stats::new());
-    let cache = Arc::new(CacheHandler::new(config.clone(), stats.clone())?);
+    let cache = Arc::new(CacheHandler::new(config.clone(), stats.clone(), shutdown.clone())?);
 
     // 8. Build AppState and spawn HTTP server
     let allow_connections = Arc::new(AtomicBool::new(false));

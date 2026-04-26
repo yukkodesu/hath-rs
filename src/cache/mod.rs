@@ -141,7 +141,7 @@ pub struct CacheHandler {
 }
 
 impl CacheHandler {
-    pub fn new(config: Arc<ArcSwap<Config>>, stats: Arc<Stats>) -> Result<Self> {
+    pub fn new(config: Arc<ArcSwap<Config>>, stats: Arc<Stats>, shutdown: tokio_util::sync::CancellationToken) -> Result<Self> {
         let cfg = config.load();
 
         // Clean up orphaned temp files (matching Java)
@@ -183,6 +183,34 @@ impl CacheHandler {
 
         stats.set_cache_count(cache_count);
         stats.set_cache_size(Self::cache_size_with_overhead(cache_size, cache_count, &cfg));
+
+        // Java: startup safety checks (CacheHandler constructor lines 111-127)
+        let static_range_count = static_range_oldest.len() as u32;
+        if !cfg.skip_free_space_check {
+            if let Ok(free) = fs2::free_space(&cfg.cache_dir) {
+                let needed = cfg.disklimit_bytes.saturating_sub(
+                    Self::cache_size_with_overhead(cache_size, cache_count, &cfg));
+                if free < needed {
+                    tracing::error!(
+                        "The storage device does not have enough space available to \
+                         hold the set cache size. Free up space for H@H, or reduce \
+                         the cache size from the H@H settings page."
+                    );
+                    shutdown.cancel();
+                    return Err(HathError::Fatal("insufficient disk space for cache".into()));
+                }
+            }
+        }
+        if cache_count < 1 && static_range_count > 20 {
+            tracing::error!(
+                "This client has static ranges assigned to it, but the cache is empty. \
+                 Check file permissions and file system integrity. If the cache has been \
+                 deleted or is otherwise lost, you have to manually reset your static \
+                 ranges from the H@H settings page."
+            );
+            shutdown.cancel();
+            return Err(HathError::Fatal("empty cache with static ranges assigned".into()));
+        }
 
         Ok(Self {
             config,

@@ -729,8 +729,22 @@ pub fn spawn_cert_refresh_watcher(
                 Ok(resp) if resp.status == rpc::ResponseStatus::Ok => {
                     tracing::info!("Resume notification successful");
                 }
-                _ => {
-                    tracing::warn!("Resume notification returned non-OK");
+                Ok(resp) => {
+                    let code = resp.fail_code.unwrap_or_default();
+                    // Java: TERM_BAD_NETWORK → dieWithError (terminate client)
+                    if code.starts_with("TERM_BAD_NETWORK") {
+                        tracing::error!(
+                            "Client is shutting down since the network is misconfigured; \
+                             correct firewall/forwarding settings then restart the client."
+                        );
+                        shutdown.cancel();
+                        break;
+                    } else {
+                        tracing::warn!("Failed stillAlive test: ({}) - will retry later", code);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Still-alive request failed: {}", e);
                 }
             }
 
