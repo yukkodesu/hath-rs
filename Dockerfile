@@ -1,7 +1,9 @@
-# Stage 1: Build (requires BuildKit for cache mounts)
-FROM rust:alpine AS builder
+# Stage 1: Build
+FROM rust:trixie AS builder
 
-RUN apk add --no-cache musl-dev openssl openssl-dev openssl-libs-static libcrypto3 pkgconfig libc-dev perl
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libssl-dev pkg-config perl \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
 
@@ -21,9 +23,11 @@ RUN --mount=type=cache,target=/build/target \
     cp /build/target/release/hath-rs /build/out/hath-rs
 
 # Stage 2: Runtime
-FROM alpine:latest
+FROM debian:trixie-slim
 
-RUN apk add --no-cache tini ca-certificates libgcc musl openssl openssl-dev openssl-libs-static libcrypto3
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    tini ca-certificates openssl openssl-provider-legacy \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/out/hath-rs /usr/local/bin/hath-rs
 COPY docker-entrypoint.sh /docker-entrypoint.sh
@@ -31,4 +35,4 @@ COPY docker-entrypoint.sh /docker-entrypoint.sh
 VOLUME ["/hath/cache", "/hath/data", "/hath/download", "/hath/log", "/hath/tmp"]
 WORKDIR /hath
 
-ENTRYPOINT ["/sbin/tini", "--", "/bin/sh", "/docker-entrypoint.sh"]
+ENTRYPOINT ["tini", "--", "/bin/sh", "/docker-entrypoint.sh"]
