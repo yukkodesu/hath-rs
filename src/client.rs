@@ -36,6 +36,16 @@ pub async fn run() -> Result<()> {
 
     let shutdown = tokio_util::sync::CancellationToken::new();
 
+    // Handle Ctrl+C / SIGTERM for graceful shutdown (Java: ShutdownHook)
+    {
+        let s = shutdown.clone();
+        tokio::spawn(async move {
+            tokio::signal::ctrl_c().await.ok();
+            tracing::info!("Interrupt received, shutting down gracefully...");
+            s.cancel();
+        });
+    }
+
     // 3. Save client_login if newly provided via CLI
     if config.client_id.0 > 0 && !config.client_key.as_str().is_empty() {
         let _ = config.save_client_login();

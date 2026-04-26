@@ -191,12 +191,19 @@ impl Service<Request<Incoming>> for HathService {
                             }
                             response::file_response(hv, &config.cache_dir, bwm_for_request).await
                         } else {
-                            // Cache miss — try proxy fallback.
-                            // Java: HTTPResponse.parseRequest() creates
-                            // HTTPResponseProcessorProxy(fileid, sources).
+                            // Cache miss — validate fileindex/xres before proxy fallback.
+                            // Java: fileindex must be numeric, xres must be "org" or numeric,
+                            // otherwise return local 404 without producing RPC traffic.
                             let fileindex = additional.get("fileindex");
                             let xres = additional.get("xres");
-                            if let (Some(fileindex), Some(xres)) = (fileindex, xres) {
+                            let fileindex_valid = fileindex
+                                .is_some_and(|v| v.parse::<u32>().is_ok());
+                            let xres_valid = xres.is_some_and(|v| {
+                                v == "org" || v.parse::<u32>().is_ok()
+                            });
+                            if fileindex_valid && xres_valid {
+                                let fileindex = fileindex.unwrap();
+                                let xres = xres.unwrap();
                                 match state.rpc_client.static_range_fetch(fileindex, xres, &fileid).await {
                                     Ok(sr) if sr.status == crate::rpc::ResponseStatus::Ok => {
                                         let sources: Vec<Url> = sr.lines.iter()
@@ -218,6 +225,7 @@ impl Service<Request<Incoming>> for HathService {
                                                         proxy.write_offset,
                                                         proxy.notify,
                                                         proxy.body_done_notify,
+                                                        proxy.download_done,
                                                         bwm_for_request,
                                                     )
                                                 }

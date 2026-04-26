@@ -9,6 +9,7 @@ use sha1::Digest;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Notify;
 
@@ -32,7 +33,9 @@ pub struct ProxyFileDownloader {
     pub notify: Arc<Notify>,
     /// Notified when the body finishes reading.
     pub body_done_notify: Arc<Notify>,
-    success: Arc<std::sync::Mutex<bool>>,
+    /// True when the download task has finished (success or failure).
+    /// The body reader checks this to avoid waiting for data that will never arrive.
+    pub download_done: Arc<AtomicBool>,
 }
 
 impl ProxyFileDownloader {
@@ -47,9 +50,11 @@ impl ProxyFileDownloader {
         let hv_file = HVFile::from_fileid(fileid)
             .ok_or_else(|| HathError::Parse(format!("invalid fileid: {}", fileid)))?;
 
+        // Java: setConnectTimeout(5000), setReadTimeout(30000). 300s total in chunk loop.
         let mut builder = Client::builder()
             .user_agent(format!("Hentai@Home {}", crate::rpc::CLIENT_VERSION))
-            .connect_timeout(std::time::Duration::from_secs(5));
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .read_timeout(std::time::Duration::from_secs(30));
 
         // Java: proxy support via Settings.getImageProxy()
         if let (Some(proxy_type), Some(proxy_host), Some(proxy_port)) =
@@ -115,7 +120,6 @@ impl ProxyFileDownloader {
                 "User-Agent",
                 format!("Hentai@Home {}", crate::rpc::CLIENT_VERSION),
             )
-            .timeout(std::time::Duration::from_secs(30))
             .send()
             .await
             .map_err(|e| HathError::Network(e.to_string()))?;
@@ -141,7 +145,7 @@ impl ProxyFileDownloader {
         let write_offset = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let notify = Arc::new(Notify::new());
         let body_done_notify = Arc::new(Notify::new());
-        let success = Arc::new(std::sync::Mutex::new(false));
+        let download_done = Arc::new(AtomicBool::new(false));
 
         let this = Self {
             content_length: hv_file.size as usize,
@@ -151,7 +155,7 @@ impl ProxyFileDownloader {
             total_size: content_length,
             notify: notify.clone(),
             body_done_notify: body_done_notify.clone(),
-            success,
+            download_done: download_done.clone(),
         };
 
         // Spawn download task
@@ -159,6 +163,7 @@ impl ProxyFileDownloader {
         let tf = temp_file.clone();
         let not = notify.clone();
         let bdn = body_done_notify.clone();
+        let dd = download_done.clone();
         let hash = hv_file.hash.clone();
         let expected_size = hv_file.size as u64;
         let fileid_owned = hv_file.fileid();
@@ -175,15 +180,50 @@ impl ProxyFileDownloader {
 
             let mut sha1 = sha1::Sha1::new();
             let mut downloaded = 0u64;
+            let download_start = std::time::Instant::now();
+            // Java: streamThreadSuccess — only set true when download completes
+            // successfully. Finalization (cache import) is gated on this flag.
+            let mut stream_success = false;
 
             loop {
                 let chunk = match resp.chunk().await {
                     Ok(Some(data)) => data,
-                    Ok(None) => break,
-                    Err(_) => break,
+                    Ok(None) => {
+                        // EOF: success only if we received all expected bytes
+                        if downloaded == expected_size {
+                            stream_success = true;
+                        } else {
+                            tracing::warn!(
+                                "Proxy download: premature EOF for {} ({} of {} bytes)",
+                                fileid_owned, downloaded, expected_size
+                            );
+                        }
+                        break;
+                    }
+                    Err(e) => {
+                        // reqwest read_timeout / connection error
+                        tracing::warn!(
+                            "Proxy download: error for {} ({} of {} bytes): {}",
+                            fileid_owned, downloaded, expected_size, e
+                        );
+                        break;
+                    }
                 };
+
+                if download_start.elapsed() > std::time::Duration::from_secs(300) {
+                    tracing::warn!(
+                        "Proxy download: total time limit exceeded for {}",
+                        fileid_owned
+                    );
+                    break;
+                }
+
                 sha1::Digest::update(&mut sha1, &chunk);
                 if file.write_all(&chunk).await.is_err() {
+                    tracing::warn!(
+                        "Proxy download: disk write error for {}",
+                        fileid_owned
+                    );
                     break;
                 }
                 downloaded += chunk.len() as u64;
@@ -193,12 +233,14 @@ impl ProxyFileDownloader {
 
             drop(file);
 
-            // Final wake so the body can read any remaining chunks.
+            // Signal that the download has finished (success or failure).
+            // The body reader checks this flag — if true and data is insufficient,
+            // it terminates instead of waiting for the full 300s timeout.
+            dd.store(true, Ordering::SeqCst);
+            // Final wake so the body can read remaining chunks or see the done flag.
             not.notify_waiters();
 
-            // Wait for the body to finish reading, then delete temp.
-            // Java: checkFinalizeDownloadedFile — proxyThreadComplete
-            // notify_one() stores a permit, so even if body signaled first we'll wake.
+            // Wait for the body to finish reading.
             let timeout = std::time::Duration::from_secs(300);
             tokio::select! {
                 _ = bdn.notified() => {},
@@ -210,19 +252,19 @@ impl ProxyFileDownloader {
                 }
             }
 
-            // Java: checkFinalizeDownloadedFile — import to cache after body finishes reading.
-            // Use copy (not rename) so the body can still read from temp while we import.
-            let digest = utils::hex_encode(&sha1.finalize());
-            if downloaded == expected_size
-                && digest == hash.as_str()
-                && let Some(hv) = HVFile::from_fileid(fileid_owned.as_str())
-            {
-                let cache_path = hv.cache_path(&cache_dir);
-                if let Ok(()) = utils::ensure_dir(cache_path.parent().unwrap())
-                    && std::fs::copy(&tf, &cache_path).is_ok()
-                        && let Some(ref cache) = cache_handler {
-                            cache.register_proxy_file(&hv);
-                        }
+            // Java: checkFinalizeDownloadedFile — only import on stream success
+            if stream_success {
+                let digest = utils::hex_encode(&sha1.finalize());
+                if digest == hash.as_str()
+                    && let Some(hv) = HVFile::from_fileid(fileid_owned.as_str())
+                {
+                    let cache_path = hv.cache_path(&cache_dir);
+                    if let Ok(()) = utils::ensure_dir(cache_path.parent().unwrap())
+                        && std::fs::copy(&tf, &cache_path).is_ok()
+                            && let Some(ref cache) = cache_handler {
+                                cache.register_proxy_file(&hv);
+                            }
+                }
             }
             utils::remove_file(&tf);
         });
@@ -261,8 +303,4 @@ impl ProxyFileDownloader {
         Ok(n)
     }
 
-    /// Check if the download was successful.
-    pub fn is_successful(&self) -> bool {
-        *self.success.lock().unwrap()
-    }
 }

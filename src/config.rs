@@ -203,8 +203,10 @@ impl Config {
                 && *host == *failed {
                     // Cached host is the failed one — fall through to random selection
                     tracing::debug!("{} was marked as last failed (from cache)", failed);
-                } else {
+                } else if self.rpc_port == 80 {
                     return host.clone();
+                } else {
+                    return format!("{}:{}", host, self.rpc_port);
                 }
         }
         if self.rpc_servers.is_empty() {

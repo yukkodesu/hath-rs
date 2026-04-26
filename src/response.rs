@@ -124,6 +124,7 @@ pub fn proxy_response(
     write_offset: Arc<AtomicU64>,
     notify: Arc<Notify>,
     body_done_notify: Arc<Notify>,
+    download_done: Arc<std::sync::atomic::AtomicBool>,
     bwm: Option<Arc<BandwidthMonitor>>,
 ) -> Result<Response<StreamingBody>> {
     let mut builder = Response::builder()
@@ -142,6 +143,7 @@ pub fn proxy_response(
             write_offset,
             notify,
             body_done_notify,
+            download_done,
             bwm,
         ))
         .map_err(HathError::Http)

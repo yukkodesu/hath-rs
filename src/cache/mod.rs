@@ -168,15 +168,15 @@ impl CacheHandler {
                     (lru, state.cache_count, state.cache_size, state.static_range_ages)
                 } else {
                     Self::startup_cache_cleanup(&cfg)?;
-                    let (count, size, ages) = Self::full_rescan(&cfg, &stats, cfg.verify_cache)?;
+                    let (lru, count, size, ages) = Self::full_rescan(&cfg, &stats, cfg.verify_cache)?;
                     cache_loaded = true;
-                    (LruState::new(), count, size, ages)
+                    (lru, count, size, ages)
                 }
             } else {
                 Self::startup_cache_cleanup(&cfg)?;
-                let (count, size, ages) = Self::full_rescan(&cfg, &stats, cfg.verify_cache)?;
+                let (lru, count, size, ages) = Self::full_rescan(&cfg, &stats, cfg.verify_cache)?;
                 cache_loaded = true;
-                (LruState::new(), count, size, ages)
+                (lru, count, size, ages)
             };
 
         Self::delete_persistent_data(&cfg);
@@ -454,8 +454,10 @@ impl CacheHandler {
     }
 
     /// Full rescan: iterates all cache directories, validates files, builds initial state.
-    /// Returns (count, size, range_ages). LRU always starts fresh (all zeros) after a rescan.
-    fn full_rescan(config: &Config, stats: &Stats, verify_cache: bool) -> Result<(u32, u64, HashMap<String, u64>)> {
+    /// Java: startupInitCache — returns LRU initialized with recently-accessed files
+    /// (modified within 7 days) so that the first request for a recent file won't
+    /// update its mtime unnecessarily.
+    fn full_rescan(config: &Config, stats: &Stats, verify_cache: bool) -> Result<(LruState, u32, u64, HashMap<String, u64>)> {
         // Java: create a single MessageDigest + ByteBuffer and reuse across all files
         let mut hasher = Sha1::new();
         let mut read_buf = vec![0u8; 65536];
@@ -470,6 +472,9 @@ impl CacheHandler {
         let mut count = 0u32;
         let mut size = 0u64;
         let mut range_ages = HashMap::new();
+        let mut lru = LruState::new();
+        // Java: recentlyAccessedCutoff = System.currentTimeMillis() - 604800000
+        let recently_accessed_cutoff = utils::millis_now().saturating_sub(604_800_000);
 
         for l1_dir in &utils::list_sorted_files(&config.cache_dir) {
             if !l1_dir.is_dir() { continue; }
@@ -542,6 +547,13 @@ impl CacheHandler {
                     let modified = utils::modified_millis(file);
                     oldest_modified = oldest_modified.min(modified);
 
+                    // Java: if fileLastModified > recentlyAccessedCutoff,
+                    // markRecentlyAccessed(hvFile, true) — sets LRU bit without
+                    // updating file mtime.
+                    if modified > recently_accessed_cutoff {
+                        lru.mark_recently_accessed(hv.fileid().as_str());
+                    }
+
                     if count.is_multiple_of(print_freq) {
                         tracing::info!("CacheHandler: Loaded {} files so far...", count);
                     }
@@ -557,7 +569,7 @@ impl CacheHandler {
         tracing::info!("Cache init complete: {} files, {} apparent bytes, {} estimated on disk",
             count, size, Self::cache_size_with_overhead(size, count, config));
 
-        Ok((count, size, range_ages))
+        Ok((lru, count, size, range_ages))
     }
 
     pub fn cache_size_with_overhead(actual: u64, count: u32, config: &Config) -> u64 {
