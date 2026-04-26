@@ -92,7 +92,11 @@ impl ProxyFileDownloader {
             }
         }
 
-        Err(last_err.unwrap_or_else(|| HathError::Network("all sources exhausted".into())))
+        // Java: returns 500 when no source works, 502 when source has bad content.
+        Err(last_err.unwrap_or_else(|| HathError::ProxyDownloader {
+            status: 500,
+            message: "all sources exhausted".into(),
+        }))
     }
 
     async fn try_source(
@@ -126,14 +130,20 @@ impl ProxyFileDownloader {
 
         let content_length = resp
             .content_length()
-            .ok_or_else(|| HathError::Network("missing Content-Length".into()))?
+            .ok_or_else(|| HathError::ProxyDownloader {
+                status: 502,
+                message: "missing Content-Length".into(),
+            })?
             as u64;
 
         if content_length != hv_file.size as u64 {
-            return Err(HathError::Network(format!(
-                "size mismatch: expected {}, got {}",
-                hv_file.size, content_length
-            )));
+            return Err(HathError::ProxyDownloader {
+                status: 502,
+                message: format!(
+                    "size mismatch: expected {}, got {}",
+                    hv_file.size, content_length
+                ),
+            });
         }
 
         // Java: File.createTempFile("proxyfile_", "", tempDir) — random suffix prevents

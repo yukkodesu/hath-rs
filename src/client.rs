@@ -89,6 +89,10 @@ pub async fn run() -> Result<()> {
 
     // 8. Build AppState and spawn HTTP server
     let allow_connections = Arc::new(AtomicBool::new(false));
+    // Java: reportShutdown — set after successful notifyStart(), never cleared.
+    // Used to decide whether to send client_stop on shutdown. allow_connections
+    // is toggled during cert refresh, so it can't serve this purpose.
+    let report_shutdown = Arc::new(AtomicBool::new(false));
     let flood_control = Arc::new(Mutex::new(HashMap::new()));
 
     let app_state = AppState {
@@ -169,6 +173,7 @@ pub async fn run() -> Result<()> {
     if startup_ok {
         // 10. Allow normal connections
         allow_connections.store(true, Ordering::SeqCst);
+        report_shutdown.store(true, Ordering::SeqCst);
         stats.program_started();
 
         // Refresh settings after notifyStart
@@ -204,10 +209,10 @@ pub async fn run() -> Result<()> {
     shutdown.cancelled().await;
 
     // Graceful shutdown (Java order: client_stop → drain connections → save data).
-    // Java: reportShutdown is only set after successful notifyStart();
-    // FAIL_CONNECT_TEST skips both reportShutdown and client_stop.
+    // Java: reportShutdown is only set after successful notifyStart().
+    // Unlike allow_connections, it's never toggled during cert refresh.
     tracing::info!("Shutting down...");
-    if allow_connections.load(Ordering::Relaxed) {
+    if report_shutdown.load(Ordering::Relaxed) {
         rpc_client.client_stop().await.ok();
     }
     cache.save_persistent_data();

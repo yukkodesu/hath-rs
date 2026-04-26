@@ -171,66 +171,67 @@ impl Service<Request<Incoming>> for HathService {
 
             let mut resp = match request_type {
                 RequestType::FileServe { fileid, hv_file, additional, keystamp_valid, head_only } => {
+                    // Java validates fileindex/xres BEFORE cache hit check
+                    // (line 194 in HTTPResponse.processRequest). Even a cached
+                    // file with missing/invalid arguments returns 404.
+                    let fileindex = additional.get("fileindex");
+                    let xres = additional.get("xres");
+                    let fileindex_valid = fileindex.is_some_and(|v| v.parse::<u32>().is_ok());
+                    let xres_valid = xres.is_some_and(|v| v == "org" || v.parse::<u32>().is_ok());
+
                     if !keystamp_valid {
                         response::forbidden_response()
-                    } else if let Some(ref hv) = hv_file {
+                    } else if hv_file.is_none() || !fileindex_valid || !xres_valid {
+                        response::not_found_response()
+                    } else {
+                        let hv = hv_file.as_ref().unwrap();
+                        let fileindex = fileindex.unwrap();
+                        let xres = xres.unwrap();
                         let cache_path = hv.cache_path(&config.cache_dir);
-                        // Java: check exists AND file.length() == expectedSize before serving.
-                        // Wrong-sized files fall through to proxy fallback, not error.
                         let cache_hit = cache_path.exists()
                             && cache_path.metadata()
                                 .map(|m| m.len() == hv.size as u64)
                                 .unwrap_or(false);
-                        if head_only {
-                            // HEAD: same resource check as GET (Java still calls
-                            // HTTPResponseProcessorFile.initialize), but skip body.
-                            // For cache miss, return headers without starting proxy
-                            // download (Java starts it anyway, but that's wasteful).
-                            if cache_hit {
-                                state.cache.mark_recently_accessed(hv, false);
-                                state.stats.record_file_sent();
-                                if !is_local && !is_rpc {
-                                    state.stats.record_bytes_sent(hv.size as u64);
-                                }
-                            }
-                            response::head_response(hv.mime_type(), hv.size as usize)
-                        } else if cache_hit {
-                            // Java: markRecentlyAccessed — update LRU + file mtime.
-                            // Java: markRecentlyAccessed — updates LRU bit + file mtime.
+                        if cache_hit {
                             state.cache.mark_recently_accessed(hv, false);
                             state.stats.record_file_sent();
                             if !is_local && !is_rpc {
                                 state.stats.record_bytes_sent(hv.size as u64);
                             }
-                            response::file_response(hv, &config.cache_dir, bwm_for_request).await
+                            if head_only {
+                                response::head_response(hv.mime_type(), hv.size as usize)
+                            } else {
+                                response::file_response(hv, &config.cache_dir, bwm_for_request).await
+                            }
                         } else {
-                            // Cache miss — validate fileindex/xres before proxy fallback.
-                            // Java: fileindex must be numeric, xres must be "org" or numeric,
-                            // otherwise return local 404 without producing RPC traffic.
-                            let fileindex = additional.get("fileindex");
-                            let xres = additional.get("xres");
-                            let fileindex_valid = fileindex
-                                .is_some_and(|v| v.parse::<u32>().is_ok());
-                            let xres_valid = xres.is_some_and(|v| {
-                                v == "org" || v.parse::<u32>().is_ok()
-                            });
-                            if fileindex_valid && xres_valid {
-                                let fileindex = fileindex.unwrap();
-                                let xres = xres.unwrap();
-                                match state.rpc_client.static_range_fetch(fileindex, xres, &fileid).await {
-                                    Ok(sr) if sr.status == crate::rpc::ResponseStatus::Ok => {
-                                        let sources: Vec<Url> = sr.lines.iter()
-                                            .filter(|s| !s.is_empty())
-                                            .filter_map(|s| Url::parse(s).ok())
-                                            .collect();
-                                        if !sources.is_empty() {
-                                            match ProxyFileDownloader::new(&fileid, &sources, &config, Some(state.cache.clone())).await {
-                                                Ok(proxy) => {
-                                                    let mime = hv.mime_type();
-                                                    state.stats.record_file_sent();
-                                                    if !is_local && !is_rpc {
-                                                        state.stats.record_bytes_sent(hv.size as u64);
-                                                    }
+                            match state.rpc_client.static_range_fetch(fileindex, xres, &fileid).await {
+                                Ok(sr) if sr.status == crate::rpc::ResponseStatus::Ok => {
+                                    let sources: Vec<Url> = sr.lines.iter()
+                                        .filter(|s| !s.is_empty())
+                                        .filter_map(|s| Url::parse(s).ok())
+                                        .collect();
+                                    if sources.is_empty() {
+                                        response::not_found_response()
+                                    } else {
+                                        // Java creates HTTPResponseProcessorProxy and calls
+                                        // initialize() for both GET and HEAD. The init result
+                                        // (connecting to source, checking Content-Length/size)
+                                        // determines the status code. HEAD then skips body.
+                                        match ProxyFileDownloader::new(&fileid, &sources, &config, Some(state.cache.clone())).await {
+                                            Ok(proxy) => {
+                                                let mime = hv.mime_type();
+                                                state.stats.record_file_sent();
+                                                if !is_local && !is_rpc {
+                                                    state.stats.record_bytes_sent(hv.size as u64);
+                                                }
+                                                if head_only {
+                                                    // Java: requestCompleted() → proxyThreadCompleted()
+                                                    // fires even for HEAD. Signal the download task
+                                                    // that the body side is done so it can finalize
+                                                    // immediately instead of waiting 300s.
+                                                    proxy.body_done_notify.notify_one();
+                                                    response::head_response(mime, proxy.total_size as usize)
+                                                } else {
                                                     response::proxy_response(
                                                         mime,
                                                         proxy.total_size as usize,
@@ -242,23 +243,24 @@ impl Service<Request<Incoming>> for HathService {
                                                         bwm_for_request,
                                                     )
                                                 }
-                                                Err(e) => {
-                                                    tracing::warn!("Proxy download failed for {}: {}", fileid, e);
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!("Proxy download failed for {}: {}", fileid, e);
+                                                if let crate::error::HathError::ProxyDownloader { status, message } = e {
+                                                    response::text_response(
+                                                        hyper::StatusCode::from_u16(status).unwrap_or(hyper::StatusCode::INTERNAL_SERVER_ERROR),
+                                                        &message,
+                                                    )
+                                                } else {
                                                     response::not_found_response()
                                                 }
                                             }
-                                        } else {
-                                            response::not_found_response()
                                         }
                                     }
-                                    _ => response::not_found_response(),
                                 }
-                            } else {
-                                response::not_found_response()
+                                _ => response::not_found_response(),
                             }
                         }
-                    } else {
-                        response::not_found_response()
                     }
                 }
                 RequestType::ServerCommand { command, additional, valid } => {

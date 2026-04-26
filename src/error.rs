@@ -29,6 +29,13 @@ pub enum HathError {
     #[error("Network error: {0}")]
     Network(String),
 
+    /// Proxy download error carrying the HTTP status code to return.
+    /// Java: ProxyFileDownloader.initialize() returns 502 for bad source
+    /// (missing Content-Length, oversized, size mismatch) or 500 for
+    /// connection failure after exhausting all sources.
+    #[error("Proxy download error ({status}): {message}")]
+    ProxyDownloader { status: u16, message: String },
+
     #[error("Shutdown requested")]
     Shutdown,
 
