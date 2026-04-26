@@ -244,7 +244,9 @@ impl Config {
     }
 
     pub fn apply_setting(&mut self, setting: &str, value: &str) {
-        match setting {
+        // Java: replace '-' with '_' before matching (e.g. rpc-server-ip → rpc_server_ip)
+        let setting = &setting.replace('-', "_");
+        match setting.as_str() {
             "min_client_build" => {
                 if let Ok(build) = value.parse::<i32>()
                     && build > crate::rpc::CLIENT_BUILD {
@@ -270,6 +272,15 @@ impl Config {
                 self.rpc_servers = value.split(';')
                     .filter_map(|s| s.trim().parse::<IpAddr>().ok())
                     .collect();
+                // Java: clear cached host if it's no longer in the new server list
+                if let Some(ref current) = self.rpc_current {
+                    let still_valid = self.rpc_servers.iter().any(|s| {
+                        s.to_string().to_lowercase() == *current
+                    });
+                    if !still_valid {
+                        self.rpc_current = None;
+                    }
+                }
             }
             "rpc_path" => self.rpc_path = value.to_string(),
             "host" => self.client_host = value.to_string(),
@@ -303,7 +314,6 @@ impl Config {
                 for s in value.split(';') {
                     if s.len() == 4 { self.static_ranges.insert(s.to_string(), 1); }
                 }
-                self.static_range_count = self.static_ranges.len() as u32;
             }
             "static_range_count" => self.static_range_count = value.parse().unwrap_or(self.static_range_count),
             "cache_dir" => self.cache_dir = PathBuf::from(value),

@@ -114,6 +114,8 @@ where
     Fut: std::future::Future<Output = ()> + Send,
 {
     let mut tick = tokio::time::interval(every);
+    // Skip the immediate first tick (Java main loop sleeps before first iteration).
+    tick.tick().await;
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
