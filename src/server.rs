@@ -173,15 +173,6 @@ impl Service<Request<Incoming>> for HathService {
                 RequestType::FileServe { fileid, hv_file, additional, keystamp_valid, head_only } => {
                     if !keystamp_valid {
                         response::forbidden_response()
-                    } else if head_only {
-                        // HEAD request: return headers only, skip file read and
-                        // proxy download side effects (Java does the same — it
-                        // constructs headers identically but skips the body write).
-                        if let Some(ref hv) = hv_file {
-                            response::head_response(hv.mime_type(), hv.size as usize)
-                        } else {
-                            response::not_found_response()
-                        }
                     } else if let Some(ref hv) = hv_file {
                         let cache_path = hv.cache_path(&config.cache_dir);
                         // Java: check exists AND file.length() == expectedSize before serving.
@@ -190,7 +181,20 @@ impl Service<Request<Incoming>> for HathService {
                             && cache_path.metadata()
                                 .map(|m| m.len() == hv.size as u64)
                                 .unwrap_or(false);
-                        if cache_hit {
+                        if head_only {
+                            // HEAD: same resource check as GET (Java still calls
+                            // HTTPResponseProcessorFile.initialize), but skip body.
+                            // For cache miss, return headers without starting proxy
+                            // download (Java starts it anyway, but that's wasteful).
+                            if cache_hit {
+                                state.cache.mark_recently_accessed(hv, false);
+                                state.stats.record_file_sent();
+                                if !is_local && !is_rpc {
+                                    state.stats.record_bytes_sent(hv.size as u64);
+                                }
+                            }
+                            response::head_response(hv.mime_type(), hv.size as usize)
+                        } else if cache_hit {
                             // Java: markRecentlyAccessed — update LRU + file mtime.
                             // Java: markRecentlyAccessed — updates LRU bit + file mtime.
                             state.cache.mark_recently_accessed(hv, false);
@@ -270,7 +274,8 @@ impl Service<Request<Incoming>> for HathService {
                             state.stats.record_bytes_sent(testsize as u64);
                         }
                         if head_only {
-                            response::head_response("application/octet-stream", testsize as usize)
+                            // Java: speedtest inherits CONTENT_TYPE_DEFAULT = text/html
+                            response::head_response("text/html; charset=iso-8859-1", testsize as usize)
                         } else {
                             response::speedtest_response(testsize as usize, bwm_for_request)
                         }

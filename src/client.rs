@@ -203,9 +203,13 @@ pub async fn run() -> Result<()> {
     // Wait for shutdown signal
     shutdown.cancelled().await;
 
-    // Graceful shutdown (Java order: client_stop → drain connections → save data)
+    // Graceful shutdown (Java order: client_stop → drain connections → save data).
+    // Java: reportShutdown is only set after successful notifyStart();
+    // FAIL_CONNECT_TEST skips both reportShutdown and client_stop.
     tracing::info!("Shutting down...");
-    rpc_client.client_stop().await.ok();
+    if allow_connections.load(Ordering::Relaxed) {
+        rpc_client.client_stop().await.ok();
+    }
     cache.save_persistent_data();
     {
         let cfg = config.load();
