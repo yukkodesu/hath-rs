@@ -820,11 +820,14 @@ pub async fn start_server(
         }
     };
 
-    // Create bandwidth monitor if throttling is enabled and not disabled
+    // Create bandwidth monitor if throttling is enabled and not disabled.
+    // Explicitly clear on server restart so cert refresh doesn't leak old monitor.
     if config.throttle_bytes > 0 && !config.disable_bwm {
         state.bandwidth_monitor.store(Some(Arc::new(
             BandwidthMonitor::new(config.throttle_bytes)
         )));
+    } else {
+        state.bandwidth_monitor.store(None);
     }
 
     // Store in AppState so it can be refreshed at runtime

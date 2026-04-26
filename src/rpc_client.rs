@@ -167,14 +167,31 @@ pub fn spawn_still_alive_heartbeat(
     stats: Arc<Stats>,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
-    tokio::spawn(crate::utils::tick_every(shutdown, Duration::from_secs(110), move || {
+    tokio::spawn(crate::utils::tick_every(shutdown.clone(), Duration::from_secs(110), move || {
         let rpc_client = rpc_client.clone();
         let stats = stats.clone();
+        let shutdown = shutdown.clone();
         async move {
-            if let Err(e) = rpc_client.still_alive(false).await {
-                tracing::warn!("Still-alive failed: {}", e);
-            } else {
-                stats.record_server_contact();
+            match rpc_client.still_alive(false).await {
+                Ok(resp) if resp.status == ResponseStatus::Ok => {
+                    stats.record_server_contact();
+                }
+                Ok(resp) => {
+                    let code = resp.fail_code.unwrap_or_default();
+                    // Java: TERM_BAD_NETWORK → dieWithError (terminate client)
+                    if code.starts_with("TERM_BAD_NETWORK") {
+                        tracing::error!(
+                            "Client is shutting down since the network is misconfigured; \
+                             correct firewall/forwarding settings then restart the client."
+                        );
+                        shutdown.cancel();
+                    } else {
+                        tracing::warn!("Failed stillAlive test: ({}) - will retry later", code);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Still-alive request failed: {}", e);
+                }
             }
         }
     }));
