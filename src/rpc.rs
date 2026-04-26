@@ -3,6 +3,7 @@ use crate::error::{HathError, Result};
 use crate::utils;
 use reqwest::Url;
 use std::fmt;
+use std::net::IpAddr;
 
 pub const CLIENT_BUILD: i32 = 178;
 pub const CLIENT_VERSION: &str = "1.6.5";
@@ -87,9 +88,25 @@ pub fn make_rpc_query(act: Action, add: &str, config: &Config) -> String {
 pub fn make_rpc_url(act: Action, add: &str, config: &Config) -> Result<Url> {
     let host = config.get_rpc_host();
     let query = make_rpc_query(act, add, config);
-    // rpc_path already ends with '?', e.g. "15/rpc?" — do not add another
-    let url_str = format!("http://{}/{}{}", host, config.rpc_path, query);
-    Url::parse(&url_str).map_err(|e| HathError::Rpc(format!("invalid URL: {}", e)))
+    let mut url = Url::parse("http://rpc.hentaiathome.net/")
+        .map_err(|e| HathError::Rpc(format!("invalid URL base: {}", e)))?;
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        url.set_ip_host(ip)
+            .map_err(|_| HathError::Rpc("invalid URL host".into()))?;
+    } else {
+        url.set_host(Some(&host))
+            .map_err(|e| HathError::Rpc(format!("invalid URL host: {}", e)))?;
+    }
+    if config.rpc_port == 80 {
+        url.set_port(None)
+            .map_err(|_| HathError::Rpc("invalid URL port".into()))?;
+    } else {
+        url.set_port(Some(config.rpc_port))
+            .map_err(|_| HathError::Rpc("invalid URL port".into()))?;
+    }
+    url.set_path(config.rpc_path.trim_end_matches('?'));
+    url.set_query(Some(&query));
+    Ok(url)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -171,6 +188,31 @@ mod tests {
         assert!(q.contains("act=client_start"));
         assert!(q.contains("cid=12345"));
         assert!(q.contains("actkey="));
+    }
+
+    #[test]
+    fn test_make_rpc_url_brackets_ipv6_host() {
+        let mut config = test_config();
+        config.apply_setting("rpc_server_ip", "::ffff:192.0.2.1");
+
+        let url = make_rpc_url(Action::GetCertificate, "", &config).unwrap();
+
+        assert!(url
+            .as_str()
+            .starts_with("http://[::ffff:c000:201]/15/rpc?clientbuild=178&act=get_cert"));
+    }
+
+    #[test]
+    fn test_make_rpc_url_sets_non_default_rpc_port() {
+        let mut config = test_config();
+        config.apply_setting("rpc_server_ip", "192.0.2.1");
+        config.apply_setting("rpc_server_port", "8080");
+
+        let url = make_rpc_url(Action::GetCertificate, "", &config).unwrap();
+
+        assert!(url
+            .as_str()
+            .starts_with("http://192.0.2.1:8080/15/rpc?clientbuild=178&act=get_cert"));
     }
 
     #[test]

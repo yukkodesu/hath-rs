@@ -7,6 +7,7 @@ use rand::Rng;
 use reqwest::{Client, Url};
 use sha1::Digest;
 use std::io::{Read, Seek, SeekFrom};
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -60,8 +61,8 @@ impl ProxyFileDownloader {
         if let (Some(proxy_type), Some(proxy_host), Some(proxy_port)) =
             (&config.image_proxy_type, &config.image_proxy_host, config.image_proxy_port)
         {
-            let proxy_url = format!("{}://{}:{}", proxy_type, proxy_host, proxy_port);
-            if let Ok(proxy) = reqwest::Proxy::all(&proxy_url) {
+            if let Ok(proxy_url) = build_proxy_url(proxy_type, proxy_host, proxy_port)
+                && let Ok(proxy) = reqwest::Proxy::all(proxy_url.as_str()) {
                 builder = builder.proxy(proxy);
             }
         }
@@ -117,7 +118,7 @@ impl ProxyFileDownloader {
             ))
         );
 
-        let mut resp = client
+        let resp = client
             .get(source.clone())
             .header("Hath-Request", &hath_request)
             .header(
@@ -179,7 +180,8 @@ impl ProxyFileDownloader {
             download_done: download_done.clone(),
         };
 
-        // Spawn download task
+        // Spawn download task with inner retry matching Java's
+        // do { ... } while(!streamThreadSuccess && --trycounter > 0)
         let wo = write_offset.clone();
         let tf = temp_file.clone();
         let not = notify.clone();
@@ -189,70 +191,103 @@ impl ProxyFileDownloader {
         let expected_size = hv_file.size as u64;
         let fileid_owned = hv_file.fileid();
         let cache_dir = config.cache_dir.clone();
+        let retry_source = source.clone();
+        let retry_client = client.clone();
+        let retry_hath = hath_request.clone();
 
         tokio::spawn(async move {
-            let mut file = match tokio::fs::File::create(&tf).await {
-                Ok(f) => f,
-                Err(_) => {
-                    not.notify_waiters();
-                    return;
-                }
-            };
-
-            let mut sha1 = sha1::Sha1::new();
-            let mut downloaded = 0u64;
-            let download_start = std::time::Instant::now();
-            // Java: streamThreadSuccess — only set true when download completes
-            // successfully. Finalization (cache import) is gated on this flag.
             let mut stream_success = false;
+            let mut try_count = 3u32;
+            let mut final_digest = String::new();
 
-            loop {
-                let chunk = match resp.chunk().await {
-                    Ok(Some(data)) => data,
-                    Ok(None) => {
-                        // EOF: success only if we received all expected bytes
-                        if downloaded == expected_size {
-                            stream_success = true;
-                        } else {
-                            tracing::warn!(
-                                "Proxy download: premature EOF for {} ({} of {} bytes)",
-                                fileid_owned, downloaded, expected_size
-                            );
-                        }
-                        break;
+            while !stream_success && try_count > 0 {
+                try_count -= 1;
+
+                let mut file = match tokio::fs::File::create(&tf).await {
+                    Ok(f) => f,
+                    Err(_) => {
+                        not.notify_waiters();
+                        return;
                     }
+                };
+
+                let mut sha1 = sha1::Sha1::new();
+                let mut downloaded = 0u64;
+                let download_start = std::time::Instant::now();
+
+                // Java: each retry opens a new InputStream on the connection
+                let mut resp = match retry_client
+                    .get(retry_source.clone())
+                    .header("Hath-Request", &retry_hath)
+                    .header("User-Agent", format!("Hentai@Home {}", crate::rpc::CLIENT_VERSION))
+                    .send()
+                    .await
+                {
+                    Ok(r) => r,
                     Err(e) => {
-                        // reqwest read_timeout / connection error
-                        tracing::warn!(
-                            "Proxy download: error for {} ({} of {} bytes): {}",
-                            fileid_owned, downloaded, expected_size, e
-                        );
+                        tracing::warn!("Proxy download: request failed for {}: {}", fileid_owned, e);
                         break;
                     }
                 };
 
-                if download_start.elapsed() > std::time::Duration::from_secs(300) {
-                    tracing::warn!(
-                        "Proxy download: total time limit exceeded for {}",
-                        fileid_owned
-                    );
-                    break;
+                loop {
+                    let chunk = match resp.chunk().await {
+                        Ok(Some(data)) => data,
+                        Ok(None) => {
+                            if downloaded == expected_size {
+                                stream_success = true;
+                                final_digest = utils::hex_encode(&sha1.finalize());
+                            } else {
+                                tracing::warn!(
+                                    "Proxy download: premature EOF for {} ({} of {} bytes)",
+                                    fileid_owned, downloaded, expected_size
+                                );
+                            }
+                            break;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Proxy download: error for {} ({} of {} bytes): {}",
+                                fileid_owned, downloaded, expected_size, e
+                            );
+                            break;
+                        }
+                    };
+
+                    if download_start.elapsed() > std::time::Duration::from_secs(300) {
+                        tracing::warn!(
+                            "Proxy download: total time limit exceeded for {}",
+                            fileid_owned
+                        );
+                        break;
+                    }
+
+                    sha1::Digest::update(&mut sha1, &chunk);
+                    if file.write_all(&chunk).await.is_err() {
+                        tracing::warn!(
+                            "Proxy download: disk write error for {}",
+                            fileid_owned
+                        );
+                        break;
+                    }
+                    downloaded += chunk.len() as u64;
+                    wo.store(downloaded, std::sync::atomic::Ordering::SeqCst);
+                    not.notify_waiters();
                 }
 
-                sha1::Digest::update(&mut sha1, &chunk);
-                if file.write_all(&chunk).await.is_err() {
-                    tracing::warn!(
-                        "Proxy download: disk write error for {}",
-                        fileid_owned
-                    );
-                    break;
+                drop(file);
+
+                // Reset write_offset on failure so body side knows to keep waiting
+                if !stream_success {
+                    wo.store(0, std::sync::atomic::Ordering::SeqCst);
+                    if try_count > 0 {
+                        tracing::debug!(
+                            "Proxy download: retrying... ({} tries left) for {}",
+                            try_count, fileid_owned
+                        );
+                    }
                 }
-                downloaded += chunk.len() as u64;
-                wo.store(downloaded, std::sync::atomic::Ordering::SeqCst);
-                not.notify_waiters();
             }
-
-            drop(file);
 
             // Signal that the download has finished (success or failure).
             // The body reader checks this flag — if true and data is insufficient,
@@ -274,9 +309,7 @@ impl ProxyFileDownloader {
             }
 
             // Java: checkFinalizeDownloadedFile — only import on stream success
-            if stream_success {
-                let digest = utils::hex_encode(&sha1.finalize());
-                if digest == hash.as_str()
+            if stream_success && final_digest == hash.as_str()
                     && let Some(hv) = HVFile::from_fileid(fileid_owned.as_str())
                 {
                     let cache_path = hv.cache_path(&cache_dir);
@@ -285,7 +318,7 @@ impl ProxyFileDownloader {
                             && let Some(ref cache) = cache_handler {
                                 cache.register_proxy_file(&hv);
                             }
-                }
+                
             }
             utils::remove_file(&tf);
         });
@@ -324,4 +357,35 @@ impl ProxyFileDownloader {
         Ok(n)
     }
 
+}
+
+fn build_proxy_url(proxy_type: &str, proxy_host: &str, proxy_port: u16) -> Result<Url> {
+    let mut url = match proxy_type {
+        "socks" => Url::parse("socks://hath.invalid/"),
+        "http" => Url::parse("http://hath.invalid/"),
+        _ => return Err(HathError::Config(format!("invalid proxy type: {}", proxy_type))),
+    }
+    .map_err(|e| HathError::Config(format!("invalid proxy URL base: {}", e)))?;
+    if let Ok(ip) = proxy_host.parse::<IpAddr>() {
+        url.set_ip_host(ip)
+            .map_err(|_| HathError::Config("invalid proxy host".into()))?;
+    } else {
+        url.set_host(Some(proxy_host))
+            .map_err(|e| HathError::Config(format!("invalid proxy host: {}", e)))?;
+    }
+    url.set_port(Some(proxy_port))
+        .map_err(|_| HathError::Config(format!("invalid proxy port: {}", proxy_port)))?;
+    Ok(url)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_proxy_url_handles_ipv6_host() {
+        let url = build_proxy_url("socks", "::1", 1080).unwrap();
+
+        assert_eq!(url.as_str(), "socks://[::1]:1080/");
+    }
 }

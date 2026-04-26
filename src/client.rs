@@ -106,6 +106,7 @@ pub async fn run() -> Result<()> {
         cert_expiry: Arc::new(Mutex::new(None)),
         bandwidth_monitor: Arc::new(ArcSwapOption::const_empty()),
         active_connections: Arc::new(AtomicU32::new(0)),
+        next_conn_id: Arc::new(AtomicU32::new(0)),
         last_overload_notification: Arc::new(Mutex::new(None)),
         do_cert_refresh: Arc::new(AtomicBool::new(false)),
         cert_refresh_notify: Arc::new(Notify::new()),

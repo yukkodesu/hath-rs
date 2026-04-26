@@ -4,6 +4,7 @@ pub mod utils;
 pub mod hvfile;
 pub mod logging;
 pub mod stats;
+pub mod access_log;
 pub mod config;
 pub mod rpc;
 pub mod rpc_client;
