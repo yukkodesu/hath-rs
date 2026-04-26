@@ -72,8 +72,8 @@ impl StreamingBody {
     /// Create a new static body from pre-loaded data (zero-copy for `Bytes::from_static`).
     ///
     /// * `data` - The full response body as `Bytes`. Use `Bytes::from_static(b"...")`
-    ///            for static content, `Bytes::from(vec)` for owned data, or
-    ///            `Bytes::copy_from_slice(s)` for borrowed slices.
+    ///   for static content, `Bytes::from(vec)` for owned data, or
+    ///   `Bytes::copy_from_slice(s)` for borrowed slices.
     /// * `bwm`  - Optional bandwidth monitor for per-chunk throttling.
     pub fn new(data: Bytes, bwm: Option<Arc<BandwidthMonitor>>) -> Self {
         Self::from_bytes(data, bwm)
