@@ -69,14 +69,25 @@ pub struct StreamingBody {
 }
 
 impl StreamingBody {
-    /// Create a new static body from pre-loaded data.
+    /// Create a new static body from pre-loaded data (zero-copy for `Bytes::from_static`).
     ///
-    /// * `data` - The full response body bytes.
+    /// * `data` - The full response body as `Bytes`. Use `Bytes::from_static(b"...")`
+    ///            for static content, `Bytes::from(vec)` for owned data, or
+    ///            `Bytes::copy_from_slice(s)` for borrowed slices.
     /// * `bwm`  - Optional bandwidth monitor for per-chunk throttling.
-    pub fn new(data: Vec<u8>, bwm: Option<Arc<BandwidthMonitor>>) -> Self {
+    pub fn new(data: Bytes, bwm: Option<Arc<BandwidthMonitor>>) -> Self {
+        Self::from_bytes(data, bwm)
+    }
+
+    /// Zero-allocation empty body (for HEAD responses).
+    pub fn empty() -> Self {
+        Self::from_bytes(Bytes::new(), None)
+    }
+
+    fn from_bytes(data: Bytes, bwm: Option<Arc<BandwidthMonitor>>) -> Self {
         let total_size = data.len();
         Self {
-            source: DataSource::Static { data: Bytes::from(data) },
+            source: DataSource::Static { data },
             offset: 0,
             total_size,
             bwm,

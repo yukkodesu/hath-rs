@@ -47,15 +47,7 @@ impl RpcClient {
                 // Inline server_stat to avoid recursive call()
                 if let Ok(stat_resp) = self.call_stat_inner().await
                     && stat_resp.status == ResponseStatus::Ok {
-                        self.config.rcu(|current| {
-                            let mut new = (**current).clone();
-                            for line in &stat_resp.lines {
-                                if let Some((key, value)) = line.split_once('=') {
-                                    new.apply_setting(&key.to_lowercase(), value);
-                                }
-                            }
-                            Arc::new(new)
-                        });
+                        crate::config::Config::apply_server_response(&self.config, &stat_resp);
                     }
                 continue; // retry the original request with corrected time
             }

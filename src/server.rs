@@ -170,9 +170,18 @@ impl Service<Request<Incoming>> for HathService {
             let bwm_for_header = bwm_for_request.clone();
 
             let mut resp = match request_type {
-                RequestType::FileServe { fileid, hv_file, additional, keystamp_valid } => {
+                RequestType::FileServe { fileid, hv_file, additional, keystamp_valid, head_only } => {
                     if !keystamp_valid {
                         response::forbidden_response()
+                    } else if head_only {
+                        // HEAD request: return headers only, skip file read and
+                        // proxy download side effects (Java does the same — it
+                        // constructs headers identically but skips the body write).
+                        if let Some(ref hv) = hv_file {
+                            response::head_response(hv.mime_type(), hv.size as usize)
+                        } else {
+                            response::not_found_response()
+                        }
                     } else if let Some(ref hv) = hv_file {
                         let cache_path = hv.cache_path(&config.cache_dir);
                         // Java: check exists AND file.length() == expectedSize before serving.
@@ -255,12 +264,16 @@ impl Service<Request<Incoming>> for HathService {
                         response::forbidden_response()
                     }
                 }
-                RequestType::SpeedTest { testsize, valid, forbidden, .. } => {
+                RequestType::SpeedTest { testsize, valid, forbidden, head_only, .. } => {
                     if valid {
-                        if !is_local && !is_rpc {
+                        if !head_only && !is_local && !is_rpc {
                             state.stats.record_bytes_sent(testsize as u64);
                         }
-                        response::speedtest_response(testsize as usize, bwm_for_request)
+                        if head_only {
+                            response::head_response("application/octet-stream", testsize as usize)
+                        } else {
+                            response::speedtest_response(testsize as usize, bwm_for_request)
+                        }
                     } else if forbidden {
                         // Java: responseStatusCode = 403 for expired/invalid key
                         response::forbidden_response()
@@ -312,12 +325,30 @@ impl Service<Request<Incoming>> for HathService {
                     tracing::error!("Error building response: {}", e);
                     Ok(Response::builder()
                         .status(500)
-                        .body(StreamingBody::new(b"Internal Server Error".to_vec(), None))
+                        .body(StreamingBody::new(bytes::Bytes::from_static(b"Internal Server Error"), None))
                         .unwrap())
                 }
             }
         })
     }
+}
+
+/// Helper for `threaded_proxy_test`: extract required params from add_table,
+/// returning `INVALID_COMMAND` on missing/illegal values (matching Java's
+/// NumberFormatException → catch → INVALID_COMMAND flow).
+macro_rules! required_param {
+    ($table:expr, $key:expr) => {
+        match $table.get($key) {
+            Some(v) => v,
+            None => return response::text_response(hyper::StatusCode::OK, "INVALID_COMMAND"),
+        }
+    };
+    ($table:expr, $key:expr, $T:ty) => {
+        match $table.get($key).and_then(|v| v.parse::<$T>().ok()) {
+            Some(v) => v,
+            None => return response::text_response(hyper::StatusCode::OK, "INVALID_COMMAND"),
+        }
+    };
 }
 
 /// Handle servercmd API commands. Must support all Java commands.
@@ -332,22 +363,15 @@ async fn handle_server_command(
             response::text_response(hyper::StatusCode::OK, "I feel FANTASTIC and I'm still alive")
         }
         "threaded_proxy_test" => {
-            // Java: HTTPResponse.processThreadedProxyTest() parses addTable for
-            // hostname/protocol/port/testsize/testcount/testtime/testkey,
-            // spawns concurrent outbound GETs, returns OK:{successful}-{totalTimeMillis}.
+            // Java: Integer.parseInt on missing/illegal params throws NFE,
+            // caught by processRemoteAPICommand → returns "INVALID_COMMAND".
             let add_table = utils::parse_additional(additional);
-            let hostname = add_table.get("hostname")
-                .map(|s| s.as_str()).unwrap_or("127.0.0.1");
-            let protocol = add_table.get("protocol")
-                .map(|s| s.as_str()).unwrap_or("http");
-            let port: u16 = add_table.get("port")
-                .and_then(|v| v.parse().ok()).unwrap_or(0);
-            let testsize: u64 = add_table.get("testsize")
-                .and_then(|v| v.parse().ok()).unwrap_or(1_000_000);
-            let testcount: u32 = add_table.get("testcount")
-                .and_then(|v| v.parse().ok()).unwrap_or(1);
-            let testtime: u32 = add_table.get("testtime")
-                .and_then(|v| v.parse().ok()).unwrap_or(30);
+            let hostname = required_param!(add_table, "hostname");
+            let protocol = required_param!(add_table, "protocol");
+            let port: u16 = required_param!(add_table, "port", u16);
+            let testsize: u64 = required_param!(add_table, "testsize", u64);
+            let testcount: u32 = required_param!(add_table, "testcount", u32);
+            let testtime: u32 = required_param!(add_table, "testtime", u32);
             let testkey = add_table.get("testkey")
                 .map(|s| s.as_str()).unwrap_or("");
 
@@ -379,15 +403,7 @@ async fn handle_server_command(
         "refresh_settings" => {
             match state.rpc_client.refresh_settings().await {
                 Ok(sr) if sr.status == crate::rpc::ResponseStatus::Ok => {
-                    state.config.rcu(|current| {
-                        let mut new = (**current).clone();
-                        for line in &sr.lines {
-                            if let Some((key, value)) = line.split_once('=') {
-                                new.apply_setting(&key.to_lowercase(), value);
-                            }
-                        }
-                        Arc::new(new)
-                    });
+                    crate::config::Config::apply_server_response(&state.config, &sr);
                     // Recreate bandwidth monitor if throttle_bytes changed
                     let cfg = state.config.load_full();
                     if cfg.throttle_bytes > 0 {

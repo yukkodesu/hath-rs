@@ -2,6 +2,7 @@ use crate::bandwidth::BandwidthMonitor;
 use crate::body::StreamingBody;
 use crate::error::{HathError, Result};
 use crate::hvfile::HVFile;
+use bytes::Bytes;
 use hyper::{Response, StatusCode, header};
 use rand::Rng;
 use std::path::{Path, PathBuf};
@@ -12,7 +13,7 @@ use tokio::sync::Notify;
 /// Build a Hyper Response with proper headers.
 /// Java: Cache-Control + Content-Length only added when contentLength > 0.
 /// Server and Date headers are set at the Hyper service layer.
-pub fn ok_response(body: Vec<u8>, content_type: &str) -> Result<Response<StreamingBody>> {
+pub fn ok_response(body: Bytes, content_type: &str) -> Result<Response<StreamingBody>> {
     let len = body.len();
     let mut builder = Response::builder()
         .status(StatusCode::OK)
@@ -46,7 +47,7 @@ pub fn method_not_allowed_response() -> Result<Response<StreamingBody>> {
         .header(header::ALLOW, "GET, HEAD")
         .header(header::CONTENT_TYPE, "text/html; charset=iso-8859-1")
         .header(header::CONNECTION, "close")
-        .body(StreamingBody::new(b"Method Not Allowed".to_vec(), None))
+        .body(StreamingBody::new(Bytes::from_static(b"Method Not Allowed"), None))
         .map_err(HathError::Http)
 }
 
@@ -62,7 +63,7 @@ pub fn text_response(status: StatusCode, text: &str) -> Result<Response<Streamin
             .header(header::CONTENT_LENGTH, len);
     }
     builder
-        .body(StreamingBody::new(text.as_bytes().to_vec(), None))
+        .body(StreamingBody::new(Bytes::copy_from_slice(text.as_bytes()), None))
         .map_err(HathError::Http)
 }
 
@@ -74,7 +75,7 @@ pub fn redirect_response(location: &str) -> Result<Response<StreamingBody>> {
         .header(header::CONTENT_TYPE, "text/html; charset=iso-8859-1")
         .header(header::LOCATION, location)
         .header(header::CONNECTION, "close")
-        .body(StreamingBody::new(vec![], None))
+        .body(StreamingBody::empty())
         .map_err(HathError::Http)
 }
 
@@ -86,7 +87,24 @@ pub fn robots_response() -> Result<Response<StreamingBody>> {
         .header(header::CONTENT_TYPE, "text/plain; charset=iso-8859-1")
         .header(header::CONTENT_LENGTH, len)
         .header(header::CONNECTION, "close")
-        .body(StreamingBody::new(body.to_vec(), None))
+        .body(StreamingBody::new(Bytes::from_static(body), None))
+        .map_err(HathError::Http)
+}
+
+/// HEAD response: headers-only, no body. Java constructs identical headers
+/// for HEAD but skips body writing in HTTPSession.write().
+pub fn head_response(content_type: &str, total_size: usize) -> Result<Response<StreamingBody>> {
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CONNECTION, "close");
+    if total_size > 0 {
+        builder = builder
+            .header(header::CACHE_CONTROL, "public, max-age=31536000")
+            .header(header::CONTENT_LENGTH, total_size);
+    }
+    builder
+        .body(StreamingBody::empty())
         .map_err(HathError::Http)
 }
 
@@ -97,7 +115,7 @@ pub fn speedtest_response(
     size: usize,
     bwm: Option<Arc<BandwidthMonitor>>,
 ) -> Result<Response<StreamingBody>> {
-    let mut data = vec![0u8; size];
+    let mut data = bytes::BytesMut::zeroed(size);
     rand::rng().fill_bytes(&mut data);
     let len = data.len();
     let mut builder = Response::builder()
@@ -110,7 +128,7 @@ pub fn speedtest_response(
             .header(header::CONTENT_LENGTH, len);
     }
     builder
-        .body(StreamingBody::new(data, bwm))
+        .body(StreamingBody::new(data.freeze(), bwm))
         .map_err(HathError::Http)
 }
 
@@ -178,6 +196,6 @@ pub async fn file_response(
             .header(header::CONTENT_LENGTH, len);
     }
     builder
-        .body(StreamingBody::new(data, bwm))
+        .body(StreamingBody::new(Bytes::from(data), bwm))
         .map_err(HathError::Http)
 }

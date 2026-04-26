@@ -5,6 +5,7 @@ use rand::Rng;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 #[derive(Parser, Debug)]
 #[command(name = "hath-rs", version = "1.6.5")]
@@ -327,6 +328,15 @@ impl Config {
                 self.apply_setting(&key.to_lowercase(), value);
             }
         }
+    }
+
+    /// Apply settings from a `ServerResponse` into an `ArcSwap<Config>` via rcu.
+    pub fn apply_server_response(config: &arc_swap::ArcSwap<Config>, resp: &crate::rpc::ServerResponse) {
+        config.rcu(|current| {
+            let mut new = (**current).clone();
+            new.apply_server_settings(&resp.lines);
+            Arc::new(new)
+        });
     }
 
     pub fn load_client_login(&self) -> Result<Option<(ClientId, ClientKey)>> {
