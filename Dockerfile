@@ -11,7 +11,7 @@ RUN cargo build --release
 # Stage 2: Runtime
 FROM alpine:latest
 
-RUN apk add --no-cache tini ca-certificates libgcc
+RUN apk add --no-cache tini ca-certificates libgcc openssl
 
 COPY --from=builder /build/target/release/hath-rs /usr/local/bin/hath-rs
 COPY docker-entrypoint.sh /docker-entrypoint.sh
