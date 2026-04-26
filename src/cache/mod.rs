@@ -6,7 +6,9 @@ use crate::error::{HathError, Result};
 use crate::hvfile::HVFile;
 use crate::stats::Stats;
 use crate::utils;
+use crate::rpc_client::RpcClient;
 use crate::cache::persistent::PersistentCacheState;
+use crate::cache::pruner::CachePruner;
 use arc_swap::ArcSwap;
 use sha1::{Digest, Sha1};
 use std::collections::HashMap;
@@ -766,4 +768,72 @@ impl CacheHandler {
         self.stats.set_cache_count(count);
         self.stats.set_cache_size(self.get_cache_size_with_overhead());
     }
+}
+
+/// Spawn the cache pruner background task.
+pub fn spawn_pruner(
+    cache: Arc<CacheHandler>,
+    config: Arc<ArcSwap<Config>>,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
+    let pruner = CachePruner::new(cache, config, shutdown);
+    tokio::spawn(async move { pruner.run().await });
+}
+
+/// Spawn periodic LRU cycle + stats shift (10s interval).
+pub fn spawn_periodic_stats(
+    cache: Arc<CacheHandler>,
+    stats: Arc<Stats>,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
+    tokio::spawn(crate::utils::tick_every(shutdown, Duration::from_secs(10), move || {
+        let cache = cache.clone();
+        let stats = stats.clone();
+        async move {
+            if let Ok(mut lru) = cache.lru.try_lock() {
+                lru.cycle();
+            }
+            stats.shift_bytes_sent_history();
+        }
+    }));
+}
+
+/// Synchronous initial blacklist fetch at startup.
+/// Fetches blacklist with 3-day delta and deletes matching files from cache.
+pub async fn fetch_initial_blacklist(rpc_client: &RpcClient, cache: &CacheHandler) {
+    match rpc_client.get_blacklist(259200).await {
+        Ok(resp) if resp.status == crate::rpc::ResponseStatus::Ok => {
+            for fileid in &resp.lines {
+                let _ = cache.delete_file_from_cache(fileid);
+            }
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!("Initial blacklist fetch failed: {}", e);
+        }
+    }
+}
+
+/// Spawn periodic blacklist fetch (6h interval).
+pub fn spawn_blacklist_fetcher(
+    rpc_client: Arc<RpcClient>,
+    cache: Arc<CacheHandler>,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
+    tokio::spawn(crate::utils::tick_every(shutdown, Duration::from_secs(21600), move || {
+        let rpc_client = rpc_client.clone();
+        let cache = cache.clone();
+        async move {
+            match rpc_client.get_blacklist(43200).await {
+                Ok(resp) if resp.status == crate::rpc::ResponseStatus::Ok => {
+                    for fileid in &resp.lines {
+                        let _ = cache.delete_file_from_cache(fileid);
+                    }
+                }
+                _ => {
+                    tracing::warn!("CacheHandler: Failed to retrieve file blacklist, will try again later.");
+                }
+            }
+        }
+    }));
 }

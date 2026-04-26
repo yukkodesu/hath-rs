@@ -1,9 +1,11 @@
 use crate::config::Config;
 use crate::error::{HathError, Result};
 use crate::rpc::{self, ServerResponse, ResponseStatus, Action};
+use crate::stats::Stats;
 use arc_swap::ArcSwap;
 use reqwest::Client;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Shared HTTP client for RPC calls.
 pub struct RpcClient {
@@ -145,4 +147,42 @@ impl RpcClient {
         let add = format!("{};{};{}", fileindex, xres, fileid);
         self.call(Action::StaticRangeFetch, &add).await
     }
+}
+
+/// Spawn periodic still_alive heartbeat (110s interval).
+pub fn spawn_still_alive_heartbeat(
+    rpc_client: Arc<RpcClient>,
+    stats: Arc<Stats>,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
+    tokio::spawn(crate::utils::tick_every(shutdown, Duration::from_secs(110), move || {
+        let rpc_client = rpc_client.clone();
+        let stats = stats.clone();
+        async move {
+            if let Err(e) = rpc_client.still_alive(false).await {
+                tracing::warn!("Still-alive failed: {}", e);
+            } else {
+                stats.record_server_contact();
+            }
+        }
+    }));
+}
+
+/// Spawn periodic RPC server failure clearer (4h interval).
+pub fn spawn_rpc_failure_clearer(
+    config: Arc<ArcSwap<Config>>,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
+    tokio::spawn(crate::utils::tick_every(shutdown, Duration::from_secs(14400), move || {
+        let config = config.clone();
+        async move {
+            let cfg = config.load();
+            if cfg.rpc_last_failed.is_some() {
+                let mut new = (**cfg).clone();
+                new.rpc_last_failed = None;
+                new.rpc_current = None;
+                config.store(Arc::new(new));
+            }
+        }
+    }));
 }
