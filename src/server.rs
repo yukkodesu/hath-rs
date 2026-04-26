@@ -22,7 +22,7 @@ use hyper::header;
 use openssl::asn1::Asn1Time;
 use openssl::pkcs12::Pkcs12;
 use openssl::provider::Provider;
-use openssl::ssl::{SslAcceptor, SslContext, SslMethod};
+use openssl::ssl::{SslContext, SslMethod};
 use reqwest::Url;
 use std::collections::HashMap;
 use std::future::Future;
@@ -609,23 +609,28 @@ async fn build_tls_acceptor(config: &Config, force_download: bool) -> Result<(Ss
     let now_unix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
     let cert_expiry_unix = now_unix + diff.days as i64 * 86400 + diff.secs as i64;
 
-    // Build OpenSSL SslAcceptor with Mozilla intermediate profile (TLS 1.2 + 1.3, matching Java)
-    let mut acceptor = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls_server())
-        .map_err(|e| HathError::Tls(format!("Failed to create SslAcceptor: {}", e)))?;
-    acceptor
+    // Build OpenSSL SslContext with minimal configuration (matching Java's
+    // SSLContext.init() which uses JVM defaults without cipher restrictions).
+    let mut ctx_builder = SslContext::builder(SslMethod::tls_server())
+        .map_err(|e| HathError::Tls(format!("Failed to create SslContextBuilder: {}", e)))?;
+    // Match Java: setEnabledProtocols("TLSv1.3", "TLSv1.2")
+    ctx_builder
+        .set_min_proto_version(Some(openssl::ssl::SslVersion::TLS1_2))
+        .map_err(|e| HathError::Tls(format!("Failed to set min protocol: {}", e)))?;
+    ctx_builder
         .set_private_key(key)
         .map_err(|e| HathError::Tls(format!("Failed to set private key: {}", e)))?;
-    acceptor
+    ctx_builder
         .set_certificate(cert)
         .map_err(|e| HathError::Tls(format!("Failed to set certificate: {}", e)))?;
     if let Some(chain) = pkcs12.ca {
         for ca in chain {
-            acceptor
+            ctx_builder
                 .add_extra_chain_cert(ca)
                 .map_err(|e| HathError::Tls(format!("Failed to add chain cert: {}", e)))?;
         }
     }
-    let ctx = acceptor.build().into_context();
+    let ctx = ctx_builder.build();
     Ok((ctx, cert_expiry_unix))
 }
 
@@ -1002,19 +1007,19 @@ pub async fn start_server(
                     let ssl = match openssl::ssl::Ssl::new(ssl_context.as_ref()) {
                         Ok(s) => s,
                         Err(e) => {
-                            tracing::warn!("SSL context error: {}", e);
+                            tracing::error!("SSL Ssl::new failed: {:?}", e);
                             return;
                         }
                     };
                     let mut tls_stream = match tokio_openssl::SslStream::new(ssl, stream) {
                         Ok(s) => s,
                         Err(e) => {
-                            tracing::warn!("TLS accept failed: {}", e);
+                            tracing::error!("SslStream::new failed: {:?}", e);
                             return;
                         }
                     };
                     if let Err(e) = Pin::new(&mut tls_stream).accept().await {
-                        tracing::warn!("TLS accept failed: {}", e);
+                        tracing::error!("TLS accept failed: {:?}", e);
                         return;
                     }
 
