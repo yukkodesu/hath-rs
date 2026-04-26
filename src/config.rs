@@ -5,6 +5,7 @@ use rand::Rng;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 #[derive(Parser, Debug)]
 #[command(name = "hath-rs", version = "1.6.5")]
@@ -197,46 +198,45 @@ impl Config {
     /// Pick an RPC host. Uses cached `rpc_current` if set and not last-failed,
     /// otherwise selects a random server from `rpc_servers`.
     pub fn get_rpc_host(&self) -> String {
-        // If we have a cached host and it hasn't failed, reuse it.
-        if let Some(ref host) = self.rpc_current {
+        let host = if let Some(ref host) = self.rpc_current {
             if let Some(ref failed) = self.rpc_last_failed
                 && *host == *failed {
-                    // Cached host is the failed one — fall through to random selection
                     tracing::debug!("{} was marked as last failed (from cache)", failed);
+                    None // fall through to selection
                 } else {
-                    return host.clone();
+                    Some(host.clone())
                 }
-        }
-        if self.rpc_servers.is_empty() {
-            return "rpc.hentaiathome.net".to_string();
-        }
-        // Pick a random server and random scan direction, avoiding last failed.
-        // Java: rpcServerSelector = random index, scanDirection = Math.random() < 0.5 ? -1 : 1
-        let mut idx: isize = (rand::rng().next_u32() as usize % self.rpc_servers.len()) as isize;
-        let dir: isize = if rand::rng().next_u32() & 1 == 0 { -1 } else { 1 };
-        let len = self.rpc_servers.len() as isize;
-        let selected;
-
-        loop {
-            let candidate = self.rpc_servers[((len + idx) % len) as usize].to_string().to_lowercase();
-
-            if let Some(ref failed) = self.rpc_last_failed
-                && candidate == *failed {
-                    tracing::debug!("{} was marked as last failed", failed);
-                    idx += dir;
-                    continue;
-                }
-
-            selected = candidate;
-            tracing::debug!("Selected rpcServerCurrent={}", selected);
-            break;
-        }
-
-        if self.rpc_port == 80 {
-            selected
         } else {
-            format!("{}:{}", selected, self.rpc_port)
-        }
+            None
+        };
+
+        let host = host.unwrap_or_else(|| {
+            if self.rpc_servers.is_empty() {
+                return "rpc.hentaiathome.net".to_string();
+            }
+            // Java: single server → use directly, skip the avoid-last-failed loop.
+            if self.rpc_servers.len() == 1 {
+                return self.rpc_servers[0].to_string().to_lowercase();
+            }
+            // Pick a random server and random scan direction, avoiding last failed.
+            // Java: rpcServerSelector = random index, scanDirection = Math.random() < 0.5 ? -1 : 1
+            let mut idx: isize = (rand::rng().next_u32() as usize % self.rpc_servers.len()) as isize;
+            let dir: isize = if rand::rng().next_u32() & 1 == 0 { -1 } else { 1 };
+            let len = self.rpc_servers.len() as isize;
+            loop {
+                let candidate = self.rpc_servers[((len + idx) % len) as usize].to_string().to_lowercase();
+                if let Some(ref failed) = self.rpc_last_failed
+                    && candidate == *failed {
+                        tracing::debug!("{} was marked as last failed", failed);
+                        idx += dir;
+                        continue;
+                    }
+                tracing::debug!("Selected rpcServerCurrent={}", candidate);
+                break candidate;
+            }
+        });
+
+        if self.rpc_port == 80 { host } else { format!("{}:{}", host, self.rpc_port) }
     }
 
     pub fn is_static_range(&self, range: &str) -> bool {
@@ -325,6 +325,15 @@ impl Config {
                 self.apply_setting(&key.to_lowercase(), value);
             }
         }
+    }
+
+    /// Apply settings from a `ServerResponse` into an `ArcSwap<Config>` via rcu.
+    pub fn apply_server_response(config: &arc_swap::ArcSwap<Config>, resp: &crate::rpc::ServerResponse) {
+        config.rcu(|current| {
+            let mut new = (**current).clone();
+            new.apply_server_settings(&resp.lines);
+            Arc::new(new)
+        });
     }
 
     pub fn load_client_login(&self) -> Result<Option<(ClientId, ClientKey)>> {

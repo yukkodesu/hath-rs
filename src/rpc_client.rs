@@ -32,11 +32,21 @@ impl RpcClient {
             let url = rpc::make_rpc_url(act, add, &cfg)?;
             let host = url.host_str().unwrap_or("unknown").to_string();
 
-            let resp = self.http.get(url).send().await
-                .map_err(|e| HathError::Rpc(format!("request failed: {}", e)))?;
-
-            let body = resp.text().await
-                .map_err(|e| HathError::Rpc(format!("read failed: {}", e)))?;
+            // Java: network failures → NO_RESPONSE → markRPCServerFailure
+            let resp = self.http.get(url.clone()).send().await;
+            let body = match resp {
+                Ok(r) => r.text().await,
+                Err(e) => Err(e),
+            };
+            let body = match body {
+                Ok(b) => b,
+                Err(e) => {
+                    let mut new = (**cfg).clone();
+                    new.rpc_last_failed = Some(host.clone());
+                    self.config.store(Arc::new(new));
+                    return Err(HathError::Rpc(format!("request failed: {}", e)));
+                }
+            };
 
             let parsed = rpc::parse_server_response(&body, &host);
 
@@ -47,15 +57,7 @@ impl RpcClient {
                 // Inline server_stat to avoid recursive call()
                 if let Ok(stat_resp) = self.call_stat_inner().await
                     && stat_resp.status == ResponseStatus::Ok {
-                        self.config.rcu(|current| {
-                            let mut new = (**current).clone();
-                            for line in &stat_resp.lines {
-                                if let Some((key, value)) = line.split_once('=') {
-                                    new.apply_setting(&key.to_lowercase(), value);
-                                }
-                            }
-                            Arc::new(new)
-                        });
+                        crate::config::Config::apply_server_response(&self.config, &stat_resp);
                     }
                 continue; // retry the original request with corrected time
             }
@@ -84,10 +86,20 @@ impl RpcClient {
         let cfg = self.config.load();
         let url = rpc::make_rpc_url(Action::ServerStat, "", &cfg)?;
         let host = url.host_str().unwrap_or("unknown").to_string();
-        let resp = self.http.get(url).send().await
-            .map_err(|e| HathError::Rpc(format!("stat request failed: {}", e)))?;
-        let body = resp.text().await
-            .map_err(|e| HathError::Rpc(format!("stat read failed: {}", e)))?;
+        let resp = self.http.get(url.clone()).send().await;
+        let body = match resp {
+            Ok(r) => r.text().await,
+            Err(e) => Err(e),
+        };
+        let body = match body {
+            Ok(b) => b,
+            Err(e) => {
+                let mut new = (**cfg).clone();
+                new.rpc_last_failed = Some(host.clone());
+                self.config.store(Arc::new(new));
+                return Err(HathError::Rpc(format!("stat request failed: {}", e)));
+            }
+        };
         Ok(rpc::parse_server_response(&body, &host))
     }
 
@@ -155,14 +167,31 @@ pub fn spawn_still_alive_heartbeat(
     stats: Arc<Stats>,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
-    tokio::spawn(crate::utils::tick_every(shutdown, Duration::from_secs(110), move || {
+    tokio::spawn(crate::utils::tick_every(shutdown.clone(), Duration::from_secs(110), move || {
         let rpc_client = rpc_client.clone();
         let stats = stats.clone();
+        let shutdown = shutdown.clone();
         async move {
-            if let Err(e) = rpc_client.still_alive(false).await {
-                tracing::warn!("Still-alive failed: {}", e);
-            } else {
-                stats.record_server_contact();
+            match rpc_client.still_alive(false).await {
+                Ok(resp) if resp.status == ResponseStatus::Ok => {
+                    stats.record_server_contact();
+                }
+                Ok(resp) => {
+                    let code = resp.fail_code.unwrap_or_default();
+                    // Java: TERM_BAD_NETWORK → dieWithError (terminate client)
+                    if code.starts_with("TERM_BAD_NETWORK") {
+                        tracing::error!(
+                            "Client is shutting down since the network is misconfigured; \
+                             correct firewall/forwarding settings then restart the client."
+                        );
+                        shutdown.cancel();
+                    } else {
+                        tracing::warn!("Failed stillAlive test: ({}) - will retry later", code);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Still-alive request failed: {}", e);
+                }
             }
         }
     }));

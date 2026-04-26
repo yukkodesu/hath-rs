@@ -170,47 +170,68 @@ impl Service<Request<Incoming>> for HathService {
             let bwm_for_header = bwm_for_request.clone();
 
             let mut resp = match request_type {
-                RequestType::FileServe { fileid, hv_file, additional, keystamp_valid } => {
+                RequestType::FileServe { fileid, hv_file, additional, keystamp_valid, head_only } => {
+                    // Java validates fileindex/xres BEFORE cache hit check
+                    // (line 194 in HTTPResponse.processRequest). Even a cached
+                    // file with missing/invalid arguments returns 404.
+                    let fileindex = additional.get("fileindex");
+                    let xres = additional.get("xres");
+                    let fileindex_valid = fileindex.is_some_and(|v| v.parse::<u32>().is_ok());
+                    let xres_valid = xres.is_some_and(|v| v == "org" || v.parse::<u32>().is_ok());
+
                     if !keystamp_valid {
                         response::forbidden_response()
-                    } else if let Some(ref hv) = hv_file {
+                    } else if hv_file.is_none() || !fileindex_valid || !xres_valid {
+                        response::not_found_response()
+                    } else {
+                        let hv = hv_file.as_ref().unwrap();
+                        let fileindex = fileindex.unwrap();
+                        let xres = xres.unwrap();
                         let cache_path = hv.cache_path(&config.cache_dir);
-                        // Java: check exists AND file.length() == expectedSize before serving.
-                        // Wrong-sized files fall through to proxy fallback, not error.
                         let cache_hit = cache_path.exists()
                             && cache_path.metadata()
                                 .map(|m| m.len() == hv.size as u64)
                                 .unwrap_or(false);
                         if cache_hit {
-                            // Java: markRecentlyAccessed — update LRU + file mtime.
-                            // Java: markRecentlyAccessed — updates LRU bit + file mtime.
                             state.cache.mark_recently_accessed(hv, false);
                             state.stats.record_file_sent();
                             if !is_local && !is_rpc {
                                 state.stats.record_bytes_sent(hv.size as u64);
                             }
-                            response::file_response(hv, &config.cache_dir, bwm_for_request).await
+                            if head_only {
+                                response::head_response(hv.mime_type(), hv.size as usize)
+                            } else {
+                                response::file_response(hv, &config.cache_dir, bwm_for_request).await
+                            }
                         } else {
-                            // Cache miss — try proxy fallback.
-                            // Java: HTTPResponse.parseRequest() creates
-                            // HTTPResponseProcessorProxy(fileid, sources).
-                            let fileindex = additional.get("fileindex");
-                            let xres = additional.get("xres");
-                            if let (Some(fileindex), Some(xres)) = (fileindex, xres) {
-                                match state.rpc_client.static_range_fetch(fileindex, xres, &fileid).await {
-                                    Ok(sr) if sr.status == crate::rpc::ResponseStatus::Ok => {
-                                        let sources: Vec<Url> = sr.lines.iter()
-                                            .filter(|s| !s.is_empty())
-                                            .filter_map(|s| Url::parse(s).ok())
-                                            .collect();
-                                        if !sources.is_empty() {
-                                            match ProxyFileDownloader::new(&fileid, &sources, &config, Some(state.cache.clone())).await {
-                                                Ok(proxy) => {
-                                                    let mime = hv.mime_type();
-                                                    state.stats.record_file_sent();
-                                                    if !is_local && !is_rpc {
-                                                        state.stats.record_bytes_sent(hv.size as u64);
-                                                    }
+                            match state.rpc_client.static_range_fetch(fileindex, xres, &fileid).await {
+                                Ok(sr) if sr.status == crate::rpc::ResponseStatus::Ok => {
+                                    let sources: Vec<Url> = sr.lines.iter()
+                                        .filter(|s| !s.is_empty())
+                                        .filter_map(|s| Url::parse(s).ok())
+                                        .collect();
+                                    if sources.is_empty() {
+                                        response::not_found_response()
+                                    } else {
+                                        // Java creates HTTPResponseProcessorProxy and calls
+                                        // initialize() for both GET and HEAD. The init result
+                                        // (connecting to source, checking Content-Length/size)
+                                        // determines the status code. HEAD then skips body.
+                                        match ProxyFileDownloader::new(&fileid, &sources, &config, Some(state.cache.clone())).await {
+                                            Ok(proxy) => {
+                                                let mime = hv.mime_type();
+                                                state.stats.record_file_sent();
+                                                if !is_local && !is_rpc {
+                                                    state.stats.record_bytes_sent(hv.size as u64);
+                                                }
+                                                if head_only {
+                                                    // Java: requestCompleted() → proxyThreadCompleted()
+                                                    // fires even for HEAD. Signal the download task
+                                                    // that the body side is done so it can finalize
+                                                    // immediately instead of waiting 300s.
+                                                    proxy.body_done_notify.notify_one();
+                                                    response::head_response(mime, proxy.total_size as usize)
+                                                } else {
                                                     response::proxy_response(
                                                         mime,
                                                         proxy.total_size as usize,
@@ -218,26 +239,32 @@ impl Service<Request<Incoming>> for HathService {
                                                         proxy.write_offset,
                                                         proxy.notify,
                                                         proxy.body_done_notify,
+                                                        proxy.download_done,
                                                         bwm_for_request,
                                                     )
                                                 }
-                                                Err(e) => {
-                                                    tracing::warn!("Proxy download failed for {}: {}", fileid, e);
-                                                    response::not_found_response()
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!("Proxy download failed for {}: {}", fileid, e);
+                                                if let crate::error::HathError::ProxyDownloader { status, message } = e {
+                                                    response::text_response(
+                                                        hyper::StatusCode::from_u16(status).unwrap_or(hyper::StatusCode::INTERNAL_SERVER_ERROR),
+                                                        &message,
+                                                    )
+                                                } else {
+                                                    // Java: connection failures → 500
+                                                    response::text_response(
+                                                        hyper::StatusCode::INTERNAL_SERVER_ERROR,
+                                                        &e.to_string(),
+                                                    )
                                                 }
                                             }
-                                        } else {
-                                            response::not_found_response()
                                         }
                                     }
-                                    _ => response::not_found_response(),
                                 }
-                            } else {
-                                response::not_found_response()
+                                _ => response::not_found_response(),
                             }
                         }
-                    } else {
-                        response::not_found_response()
                     }
                 }
                 RequestType::ServerCommand { command, additional, valid } => {
@@ -247,12 +274,17 @@ impl Service<Request<Incoming>> for HathService {
                         response::forbidden_response()
                     }
                 }
-                RequestType::SpeedTest { testsize, valid, forbidden, .. } => {
+                RequestType::SpeedTest { testsize, valid, forbidden, head_only, .. } => {
                     if valid {
-                        if !is_local && !is_rpc {
+                        if !head_only && !is_local && !is_rpc {
                             state.stats.record_bytes_sent(testsize as u64);
                         }
-                        response::speedtest_response(testsize as usize, bwm_for_request)
+                        if head_only {
+                            // Java: speedtest inherits CONTENT_TYPE_DEFAULT = text/html
+                            response::head_response("text/html; charset=iso-8859-1", testsize as usize)
+                        } else {
+                            response::speedtest_response(testsize as usize, bwm_for_request)
+                        }
                     } else if forbidden {
                         // Java: responseStatusCode = 403 for expired/invalid key
                         response::forbidden_response()
@@ -304,12 +336,30 @@ impl Service<Request<Incoming>> for HathService {
                     tracing::error!("Error building response: {}", e);
                     Ok(Response::builder()
                         .status(500)
-                        .body(StreamingBody::new(b"Internal Server Error".to_vec(), None))
+                        .body(StreamingBody::new(bytes::Bytes::from_static(b"Internal Server Error"), None))
                         .unwrap())
                 }
             }
         })
     }
+}
+
+/// Helper for `threaded_proxy_test`: extract required params from add_table,
+/// returning `INVALID_COMMAND` on missing/illegal values (matching Java's
+/// NumberFormatException → catch → INVALID_COMMAND flow).
+macro_rules! required_param {
+    ($table:expr, $key:expr) => {
+        match $table.get($key) {
+            Some(v) => v,
+            None => return response::text_response(hyper::StatusCode::OK, "INVALID_COMMAND"),
+        }
+    };
+    ($table:expr, $key:expr, $T:ty) => {
+        match $table.get($key).and_then(|v| v.parse::<$T>().ok()) {
+            Some(v) => v,
+            None => return response::text_response(hyper::StatusCode::OK, "INVALID_COMMAND"),
+        }
+    };
 }
 
 /// Handle servercmd API commands. Must support all Java commands.
@@ -324,22 +374,15 @@ async fn handle_server_command(
             response::text_response(hyper::StatusCode::OK, "I feel FANTASTIC and I'm still alive")
         }
         "threaded_proxy_test" => {
-            // Java: HTTPResponse.processThreadedProxyTest() parses addTable for
-            // hostname/protocol/port/testsize/testcount/testtime/testkey,
-            // spawns concurrent outbound GETs, returns OK:{successful}-{totalTimeMillis}.
+            // Java: Integer.parseInt on missing/illegal params throws NFE,
+            // caught by processRemoteAPICommand → returns "INVALID_COMMAND".
             let add_table = utils::parse_additional(additional);
-            let hostname = add_table.get("hostname")
-                .map(|s| s.as_str()).unwrap_or("127.0.0.1");
-            let protocol = add_table.get("protocol")
-                .map(|s| s.as_str()).unwrap_or("http");
-            let port: u16 = add_table.get("port")
-                .and_then(|v| v.parse().ok()).unwrap_or(0);
-            let testsize: u64 = add_table.get("testsize")
-                .and_then(|v| v.parse().ok()).unwrap_or(1_000_000);
-            let testcount: u32 = add_table.get("testcount")
-                .and_then(|v| v.parse().ok()).unwrap_or(1);
-            let testtime: u32 = add_table.get("testtime")
-                .and_then(|v| v.parse().ok()).unwrap_or(30);
+            let hostname = required_param!(add_table, "hostname");
+            let protocol = required_param!(add_table, "protocol");
+            let port: u16 = required_param!(add_table, "port", u16);
+            let testsize: u64 = required_param!(add_table, "testsize", u64);
+            let testcount: u32 = required_param!(add_table, "testcount", u32);
+            let testtime: u32 = required_param!(add_table, "testtime", u32);
             let testkey = add_table.get("testkey")
                 .map(|s| s.as_str()).unwrap_or("");
 
@@ -371,18 +414,10 @@ async fn handle_server_command(
         "refresh_settings" => {
             match state.rpc_client.refresh_settings().await {
                 Ok(sr) if sr.status == crate::rpc::ResponseStatus::Ok => {
-                    state.config.rcu(|current| {
-                        let mut new = (**current).clone();
-                        for line in &sr.lines {
-                            if let Some((key, value)) = line.split_once('=') {
-                                new.apply_setting(&key.to_lowercase(), value);
-                            }
-                        }
-                        Arc::new(new)
-                    });
+                    crate::config::Config::apply_server_response(&state.config, &sr);
                     // Recreate bandwidth monitor if throttle_bytes changed
                     let cfg = state.config.load_full();
-                    if cfg.throttle_bytes > 0 {
+                    if cfg.throttle_bytes > 0 && !cfg.disable_bwm {
                         state.bandwidth_monitor.store(Some(Arc::new(
                             BandwidthMonitor::new(cfg.throttle_bytes)
                         )));
@@ -785,11 +820,14 @@ pub async fn start_server(
         }
     };
 
-    // Create bandwidth monitor if throttling is enabled
-    if config.throttle_bytes > 0 {
+    // Create bandwidth monitor if throttling is enabled and not disabled.
+    // Explicitly clear on server restart so cert refresh doesn't leak old monitor.
+    if config.throttle_bytes > 0 && !config.disable_bwm {
         state.bandwidth_monitor.store(Some(Arc::new(
             BandwidthMonitor::new(config.throttle_bytes)
         )));
+    } else {
+        state.bandwidth_monitor.store(None);
     }
 
     // Store in AppState so it can be refreshed at runtime
@@ -829,7 +867,9 @@ pub async fn start_server(
                 let host_addr = remote_addr.ip().to_string().to_lowercase();
                 let is_local = LOCAL_NETWORK_RE.is_match(&host_addr)
                     || cfg.client_host.replace("::ffff:", "") == host_addr;
-                let is_rpc = cfg.rpc_servers.iter().any(|s| s.to_string().to_lowercase() == host_addr);
+                // Java: isValidRPCServer returns true when disableIPOriginCheck is set
+                let is_rpc = cfg.disable_ip_origin_check
+                    || cfg.rpc_servers.iter().any(|s| s.to_string().to_lowercase() == host_addr);
 
                 if !allow && !is_rpc {
                     drop(stream);

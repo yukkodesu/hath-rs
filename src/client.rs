@@ -36,6 +36,16 @@ pub async fn run() -> Result<()> {
 
     let shutdown = tokio_util::sync::CancellationToken::new();
 
+    // Handle Ctrl+C / SIGTERM for graceful shutdown (Java: ShutdownHook)
+    {
+        let s = shutdown.clone();
+        tokio::spawn(async move {
+            tokio::signal::ctrl_c().await.ok();
+            tracing::info!("Interrupt received, shutting down gracefully...");
+            s.cancel();
+        });
+    }
+
     // 3. Save client_login if newly provided via CLI
     if config.client_id.0 > 0 && !config.client_key.as_str().is_empty() {
         let _ = config.save_client_login();
@@ -49,7 +59,9 @@ pub async fn run() -> Result<()> {
     // 4. Wrap config in ArcSwap for sharing
     let config = Arc::new(ArcSwap::from(Arc::new(config)));
 
-    // 5. Server stat: get time and min build
+    // 5. Server stat: get server time, min build, RPC server list.
+    // Java: refreshServerStat() applies these settings BEFORE client_login so
+    // acttime/actkey in the login request use the corrected server time.
     let rpc_client = Arc::new(RpcClient::new(config.clone())?);
     tracing::info!("Getting initial stat from server...");
 
@@ -60,24 +72,16 @@ pub async fn run() -> Result<()> {
         ));
     }
 
-    // 6. Client login: get full settings
-    tracing::info!("Reading client settings from server...");
+    Config::apply_server_response(&config, &stat_resp);
+
+    // 6. Client login: get full settings (uses corrected server time from step 5)
     let login_resp = rpc_client.client_login().await?;
     if login_resp.status != ResponseStatus::Ok {
         let code = login_resp.fail_code.unwrap_or_default();
         return Err(HathError::Rpc(format!("Login failed: {}", code)));
     }
 
-    // Apply server settings via rcu (clone → modify → atomic swap, zero unsafe)
-    config.rcu(|current| {
-        let mut new = (**current).clone();
-        for line in &login_resp.lines {
-            if let Some((key, value)) = line.split_once('=') {
-                new.apply_setting(&key.to_lowercase(), value);
-            }
-        }
-        Arc::new(new)
-    });
+    Config::apply_server_response(&config, &login_resp);
 
     // 7. Init cache
     let stats = Arc::new(Stats::new());
@@ -85,6 +89,10 @@ pub async fn run() -> Result<()> {
 
     // 8. Build AppState and spawn HTTP server
     let allow_connections = Arc::new(AtomicBool::new(false));
+    // Java: reportShutdown — set after successful notifyStart(), never cleared.
+    // Used to decide whether to send client_stop on shutdown. allow_connections
+    // is toggled during cert refresh, so it can't serve this purpose.
+    let report_shutdown = Arc::new(AtomicBool::new(false));
     let flood_control = Arc::new(Mutex::new(HashMap::new()));
 
     let app_state = AppState {
@@ -123,9 +131,13 @@ pub async fn run() -> Result<()> {
         }
     }
 
-    // 9. notifyStart: tell server we're ready (this triggers connectivity test)
+    // 9. notifyStart: tell server we're ready (this triggers connectivity test).
+    // Java: if notifyStart() returns false, the main thread skips
+    // allowNormalConnections and all periodic tasks, then waits for Ctrl+C.
     let start_resp = rpc_client.client_start().await?;
-    if start_resp.status != ResponseStatus::Ok {
+    let startup_ok = if start_resp.status == ResponseStatus::Ok {
+        true
+    } else {
         let code = start_resp.fail_code.unwrap_or_default();
         tracing::error!("Startup failure: {}", code);
         if code.starts_with("FAIL_OTHER_CLIENT_CONNECTED") || code.starts_with("FAIL_CID_IN_USE") {
@@ -138,7 +150,6 @@ pub async fn run() -> Result<()> {
             );
             return Err(HathError::Fatal(code));
         }
-        // Java: FAIL_CONNECT_TEST is non-fatal — prints troubleshooting info and keeps running
         if code.starts_with("FAIL_CONNECT_TEST") {
             tracing::error!(
                 "FAIL_CONNECT_TEST: The server was unable to verify your connection. \
@@ -146,60 +157,64 @@ pub async fn run() -> Result<()> {
                  Please ensure port {} is accessible from the internet.",
                 config.load().client_port
             );
+            tracing::error!(
+                "The client will remain running so you can diagnose firewall and port \
+                 forwarding issues. Press Ctrl+C to exit."
+            );
         } else {
             return Err(HathError::Fatal(format!(
                 "Unexpected client_start failure: {}",
                 code
             )));
         }
+        false
+    };
+
+    if startup_ok {
+        // 10. Allow normal connections
+        allow_connections.store(true, Ordering::SeqCst);
+        report_shutdown.store(true, Ordering::SeqCst);
+        stats.program_started();
+
+        // Refresh settings after notifyStart
+        match rpc_client.refresh_settings().await {
+            Ok(refresh_resp) if refresh_resp.status == ResponseStatus::Ok => {
+                Config::apply_server_response(&config, &refresh_resp);
+            }
+            Ok(_) => {
+                tracing::warn!("refresh_settings returned non-OK status after startup");
+            }
+            Err(e) => {
+                tracing::warn!("Failed to refresh settings after startup: {}", e);
+            }
+        }
+
+        // Initial blacklist fetch (3-day delta, synchronous)
+        cache::fetch_initial_blacklist(&rpc_client, &cache).await;
+
+        tracing::info!("Startup completed successfully. Starting normal operation");
+
+        // 11. Spawn periodic background tasks
+        cache::spawn_pruner(cache.clone(), config.clone(), shutdown.clone());
+        cache::spawn_periodic_stats(cache.clone(), stats.clone(), shutdown.clone());
+        server::spawn_flood_control_pruner(app_state.clone(), shutdown.clone());
+        rpc_client::spawn_still_alive_heartbeat(rpc_client.clone(), stats.clone(), shutdown.clone());
+        server::spawn_time_cert_check(config.clone(), app_state.clone(), shutdown.clone());
+        rpc_client::spawn_rpc_failure_clearer(config.clone(), shutdown.clone());
+        cache::spawn_blacklist_fetcher(rpc_client.clone(), cache.clone(), shutdown.clone());
+        server::spawn_cert_refresh_watcher(app_state.clone(), rpc_client.clone(), shutdown.clone());
     }
-
-    // 10. Allow normal connections
-    allow_connections.store(true, Ordering::SeqCst);
-    stats.program_started();
-
-    // Refresh settings after notifyStart
-    match rpc_client.refresh_settings().await {
-        Ok(refresh_resp) if refresh_resp.status == ResponseStatus::Ok => {
-            config.rcu(|current| {
-                let mut new = (**current).clone();
-                for line in &refresh_resp.lines {
-                    if let Some((key, value)) = line.split_once('=') {
-                        new.apply_setting(&key.to_lowercase(), value);
-                    }
-                }
-                Arc::new(new)
-            });
-        }
-        Ok(_) => {
-            tracing::warn!("refresh_settings returned non-OK status after startup");
-        }
-        Err(e) => {
-            tracing::warn!("Failed to refresh settings after startup: {}", e);
-        }
-    }
-
-    // Initial blacklist fetch (3-day delta, synchronous)
-    cache::fetch_initial_blacklist(&rpc_client, &cache).await;
-
-    tracing::info!("Startup completed successfully. Starting normal operation");
-
-    // 11. Spawn periodic background tasks
-    cache::spawn_pruner(cache.clone(), config.clone(), shutdown.clone());
-    cache::spawn_periodic_stats(cache.clone(), stats.clone(), shutdown.clone());
-    server::spawn_flood_control_pruner(app_state.clone(), shutdown.clone());
-    rpc_client::spawn_still_alive_heartbeat(rpc_client.clone(), stats.clone(), shutdown.clone());
-    server::spawn_time_cert_check(config.clone(), app_state.clone(), shutdown.clone());
-    rpc_client::spawn_rpc_failure_clearer(config.clone(), shutdown.clone());
-    cache::spawn_blacklist_fetcher(rpc_client.clone(), cache.clone(), shutdown.clone());
-    server::spawn_cert_refresh_watcher(app_state.clone(), rpc_client.clone(), shutdown.clone());
 
     // Wait for shutdown signal
     shutdown.cancelled().await;
 
-    // Graceful shutdown (Java order: client_stop → drain connections → save data)
+    // Graceful shutdown (Java order: client_stop → drain connections → save data).
+    // Java: reportShutdown is only set after successful notifyStart().
+    // Unlike allow_connections, it's never toggled during cert refresh.
     tracing::info!("Shutting down...");
-    rpc_client.client_stop().await.ok();
+    if report_shutdown.load(Ordering::Relaxed) {
+        rpc_client.client_stop().await.ok();
+    }
     cache.save_persistent_data();
     {
         let cfg = config.load();

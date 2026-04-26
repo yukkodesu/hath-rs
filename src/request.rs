@@ -11,6 +11,8 @@ pub enum RequestType {
         hv_file: Option<HVFile>,
         additional: HashMap<String, String>,
         keystamp_valid: bool,
+        /// HEAD requests: skip body construction (file read / proxy download).
+        head_only: bool,
     },
     ServerCommand {
         command: String,
@@ -24,6 +26,8 @@ pub enum RequestType {
         valid: bool,
         /// Distinguishes 403 (invalid key) from 400 (malformed URL) when valid=false.
         forbidden: bool,
+        /// HEAD requests: skip body generation.
+        head_only: bool,
     },
     Favicon,
     Robots,
@@ -58,10 +62,12 @@ pub fn parse_request(request_line: &str, client_ip: IpAddr, config: &Config) -> 
         return RequestType::NotFound;
     }
 
+    let head_only = method.eq_ignore_ascii_case("HEAD");
+
     match url_parts[1] {
-        "h" => parse_file_serve(&url_parts, config),
+        "h" => parse_file_serve(&url_parts, config, head_only),
         "servercmd" => parse_server_command(&url_parts, client_ip, config),
-        "t" => parse_speed_test(&url_parts, config),
+        "t" => parse_speed_test(&url_parts, config, head_only),
         _ if url_parts.len() == 2 => match url_parts[1] {
             "favicon.ico" => RequestType::Favicon,
             "robots.txt" => RequestType::Robots,
@@ -71,14 +77,14 @@ pub fn parse_request(request_line: &str, client_ip: IpAddr, config: &Config) -> 
     }
 }
 
-fn parse_file_serve(url_parts: &[&str], config: &Config) -> RequestType {
+fn parse_file_serve(url_parts: &[&str], config: &Config, head_only: bool) -> RequestType {
     if url_parts.len() < 4 { return RequestType::BadRequest; }
     let fileid = url_parts[2].to_string();
     let hv_file = HVFile::from_fileid(&fileid);
     let additional = parse_additional(url_parts[3]);
     let keystamp_valid = validate_keystamp(&fileid, additional.get("keystamp").map(|s| s.as_str()), config);
 
-    RequestType::FileServe { fileid, hv_file, additional, keystamp_valid }
+    RequestType::FileServe { fileid, hv_file, additional, keystamp_valid, head_only }
 }
 
 fn parse_server_command(url_parts: &[&str], client_ip: IpAddr, config: &Config) -> RequestType {
@@ -98,17 +104,17 @@ fn parse_server_command(url_parts: &[&str], client_ip: IpAddr, config: &Config) 
     RequestType::ServerCommand { command, additional, valid }
 }
 
-fn parse_speed_test(url_parts: &[&str], config: &Config) -> RequestType {
+fn parse_speed_test(url_parts: &[&str], config: &Config, head_only: bool) -> RequestType {
     if url_parts.len() < 5 {
         // Java: responseStatusCode = 400 when urlparts.length < 5
-        return RequestType::SpeedTest { testsize: 0, testtime: 0, testkey: String::new(), valid: false, forbidden: false };
+        return RequestType::SpeedTest { testsize: 0, testtime: 0, testkey: String::new(), valid: false, forbidden: false, head_only };
     }
     let testsize: u32 = url_parts[2].parse().unwrap_or(0);
     let testtime: i64 = url_parts[3].parse().unwrap_or(0);
     let testkey = url_parts[4].to_string();
     let valid = validate_speedtest(testsize, testtime, &testkey, config);
     // Java: responseStatusCode = 403 for expired or invalid key
-    RequestType::SpeedTest { testsize, testtime, testkey, valid, forbidden: !valid }
+    RequestType::SpeedTest { testsize, testtime, testkey, valid, forbidden: !valid, head_only }
 }
 
 /// Validate keystamp for /h/ requests.

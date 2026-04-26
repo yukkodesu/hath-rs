@@ -15,7 +15,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
@@ -38,6 +38,10 @@ enum DataSource {
         start_time: Instant,
         /// Wakes the download task when body finishes reading.
         body_done_notify: Arc<Notify>,
+        /// Set by the download task when it finishes (success or failure).
+        /// The body reader checks this to avoid waiting forever for
+        /// data that will never arrive.
+        download_done: Arc<AtomicBool>,
     },
 }
 
@@ -65,14 +69,25 @@ pub struct StreamingBody {
 }
 
 impl StreamingBody {
-    /// Create a new static body from pre-loaded data.
+    /// Create a new static body from pre-loaded data (zero-copy for `Bytes::from_static`).
     ///
-    /// * `data` - The full response body bytes.
+    /// * `data` - The full response body as `Bytes`. Use `Bytes::from_static(b"...")`
+    ///            for static content, `Bytes::from(vec)` for owned data, or
+    ///            `Bytes::copy_from_slice(s)` for borrowed slices.
     /// * `bwm`  - Optional bandwidth monitor for per-chunk throttling.
-    pub fn new(data: Vec<u8>, bwm: Option<Arc<BandwidthMonitor>>) -> Self {
+    pub fn new(data: Bytes, bwm: Option<Arc<BandwidthMonitor>>) -> Self {
+        Self::from_bytes(data, bwm)
+    }
+
+    /// Zero-allocation empty body (for HEAD responses).
+    pub fn empty() -> Self {
+        Self::from_bytes(Bytes::new(), None)
+    }
+
+    fn from_bytes(data: Bytes, bwm: Option<Arc<BandwidthMonitor>>) -> Self {
         let total_size = data.len();
         Self {
-            source: DataSource::Static { data: Bytes::from(data) },
+            source: DataSource::Static { data },
             offset: 0,
             total_size,
             bwm,
@@ -100,6 +115,7 @@ impl StreamingBody {
         write_offset: Arc<AtomicU64>,
         notify: Arc<Notify>,
         body_done_notify: Arc<Notify>,
+        download_done: Arc<AtomicBool>,
         bwm: Option<Arc<BandwidthMonitor>>,
     ) -> Self {
         Self {
@@ -109,6 +125,7 @@ impl StreamingBody {
                 notify,
                 start_time: Instant::now(),
                 body_done_notify,
+                download_done,
             },
             offset: 0,
             total_size,
@@ -191,8 +208,19 @@ impl Body for StreamingBody {
             }
 
             if need_wait {
-                // Re-borrow self.source to get notify + start_time.
-                if let DataSource::Proxy { notify, start_time, .. } = &self.source {
+                // Re-borrow self.source to get notify + start_time + download_done.
+                if let DataSource::Proxy { notify, start_time, download_done, .. } = &self.source {
+                    // If the download task has completed (success or failure) and
+                    // there isn't enough data, terminate immediately. No point
+                    // waiting for data that will never arrive.
+                    if download_done.load(Ordering::SeqCst) {
+                        tracing::debug!(
+                            "ProxyStreamingBody: download done, terminating at offset {}",
+                            self.offset
+                        );
+                        return Poll::Ready(None);
+                    }
+
                     // Check timeout (5 minutes, Java: timeout > 30000 * 10ms = 300s)
                     if start_time.elapsed() > Duration::from_secs(300) {
                         tracing::warn!(
