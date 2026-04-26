@@ -3,7 +3,8 @@ use std::path::Path;
 use std::collections::HashMap;
 use std::fs;
 use std::io;
-use std::time::{UNIX_EPOCH};
+use std::time::UNIX_EPOCH;
+use std::time::Duration;
 use tracing;
 
 /// Compute SHA-1 hex digest of a string.
@@ -104,6 +105,21 @@ pub fn millis_now() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+/// Run `f` on each tick of an interval, until `shutdown` fires.
+pub async fn tick_every<F, Fut>(shutdown: tokio_util::sync::CancellationToken, every: Duration, mut f: F)
+where
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send,
+{
+    let mut tick = tokio::time::interval(every);
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            _ = tick.tick() => f().await,
+        }
+    }
 }
 
 #[cfg(test)]

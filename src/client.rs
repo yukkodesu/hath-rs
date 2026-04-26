@@ -1,10 +1,9 @@
-use crate::config::{Config, CliArgs};
+use crate::cache::{self, CacheHandler};
+use crate::config::{CliArgs, Config};
 use crate::error::{HathError, Result};
-use crate::cache::CacheHandler;
-use crate::cache::pruner::CachePruner;
 use crate::rpc::{self, ResponseStatus};
-use crate::rpc_client::RpcClient;
-use crate::server::{self, AppState, prune_flood_control};
+use crate::rpc_client::{self, RpcClient};
+use crate::server::{self, AppState};
 use crate::stats::Stats;
 
 use arc_swap::{ArcSwap, ArcSwapOption};
@@ -12,23 +11,7 @@ use clap::Parser;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::Duration;
 use tokio::sync::{Mutex, Notify};
-
-/// Run `f` on each tick of an interval, until `shutdown` fires.
-async fn tick_every<F, Fut>(shutdown: tokio_util::sync::CancellationToken, every: Duration, mut f: F)
-where
-    F: FnMut() -> Fut + Send + 'static,
-    Fut: std::future::Future<Output = ()> + Send,
-{
-    let mut tick = tokio::time::interval(every);
-    loop {
-        tokio::select! {
-            _ = shutdown.cancelled() => break,
-            _ = tick.tick() => f().await,
-        }
-    }
-}
 
 /// Main client entry point. Follows Java HentaiAtHomeClient.run() lifecycle.
 pub async fn run() -> Result<()> {
@@ -41,9 +24,15 @@ pub async fn run() -> Result<()> {
     // 2. Start logging
     crate::logging::init_logging(&config.log_dir, !config.disable_logging)?;
 
-    tracing::info!("Hentai@Home {} (Build {}) starting up", rpc::CLIENT_VERSION, rpc::CLIENT_BUILD);
+    tracing::info!(
+        "Hentai@Home {} (Build {}) starting up",
+        rpc::CLIENT_VERSION,
+        rpc::CLIENT_BUILD
+    );
     tracing::info!("Copyright (c) 2008-2026, E-Hentai.org - all rights reserved.");
-    tracing::info!("This software comes with ABSOLUTELY NO WARRANTY. This is free software, and you are welcome to modify and redistribute it under the GPL v3 license.");
+    tracing::info!(
+        "This software comes with ABSOLUTELY NO WARRANTY. This is free software, and you are welcome to modify and redistribute it under the GPL v3 license."
+    );
 
     let shutdown = tokio_util::sync::CancellationToken::new();
 
@@ -66,7 +55,9 @@ pub async fn run() -> Result<()> {
 
     let stat_resp = rpc_client.server_stat().await?;
     if stat_resp.status != ResponseStatus::Ok {
-        return Err(HathError::Rpc("Failed to get initial stat from server".into()));
+        return Err(HathError::Rpc(
+            "Failed to get initial stat from server".into(),
+        ));
     }
 
     // 6. Client login: get full settings
@@ -92,7 +83,7 @@ pub async fn run() -> Result<()> {
     let stats = Arc::new(Stats::new());
     let cache = Arc::new(CacheHandler::new(config.clone(), stats.clone())?);
 
-    // 8. Download cert + start HTTP server
+    // 8. Build AppState and spawn HTTP server
     let allow_connections = Arc::new(AtomicBool::new(false));
     let flood_control = Arc::new(Mutex::new(HashMap::new()));
 
@@ -114,26 +105,10 @@ pub async fn run() -> Result<()> {
         server_terminated: Arc::new(AtomicBool::new(false)),
     };
 
-    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-    let server_restart_token = tokio_util::sync::CancellationToken::new();
-    let server_state = app_state.clone();
-    let server_restart_clone = server_restart_token.clone();
-    let global_shutdown_clone = shutdown.clone();
-    tokio::spawn(async move {
-        if let Err(e) = server::start_server(
-            server_state,
-            global_shutdown_clone,
-            server_restart_clone,
-            Some(ready_tx),
-        )
-        .await
-        {
-            tracing::error!("Server error: {}", e);
-        }
-    });
+    let (ready_rx, restart_token) = server::spawn_server(app_state.clone(), shutdown.clone());
     app_state
         .server_restart_token
-        .store(Some(Arc::new(server_restart_token)));
+        .store(Some(Arc::new(restart_token)));
 
     // Wait for server to bind before notifying the RPC server
     match ready_rx.await {
@@ -142,141 +117,10 @@ pub async fn run() -> Result<()> {
             return Err(HathError::Config(format!("Server startup failed: {}", e)));
         }
         Err(_) => {
-            return Err(HathError::Config("Server startup failed unexpectedly".into()));
+            return Err(HathError::Config(
+                "Server startup failed unexpectedly".into(),
+            ));
         }
-    }
-
-    // Cert refresh watcher: watches for refresh_certs RPC commands and
-    // performs a full server restart (suspend → reject new connections →
-    // drain → shutdown old listener → restart → resume).
-    // Java: HentaiAtHomeClient main loop handles doCertRefresh.
-    {
-        let state = app_state.clone();
-        let rpc = rpc_client.clone();
-        let global_shutdown = shutdown.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = state.cert_refresh_notify.notified() => {},
-                    _ = global_shutdown.cancelled() => break,
-                }
-                if !state.do_cert_refresh.load(Ordering::Acquire) {
-                    continue;
-                }
-                tracing::info!("Starting certificate refresh (full server restart)...");
-
-                // 1. Suspend traffic
-                match rpc.client_suspend().await {
-                    Ok(resp) if resp.status == ResponseStatus::Ok => {
-                        tracing::info!("Suspend notification successful");
-                    }
-                    _ => {
-                        tracing::warn!(
-                            "Failed to contact server to suspend client traffic; will retry"
-                        );
-                        tokio::time::sleep(Duration::from_secs(10)).await;
-                        state.cert_refresh_notify.notify_one();
-                        continue;
-                    }
-                }
-
-                // 2. Stop accepting new connections
-                state.allow_normal_connections.store(false, Ordering::SeqCst);
-
-                // 3. Wait 5s for in-flight requests to drain
-                tokio::time::sleep(Duration::from_secs(5)).await;
-
-                // 4. Reset terminated flag, then cancel restart token to stop old accept loop
-                state.server_terminated.store(false, Ordering::Release);
-                if let Some(token) = state.server_restart_token.load_full() {
-                    token.cancel();
-                }
-
-                // 5. Wait for old server to terminate (Java: up to 300s)
-                let mut wait_cycles = 0u32;
-                loop {
-                    if state.server_terminated.load(Ordering::Acquire) {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                    wait_cycles += 1;
-                    if wait_cycles >= 60 {
-                        tracing::warn!(
-                            "Server did not terminate after 300s, forcing restart"
-                        );
-                        break;
-                    }
-                    if wait_cycles > 1 {
-                        tracing::info!(
-                            "Waiting for HTTPServer to fully terminate... (waited {} seconds)",
-                            wait_cycles * 5
-                        );
-                    }
-                }
-
-                // 6. Wait 1s (Java: brief pause before restart)
-                tokio::time::sleep(Duration::from_secs(1)).await;
-
-                // 7. Restart server with new restart token
-                let new_restart = tokio_util::sync::CancellationToken::new();
-                let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-                let server_state = state.clone();
-                let new_restart_clone = new_restart.clone();
-                let global_shutdown_clone = global_shutdown.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = server::start_server(
-                        server_state,
-                        global_shutdown_clone,
-                        new_restart_clone,
-                        Some(ready_tx),
-                    )
-                    .await
-                    {
-                        tracing::error!("Server restart error: {}", e);
-                    }
-                });
-                state
-                    .server_restart_token
-                    .store(Some(Arc::new(new_restart)));
-
-                // 8. Wait for new server to bind
-                match ready_rx.await {
-                    Ok(Ok(port)) => {
-                        tracing::info!(
-                            "Server restarted successfully on port {}", port
-                        );
-                    }
-                    Ok(Err(e)) => {
-                        tracing::error!("Server restart failed to bind: {}", e);
-                        global_shutdown.cancel();
-                        break;
-                    }
-                    Err(_) => {
-                        tracing::error!(
-                            "Server restart failed unexpectedly (oneshot dropped)"
-                        );
-                        global_shutdown.cancel();
-                        break;
-                    }
-                }
-
-                // 9. Re-allow connections
-                state.allow_normal_connections.store(true, Ordering::SeqCst);
-
-                // 10. Resume traffic
-                match rpc.still_alive(true).await {
-                    Ok(resp) if resp.status == ResponseStatus::Ok => {
-                        tracing::info!("Resume notification successful");
-                    }
-                    _ => {
-                        tracing::warn!("Resume notification returned non-OK");
-                    }
-                }
-
-                state.do_cert_refresh.store(false, Ordering::Release);
-                tracing::info!("Certificate refresh completed successfully");
-            }
-        });
     }
 
     // 9. notifyStart: tell server we're ready (this triggers connectivity test)
@@ -302,9 +146,11 @@ pub async fn run() -> Result<()> {
                  Please ensure port {} is accessible from the internet.",
                 config.load().client_port
             );
-            // Don't return error — continue running like Java does
         } else {
-            return Err(HathError::Fatal(format!("Unexpected client_start failure: {}", code)));
+            return Err(HathError::Fatal(format!(
+                "Unexpected client_start failure: {}",
+                code
+            )));
         }
     }
 
@@ -312,7 +158,7 @@ pub async fn run() -> Result<()> {
     allow_connections.store(true, Ordering::SeqCst);
     stats.program_started();
 
-    // Java: refreshServerSettings() after notifyStart to check schedule.
+    // Refresh settings after notifyStart
     match rpc_client.refresh_settings().await {
         Ok(refresh_resp) if refresh_resp.status == ResponseStatus::Ok => {
             config.rcu(|current| {
@@ -333,155 +179,28 @@ pub async fn run() -> Result<()> {
         }
     }
 
-    // Java: initial blacklist fetch with 3-day delta at startup
-    {
-        let rpc_client = rpc_client.clone();
-        let cache = cache.clone();
-        tokio::spawn(async move {
-            if let Ok(resp) = rpc_client.get_blacklist(259200).await
-                && resp.status == ResponseStatus::Ok
-            {
-                for fileid in &resp.lines {
-                    let _ = cache.delete_file_from_cache(fileid);
-                }
-            }
-        });
-    }
+    // Initial blacklist fetch (3-day delta, synchronous)
+    cache::fetch_initial_blacklist(&rpc_client, &cache).await;
 
     tracing::info!("Startup completed successfully. Starting normal operation");
 
     // 11. Spawn periodic background tasks
-
-    // Cache pruner: checks disk usage and prunes old files.
-    // Java: CachePruner runs in its own thread with a 1-second tick.
-    {
-        let pruner = CachePruner::new(cache.clone(), config.clone(), shutdown.clone());
-        tokio::spawn(async move { pruner.run().await });
-    }
-
-    // 10s: LRU cycle + shift stats
-    {
-        let cache = cache.clone();
-        let stats = stats.clone();
-        tokio::spawn(tick_every(shutdown.clone(), Duration::from_secs(10), move || {
-            let cache = cache.clone();
-            let stats = stats.clone();
-            async move {
-                if let Ok(mut lru) = cache.lru.try_lock() {
-                    lru.cycle();
-                }
-                stats.shift_bytes_sent_history();
-            }
-        }));
-    }
-
-    // 60s: prune flood control
-    {
-        let app_state = app_state.clone();
-        tokio::spawn(tick_every(shutdown.clone(), Duration::from_secs(60), move || {
-            let app_state = app_state.clone();
-            async move { prune_flood_control(&app_state).await }
-        }));
-    }
-
-    // 110s: still_alive
-    {
-        let rpc_client = rpc_client.clone();
-        let stats = stats.clone();
-        tokio::spawn(tick_every(shutdown.clone(), Duration::from_secs(110), move || {
-            let rpc_client = rpc_client.clone();
-            let stats = stats.clone();
-            async move {
-                if let Err(e) = rpc_client.still_alive(false).await {
-                    tracing::warn!("Still-alive failed: {}", e);
-                } else {
-                    stats.record_server_contact();
-                }
-            }
-        }));
-    }
-
-    // 5min: time check + cert expiry
-    {
-        let config = config.clone();
-        let app_state = app_state.clone();
-        let shutdown_signal = shutdown.clone();
-        tokio::spawn(tick_every(shutdown.clone(), Duration::from_secs(300), move || {
-            let config = config.clone();
-            let app_state = app_state.clone();
-            let shutdown_signal = shutdown_signal.clone();
-            async move {
-                if config.load().server_time_delta.abs() > 86400 {
-                    tracing::warn!("System time off by >24h. Correct your system clock.");
-                }
-                // Java: httpServer.isCertExpired() — cert must not expire within 24h
-                if let Some(expiry) = *app_state.cert_expiry.lock().await {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs() as i64;
-                    if expiry - now < 86400 {
-                        tracing::error!(
-                            "Either the system clock is significantly wrong, or something has \
-                             gone wrong with certificate renewal. Check your system clock and \
-                             internet connection, then restart the client manually."
-                        );
-                        shutdown_signal.cancel();
-                    }
-                }
-            }
-        }));
-    }
-
-    // 4h: clear RPC server failure
-    {
-        let config = config.clone();
-        tokio::spawn(tick_every(shutdown.clone(), Duration::from_secs(14400), move || {
-            let config = config.clone();
-            async move {
-                let cfg = config.load();
-                if cfg.rpc_last_failed.is_some() {
-                    let mut new = (**cfg).clone();
-                    new.rpc_last_failed = None;
-                    new.rpc_current = None;
-                    config.store(Arc::new(new));
-                }
-            }
-        }));
-    }
-
-    // 6h: fetch blacklist
-    {
-        let rpc_client = rpc_client.clone();
-        let cache = cache.clone();
-        tokio::spawn(tick_every(shutdown.clone(), Duration::from_secs(21600), move || {
-            let rpc_client = rpc_client.clone();
-            let cache = cache.clone();
-            async move {
-                match rpc_client.get_blacklist(43200).await {
-                    Ok(resp) if resp.status == ResponseStatus::Ok => {
-                        for fileid in &resp.lines {
-                            let _ = cache.delete_file_from_cache(fileid);
-                        }
-                    }
-                    _ => {
-                        tracing::warn!("CacheHandler: Failed to retrieve file blacklist, will try again later.");
-                    }
-                }
-            }
-        }));
-    }
+    cache::spawn_pruner(cache.clone(), config.clone(), shutdown.clone());
+    cache::spawn_periodic_stats(cache.clone(), stats.clone(), shutdown.clone());
+    server::spawn_flood_control_pruner(app_state.clone(), shutdown.clone());
+    rpc_client::spawn_still_alive_heartbeat(rpc_client.clone(), stats.clone(), shutdown.clone());
+    server::spawn_time_cert_check(config.clone(), app_state.clone(), shutdown.clone());
+    rpc_client::spawn_rpc_failure_clearer(config.clone(), shutdown.clone());
+    cache::spawn_blacklist_fetcher(rpc_client.clone(), cache.clone(), shutdown.clone());
+    server::spawn_cert_refresh_watcher(app_state.clone(), rpc_client.clone(), shutdown.clone());
 
     // Wait for shutdown signal
     shutdown.cancelled().await;
 
     // Graceful shutdown (Java order: client_stop → drain connections → save data)
     tracing::info!("Shutting down...");
-    // Step 1: Notify server we're stopping
     rpc_client.client_stop().await.ok();
-    // Step 2: Save persistent cache data
     cache.save_persistent_data();
-    // Step 3: Save client_login
     {
         let cfg = config.load();
         cfg.save_client_login().ok();

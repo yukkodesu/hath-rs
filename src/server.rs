@@ -551,6 +551,205 @@ async fn build_tls_acceptor(config: &Config, force_download: bool) -> Result<(Tl
     Ok((acceptor, cert_expiry_unix))
 }
 
+/// Spawn the HTTP server. Returns a oneshot receiver that fires when
+/// the server binds, and the restart token (to store in AppState).
+pub fn spawn_server(
+    state: AppState,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> (
+    tokio::sync::oneshot::Receiver<std::result::Result<u16, String>>,
+    tokio_util::sync::CancellationToken,
+) {
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let restart_token = tokio_util::sync::CancellationToken::new();
+    let restart_clone = restart_token.clone();
+    let shutdown_clone = shutdown.clone();
+    tokio::spawn(async move {
+        if let Err(e) = start_server(state, shutdown_clone, restart_clone, Some(ready_tx)).await {
+            tracing::error!("Server error: {}", e);
+        }
+    });
+    (ready_rx, restart_token)
+}
+
+/// Spawn the certificate refresh watcher.
+/// Watches for refresh_certs RPC commands and performs a full server restart
+/// (suspend → reject new connections → drain → shutdown old listener → restart → resume).
+pub fn spawn_cert_refresh_watcher(
+    state: AppState,
+    rpc_client: Arc<RpcClient>,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = state.cert_refresh_notify.notified() => {},
+                _ = shutdown.cancelled() => break,
+            }
+            if !state.do_cert_refresh.load(Ordering::Acquire) {
+                continue;
+            }
+            tracing::info!("Starting certificate refresh (full server restart)...");
+
+            // 1. Suspend traffic
+            match rpc_client.client_suspend().await {
+                Ok(resp) if resp.status == rpc::ResponseStatus::Ok => {
+                    tracing::info!("Suspend notification successful");
+                }
+                _ => {
+                    tracing::warn!(
+                        "Failed to contact server to suspend client traffic; will retry"
+                    );
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    state.cert_refresh_notify.notify_one();
+                    continue;
+                }
+            }
+
+            // 2. Stop accepting new connections
+            state.allow_normal_connections.store(false, Ordering::SeqCst);
+
+            // 3. Wait 5s for in-flight requests to drain
+            tokio::time::sleep(Duration::from_secs(5)).await;
+
+            // 4. Reset terminated flag, then cancel restart token to stop old accept loop
+            state.server_terminated.store(false, Ordering::Release);
+            if let Some(token) = state.server_restart_token.load_full() {
+                token.cancel();
+            }
+
+            // 5. Wait for old server to terminate (Java: up to 300s)
+            let mut wait_cycles = 0u32;
+            loop {
+                if state.server_terminated.load(Ordering::Acquire) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                wait_cycles += 1;
+                if wait_cycles >= 60 {
+                    tracing::warn!(
+                        "Server did not terminate after 300s, forcing restart"
+                    );
+                    break;
+                }
+                if wait_cycles > 1 {
+                    tracing::info!(
+                        "Waiting for HTTPServer to fully terminate... (waited {} seconds)",
+                        wait_cycles * 5
+                    );
+                }
+            }
+
+            // 6. Wait 1s
+            tokio::time::sleep(Duration::from_secs(1)).await;
+
+            // 7. Restart server with new restart token
+            let new_restart = tokio_util::sync::CancellationToken::new();
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let server_state = state.clone();
+            let new_restart_clone = new_restart.clone();
+            let global_shutdown_clone = shutdown.clone();
+            tokio::spawn(async move {
+                if let Err(e) = start_server(
+                    server_state,
+                    global_shutdown_clone,
+                    new_restart_clone,
+                    Some(ready_tx),
+                )
+                .await
+                {
+                    tracing::error!("Server restart error: {}", e);
+                }
+            });
+            state
+                .server_restart_token
+                .store(Some(Arc::new(new_restart)));
+
+            // 8. Wait for new server to bind
+            match ready_rx.await {
+                Ok(Ok(port)) => {
+                    tracing::info!(
+                        "Server restarted successfully on port {}", port
+                    );
+                }
+                Ok(Err(e)) => {
+                    tracing::error!("Server restart failed to bind: {}", e);
+                    shutdown.cancel();
+                    break;
+                }
+                Err(_) => {
+                    tracing::error!(
+                        "Server restart failed unexpectedly (oneshot dropped)"
+                    );
+                    shutdown.cancel();
+                    break;
+                }
+            }
+
+            // 9. Re-allow connections
+            state.allow_normal_connections.store(true, Ordering::SeqCst);
+
+            // 10. Resume traffic
+            match rpc_client.still_alive(true).await {
+                Ok(resp) if resp.status == rpc::ResponseStatus::Ok => {
+                    tracing::info!("Resume notification successful");
+                }
+                _ => {
+                    tracing::warn!("Resume notification returned non-OK");
+                }
+            }
+
+            state.do_cert_refresh.store(false, Ordering::Release);
+            tracing::info!("Certificate refresh completed successfully");
+        }
+    });
+}
+
+/// Spawn periodic flood control pruning (60s interval).
+pub fn spawn_flood_control_pruner(
+    state: AppState,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
+    tokio::spawn(crate::utils::tick_every(shutdown, Duration::from_secs(60), move || {
+        let state = state.clone();
+        async move { prune_flood_control(&state).await }
+    }));
+}
+
+/// Spawn periodic time check + cert expiry check (5min interval).
+/// If time drift >24h or cert expires within 24h, triggers global shutdown.
+pub fn spawn_time_cert_check(
+    config: Arc<ArcSwap<Config>>,
+    state: AppState,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
+    let global_shutdown = shutdown.clone();
+    tokio::spawn(crate::utils::tick_every(shutdown, Duration::from_secs(300), move || {
+        let config = config.clone();
+        let state = state.clone();
+        let shutdown_signal = global_shutdown.clone();
+        async move {
+            if config.load().server_time_delta.abs() > 86400 {
+                tracing::warn!("System time off by >24h. Correct your system clock.");
+            }
+            if let Some(expiry) = *state.cert_expiry.lock().await {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64;
+                if expiry - now < 86400 {
+                    tracing::error!(
+                        "Either the system clock is significantly wrong, or something has \
+                         gone wrong with certificate renewal. Check your system clock and \
+                         internet connection, then restart the client manually."
+                    );
+                    shutdown_signal.cancel();
+                }
+            }
+        }
+    }));
+}
+
 /// Prune stale flood control entries. Called periodically from main loop.
 pub async fn prune_flood_control(state: &AppState) {
     let mut fc = state.flood_control.lock().await;
