@@ -236,7 +236,7 @@ impl Config {
             }
         });
 
-        if self.rpc_port == 80 { host } else { format!("{}:{}", host, self.rpc_port) }
+        host
     }
 
     pub fn is_static_range(&self, range: &str) -> bool {
@@ -415,5 +415,13 @@ mod tests {
         let mut config = Config::load(test_cli()).unwrap();
         config.throttle_bytes = 1_000_000;
         assert_eq!(config.max_connections(), 120);
+    }
+
+    #[test]
+    fn test_get_rpc_host_keeps_ipv6_raw() {
+        let mut config = Config::load(test_cli()).unwrap();
+        config.apply_setting("rpc_server_ip", "::ffff:192.0.2.1");
+
+        assert_eq!(config.get_rpc_host(), "::ffff:192.0.2.1");
     }
 }

@@ -7,6 +7,7 @@ use rand::Rng;
 use reqwest::{Client, Url};
 use sha1::Digest;
 use std::io::{Read, Seek, SeekFrom};
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -60,8 +61,8 @@ impl ProxyFileDownloader {
         if let (Some(proxy_type), Some(proxy_host), Some(proxy_port)) =
             (&config.image_proxy_type, &config.image_proxy_host, config.image_proxy_port)
         {
-            let proxy_url = format!("{}://{}:{}", proxy_type, proxy_host, proxy_port);
-            if let Ok(proxy) = reqwest::Proxy::all(&proxy_url) {
+            if let Ok(proxy_url) = build_proxy_url(proxy_type, proxy_host, proxy_port)
+                && let Ok(proxy) = reqwest::Proxy::all(proxy_url.as_str()) {
                 builder = builder.proxy(proxy);
             }
         }
@@ -356,4 +357,35 @@ impl ProxyFileDownloader {
         Ok(n)
     }
 
+}
+
+fn build_proxy_url(proxy_type: &str, proxy_host: &str, proxy_port: u16) -> Result<Url> {
+    let mut url = match proxy_type {
+        "socks" => Url::parse("socks://hath.invalid/"),
+        "http" => Url::parse("http://hath.invalid/"),
+        _ => return Err(HathError::Config(format!("invalid proxy type: {}", proxy_type))),
+    }
+    .map_err(|e| HathError::Config(format!("invalid proxy URL base: {}", e)))?;
+    if let Ok(ip) = proxy_host.parse::<IpAddr>() {
+        url.set_ip_host(ip)
+            .map_err(|_| HathError::Config("invalid proxy host".into()))?;
+    } else {
+        url.set_host(Some(proxy_host))
+            .map_err(|e| HathError::Config(format!("invalid proxy host: {}", e)))?;
+    }
+    url.set_port(Some(proxy_port))
+        .map_err(|_| HathError::Config(format!("invalid proxy port: {}", proxy_port)))?;
+    Ok(url)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_proxy_url_handles_ipv6_host() {
+        let url = build_proxy_url("socks", "::1", 1080).unwrap();
+
+        assert_eq!(url.as_str(), "socks://[::1]:1080/");
+    }
 }

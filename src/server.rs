@@ -25,7 +25,7 @@ use tokio_rustls::TlsAcceptor;
 use reqwest::Url;
 use std::collections::HashMap;
 use std::future::Future;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -488,10 +488,11 @@ async fn run_threaded_proxy_test(
 
     for _ in 0..testcount {
         let random_int: u32 = rand::rng().random();
-        let url = format!(
-            "{}://{}:{}/t/{}/{}/{}/{}",
-            protocol, hostname, port, testsize, testtime, testkey, random_int
-        );
+        let Ok(url) = build_threaded_proxy_test_url(
+            protocol, hostname, port, testsize, testtime, testkey, random_int,
+        ) else {
+            continue;
+        };
         let client = client.clone();
 
         handles.push(tokio::spawn(async move {
@@ -501,7 +502,7 @@ async fn run_threaded_proxy_test(
             let result = timeout(
                 Duration::from_secs(60),
                 async {
-                    let resp = client.get(&url).send().await.map_err(|_| ())?;
+                    let resp = client.get(url).send().await.map_err(|_| ())?;
                     let len = resp.content_length().unwrap_or(0);
                     if len < testsize { return Err(()); }
                     resp.bytes().await.map_err(|_| ())?;
@@ -527,6 +528,35 @@ async fn run_threaded_proxy_test(
     }
 
     (successful, total_time_ms)
+}
+
+fn build_threaded_proxy_test_url(
+    protocol: &str,
+    hostname: &str,
+    port: u16,
+    testsize: u64,
+    testtime: u32,
+    testkey: &str,
+    random_int: u32,
+) -> Result<Url> {
+    let mut url = Url::parse("http://hath.invalid/")
+        .map_err(|e| HathError::Network(format!("invalid speedtest URL base: {}", e)))?;
+    url.set_scheme(protocol)
+        .map_err(|_| HathError::Network(format!("invalid speedtest protocol: {}", protocol)))?;
+    if let Ok(ip) = hostname.parse::<IpAddr>() {
+        url.set_ip_host(ip)
+            .map_err(|_| HathError::Network("invalid speedtest host".into()))?;
+    } else {
+        url.set_host(Some(hostname))
+            .map_err(|e| HathError::Network(format!("invalid speedtest host: {}", e)))?;
+    }
+    url.set_port(Some(port))
+        .map_err(|_| HathError::Network(format!("invalid speedtest port: {}", port)))?;
+    url.set_path(&format!(
+        "/t/{}/{}/{}/{}",
+        testsize, testtime, testkey, random_int
+    ));
+    Ok(url)
 }
 
 /// Build a TLS acceptor from the PKCS12 certificate.
@@ -998,4 +1028,28 @@ pub async fn start_server(
     // Signal that the server has fully terminated (for cert refresh watcher).
     state.server_terminated.store(true, Ordering::Release);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_threaded_proxy_test_url_handles_ipv6_host() {
+        let url = build_threaded_proxy_test_url(
+            "http",
+            "::ffff:192.0.2.1",
+            8443,
+            1024,
+            30,
+            "testkey",
+            12345,
+        )
+        .unwrap();
+
+        assert_eq!(
+            url.as_str(),
+            "http://[::ffff:c000:201]:8443/t/1024/30/testkey/12345"
+        );
+    }
 }
