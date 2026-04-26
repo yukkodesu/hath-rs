@@ -5,6 +5,7 @@ use crate::request::{self, RequestType};
 use crate::response;
 use crate::stats::Stats;
 use crate::cache::CacheHandler;
+use crate::access_log::AccessLogService;
 use crate::rpc_client::RpcClient;
 use crate::rpc::{self, Action};
 use crate::utils;
@@ -28,7 +29,7 @@ use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, Notify};
@@ -55,6 +56,8 @@ pub struct AppState {
     pub bandwidth_monitor: Arc<ArcSwapOption<BandwidthMonitor>>,
     /// Count of currently active connections (for max_connections enforcement).
     pub active_connections: Arc<std::sync::atomic::AtomicU32>,
+    /// Monotonic connection/session id for Java-style access logs.
+    pub next_conn_id: Arc<AtomicU32>,
     /// Timestamp of last overload notification (rate-limited to once per 30s).
     /// Java: ServerHandler.lastOverloadNotification
     pub last_overload_notification: Arc<Mutex<Option<Instant>>>,
@@ -124,6 +127,7 @@ static LOCAL_NETWORK_RE: LazyLock<Regex> = LazyLock::new(|| {
 
 pub struct HathService {
     pub state: AppState,
+    pub remote_addr: SocketAddr,
 }
 
 impl Service<Request<Incoming>> for HathService {
@@ -133,11 +137,10 @@ impl Service<Request<Incoming>> for HathService {
 
     fn call(&self, req: Request<Incoming>) -> Self::Future {
         let state = self.state.clone();
-        // Extract remote_addr from extensions (injected by accept loop)
-        let remote_addr = req.extensions().get::<SocketAddr>().copied();
+        let remote_addr = self.remote_addr;
 
         Box::pin(async move {
-            let client_ip = remote_addr.map(|a| a.ip()).unwrap_or_else(|| "0.0.0.0".parse().unwrap());
+            let client_ip = remote_addr.ip();
             // Load config once for this request (owned Arc, safe across .await)
             let config = state.config.load_full();
 
@@ -1012,7 +1015,15 @@ pub async fn start_server(
 
                     let io = TokioIo::new(tls_stream);
 
-                    let service = HathService { state: conn_state };
+                    let conn_id = conn_state.next_conn_id.fetch_add(1, Ordering::Relaxed) + 1;
+                    let service = AccessLogService::new(
+                        HathService {
+                            state: conn_state,
+                            remote_addr,
+                        },
+                        conn_id,
+                        remote_addr,
+                    );
 
                     if let Err(e) = http1::Builder::new()
                         .serve_connection(io, service)
