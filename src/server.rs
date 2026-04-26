@@ -406,9 +406,7 @@ async fn handle_server_command(
             // Java: additional is parsed as key=value pairs via Tools.parseAdditional();
             // testsize is read from addTable with default 1_000_000. No upper limit.
             let add_table = utils::parse_additional(additional);
-            let testsize: usize = add_table.get("testsize")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(1_000_000);
+            let testsize: usize = required_param!(add_table, "testsize", usize);
             response::speedtest_response(testsize, bwm)
         }
         "refresh_settings" => {

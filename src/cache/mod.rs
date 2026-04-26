@@ -185,20 +185,21 @@ impl CacheHandler {
         stats.set_cache_size(Self::cache_size_with_overhead(cache_size, cache_count, &cfg));
 
         // Java: startup safety checks (CacheHandler constructor lines 111-127)
-        let static_range_count = static_range_oldest.len() as u32;
-        if !cfg.skip_free_space_check {
-            if let Ok(free) = fs2::free_space(&cfg.cache_dir) {
-                let needed = cfg.disklimit_bytes.saturating_sub(
-                    Self::cache_size_with_overhead(cache_size, cache_count, &cfg));
-                if free < needed {
-                    tracing::error!(
-                        "The storage device does not have enough space available to \
-                         hold the set cache size. Free up space for H@H, or reduce \
-                         the cache size from the H@H settings page."
-                    );
-                    shutdown.cancel();
-                    return Err(HathError::Fatal("insufficient disk space for cache".into()));
-                }
+        // Java: Settings.getStaticRangeCount() — server-assigned ranges, not cached ranges
+        let static_range_count = cfg.static_ranges.len() as u32;
+        if !cfg.skip_free_space_check
+            && let Ok(free) = fs2::free_space(&cfg.cache_dir)
+        {
+            let needed = cfg.disklimit_bytes.saturating_sub(
+                Self::cache_size_with_overhead(cache_size, cache_count, &cfg));
+            if free < needed {
+                tracing::error!(
+                    "The storage device does not have enough space available to \
+                     hold the set cache size. Free up space for H@H, or reduce \
+                     the cache size from the H@H settings page."
+                );
+                shutdown.cancel();
+                return Err(HathError::Fatal("insufficient disk space for cache".into()));
             }
         }
         if cache_count < 1 && static_range_count > 20 {

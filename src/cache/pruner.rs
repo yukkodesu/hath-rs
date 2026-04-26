@@ -72,19 +72,19 @@ impl CachePruner {
             // dieWithError if disk is full. Respect skipFreeSpaceCheck.
             disk_check_ticks += 1;
             if disk_check_ticks >= 300 {
-                if !cfg.skip_free_space_check {
-                    if let Ok(free) = fs2::free_space(&cfg.cache_dir) {
-                        let min_remaining = cfg.diskremaining_bytes.max(104_857_600);
-                        if free < min_remaining {
-                            tracing::error!(
-                                "The free disk space has dropped below the minimum \
-                                 allowed threshold. H@H cannot safely continue. \
-                                 Free up space, or reduce the cache size from the \
-                                 H@H settings page."
-                            );
-                            self.shutdown.cancel();
-                            break;
-                        }
+                if !cfg.skip_free_space_check
+                    && let Ok(free) = fs2::free_space(&cfg.cache_dir)
+                {
+                    let min_remaining = cfg.diskremaining_bytes.max(104_857_600);
+                    if free < min_remaining {
+                        tracing::error!(
+                            "The free disk space has dropped below the minimum \
+                             allowed threshold. H@H cannot safely continue. \
+                             Free up space, or reduce the cache size from the \
+                             H@H settings page."
+                        );
+                        self.shutdown.cancel();
+                        break;
                     }
                 }
                 disk_check_ticks = 0;
