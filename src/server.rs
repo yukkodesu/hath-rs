@@ -193,7 +193,10 @@ impl Service<Request<Incoming>> for HathService {
                                 .map(|m| m.len() == hv.size as u64)
                                 .unwrap_or(false);
                         if cache_hit {
-                            state.cache.mark_recently_accessed(hv, false);
+                            // Java: if markRecentlyAccessed returns true (LRU bit was
+                            // not set) and verification is not disabled/on cooldown,
+                            // verify SHA1 inline and delete corrupt file in cleanup().
+                            let recently_accessed = state.cache.mark_recently_accessed(hv, false);
                             state.stats.record_file_sent();
                             if !is_local && !is_rpc {
                                 state.stats.record_bytes_sent(hv.size as u64);
@@ -201,7 +204,13 @@ impl Service<Request<Incoming>> for HathService {
                             if head_only {
                                 response::head_response(hv.mime_type(), hv.size as usize)
                             } else {
-                                response::file_response(hv, &config.cache_dir, bwm_for_request).await
+                                let verify = recently_accessed
+                                    && !config.disable_file_verification
+                                    && !state.cache.is_file_verification_on_cooldown();
+                                response::file_response(
+                                    hv, &config.cache_dir, bwm_for_request,
+                                    verify, Some(state.cache.clone()),
+                                ).await
                             }
                         } else {
                             match state.rpc_client.static_range_fetch(fileindex, xres, &fileid).await {
@@ -360,6 +369,15 @@ macro_rules! required_param {
             None => return response::text_response(hyper::StatusCode::OK, "INVALID_COMMAND"),
         }
     };
+    ($table:expr, $key:expr, $T:ty, default $default:expr) => {
+        match $table.get($key) {
+            Some(v) => match v.parse::<$T>() {
+                Ok(n) => n,
+                Err(_) => return response::text_response(hyper::StatusCode::OK, "INVALID_COMMAND"),
+            },
+            None => $default,
+        }
+    };
 }
 
 /// Handle servercmd API commands. Must support all Java commands.
@@ -406,7 +424,7 @@ async fn handle_server_command(
             // Java: additional is parsed as key=value pairs via Tools.parseAdditional();
             // testsize is read from addTable with default 1_000_000. No upper limit.
             let add_table = utils::parse_additional(additional);
-            let testsize: usize = required_param!(add_table, "testsize", usize);
+            let testsize: usize = required_param!(add_table, "testsize", usize, default 1_000_000);
             response::speedtest_response(testsize, bwm)
         }
         "refresh_settings" => {
@@ -478,21 +496,21 @@ async fn run_threaded_proxy_test(
 
         handles.push(tokio::spawn(async move {
             let start = Instant::now();
-            let total_timeout = Duration::from_secs(testtime as u64 + 5);
-            let result = timeout(total_timeout, client.get(&url).send()).await;
-            let elapsed_ms = start.elapsed().as_millis() as u64;
+            // Java: FileDownloader(source, 10000, 60000, true) — 10s connect, 60s total.
+            // testtime only affects the /t URL and key, not the timeout.
+            let result = timeout(
+                Duration::from_secs(60),
+                async {
+                    let resp = client.get(&url).send().await.map_err(|_| ())?;
+                    let len = resp.content_length().unwrap_or(0);
+                    if len < testsize { return Err(()); }
+                    resp.bytes().await.map_err(|_| ())?;
+                    Ok(())
+                },
+            ).await;
 
             match result {
-                Ok(Ok(resp)) => {
-                    if let Some(len) = resp.content_length()
-                        && len >= testsize {
-                            // Consume body (drain) to complete the request
-                            let _ = resp.bytes().await;
-                            Some(elapsed_ms)
-                        } else {
-                            None
-                        }
-                }
+                Ok(Ok(())) => Some(start.elapsed().as_millis() as u64),
                 _ => None,
             }
         }));
@@ -642,8 +660,13 @@ pub fn spawn_cert_refresh_watcher(
             // 2. Stop accepting new connections
             state.allow_normal_connections.store(false, Ordering::SeqCst);
 
-            // 3. Wait 5s for in-flight requests to drain
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            // 3. Wait for in-flight requests to drain (Java: up to ~25s)
+            for _ in 0..5 {
+                let active = state.active_connections.load(Ordering::Relaxed);
+                if active == 0 { break; }
+                tracing::info!("Waiting for {} active request(s) to finish...", active);
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
 
             // 4. Reset terminated flag, then cancel restart token to stop old accept loop
             state.server_terminated.store(false, Ordering::Release);

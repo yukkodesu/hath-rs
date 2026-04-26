@@ -31,6 +31,16 @@ impl Action {
     fn needs_signing(self) -> bool {
         !matches!(self, Self::ServerStat)
     }
+
+    /// Java: KEY_EXPIRED retry only applies to string-act calls that pass
+    /// a non-null retryact (via ServerHandler getServerResponse with act).
+    /// URL/add-based calls (still_alive, get_blacklist, srfetch, etc.) do
+    /// not retry on KEY_EXPIRED.
+    pub fn supports_key_expired_retry(self) -> bool {
+        matches!(self, Self::ClientLogin | Self::ClientSettings | Self::ClientStart
+            | Self::ClientSuspend | Self::ClientResume | Self::ClientStop
+            | Self::Overload)
+    }
 }
 
 impl fmt::Display for Action {

@@ -15,8 +15,12 @@ pub struct RpcClient {
 
 impl RpcClient {
     pub fn new(config: Arc<ArcSwap<Config>>) -> Result<Self> {
+        // Java: http.keepAlive=false (global), FileDownloader uses connect/read
+        // timeout. Long timeouts for slow RPC responses.
         let http = Client::builder()
             .user_agent(format!("Hentai@Home {}", rpc::CLIENT_VERSION))
+            .connect_timeout(Duration::from_secs(30))
+            .read_timeout(Duration::from_secs(30))
             .build()
             .map_err(|e| HathError::Network(e.to_string()))?;
         Ok(Self { http, config })
@@ -32,8 +36,10 @@ impl RpcClient {
             let url = rpc::make_rpc_url(act, add, &cfg)?;
             let host = url.host_str().unwrap_or("unknown").to_string();
 
-            // Java: network failures → NO_RESPONSE → markRPCServerFailure
-            let resp = self.http.get(url.clone()).send().await;
+            // Java: http.keepAlive=false → Connection: close on every request
+            let resp = self.http.get(url.clone())
+                .header("Connection", "close")
+                .send().await;
             let body = match resp {
                 Ok(r) => r.text().await,
                 Err(e) => Err(e),
@@ -50,8 +56,12 @@ impl RpcClient {
 
             let parsed = rpc::parse_server_response(&body, &host);
 
-            // Java: KEY_EXPIRED triggers refreshServerStat() and retry (max 2 retries)
-            if parsed.fail_code.as_deref() == Some("KEY_EXPIRED") && key_expired_retries < 2 {
+            // Java: KEY_EXPIRED retry only for string-act calls with non-null retryact.
+            // URL/add-based calls (still_alive, get_blacklist, srfetch) do not retry.
+            if parsed.fail_code.as_deref() == Some("KEY_EXPIRED")
+                && key_expired_retries < 2
+                && act.supports_key_expired_retry()
+            {
                 key_expired_retries += 1;
                 tracing::info!("KEY_EXPIRED received, refreshing server stat and retrying ({}/{})...", key_expired_retries, 2);
                 // Inline server_stat to avoid recursive call()
@@ -95,7 +105,9 @@ impl RpcClient {
         let cfg = self.config.load();
         let url = rpc::make_rpc_url(Action::ServerStat, "", &cfg)?;
         let host = url.host_str().unwrap_or("unknown").to_string();
-        let resp = self.http.get(url.clone()).send().await;
+        let resp = self.http.get(url.clone())
+            .header("Connection", "close")
+            .send().await;
         let body = match resp {
             Ok(r) => r.text().await,
             Err(e) => Err(e),

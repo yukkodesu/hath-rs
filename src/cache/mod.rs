@@ -144,6 +144,16 @@ impl CacheHandler {
     pub fn new(config: Arc<ArcSwap<Config>>, stats: Arc<Stats>, shutdown: tokio_util::sync::CancellationToken) -> Result<Self> {
         let cfg = config.load();
 
+        // Java: dieWithError if cache root directory exists but is unreadable
+        if cfg.cache_dir.exists() && std::fs::read_dir(&cfg.cache_dir).is_err() {
+            tracing::error!(
+                "CacheHandler: Unable to access {}; check permissions and I/O errors.",
+                cfg.cache_dir.display()
+            );
+            shutdown.cancel();
+            return Err(HathError::Fatal("cannot read cache directory".into()));
+        }
+
         // Clean up orphaned temp files (matching Java)
         for entry in utils::list_sorted_files(&cfg.temp_dir) {
             if entry.is_file() {
@@ -167,26 +177,29 @@ impl CacheHandler {
                     cache_loaded = true;
                     (lru, state.cache_count, state.cache_size, state.static_range_ages)
                 } else {
+                    // Java: delete old persistent data BEFORE rescan to prevent
+                    // stale files from misleading the next startup after a crash.
+                    Self::delete_persistent_data(&cfg);
                     Self::startup_cache_cleanup(&cfg)?;
                     let (lru, count, size, ages) = Self::full_rescan(&cfg, &stats, cfg.verify_cache)?;
                     cache_loaded = true;
                     (lru, count, size, ages)
                 }
             } else {
+                Self::delete_persistent_data(&cfg);
                 Self::startup_cache_cleanup(&cfg)?;
                 let (lru, count, size, ages) = Self::full_rescan(&cfg, &stats, cfg.verify_cache)?;
                 cache_loaded = true;
                 (lru, count, size, ages)
             };
 
-        Self::delete_persistent_data(&cfg);
-
         stats.set_cache_count(cache_count);
         stats.set_cache_size(Self::cache_size_with_overhead(cache_size, cache_count, &cfg));
 
         // Java: startup safety checks (CacheHandler constructor lines 111-127)
         // Java: Settings.getStaticRangeCount() — server-assigned ranges, not cached ranges
-        let static_range_count = cfg.static_ranges.len() as u32;
+        // Java: Settings.getStaticRangeCount() — server-assigned count
+        let static_range_count = cfg.static_range_count;
         if !cfg.skip_free_space_check
             && let Ok(free) = fs2::free_space(&cfg.cache_dir)
         {

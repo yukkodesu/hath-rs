@@ -9,6 +9,8 @@
 
 use bytes::{Bytes, BytesMut};
 use http_body::{Body, Frame, SizeHint};
+use rand::Rng;
+use sha1::Digest;
 use std::convert::Infallible;
 use std::future::Future;
 use std::io::{Read, Seek, SeekFrom};
@@ -27,8 +29,21 @@ const TCP_PACKET_SIZE: usize = 1460;
 
 /// Where the body data comes from.
 enum DataSource {
-    /// Pre-loaded data (for small responses and cached files).
+    /// Pre-loaded data (for small text responses).
     Static { data: Bytes },
+    /// Generate random data on-the-fly per chunk (speedtest).
+    Random,
+    /// Streaming from a file with optional inline SHA1 verification.
+    /// Java: HTTPResponseProcessorFile — reads chunks via FileChannel,
+    /// computes SHA1 incrementally, deletes corrupt file in cleanup().
+    File {
+        file: std::fs::File,
+        sha1: sha1::Sha1,
+        expected_hash: String,
+        /// Deleted after send if SHA1 mismatches.
+        to_delete: Option<PathBuf>,
+        cache_handler: Option<Arc<crate::cache::CacheHandler>>,
+    },
     /// Proxy download: data is being written to a temp file by a background
     /// download task. We read it incrementally as it becomes available.
     Proxy {
@@ -82,6 +97,49 @@ impl StreamingBody {
     /// Zero-allocation empty body (for HEAD responses).
     pub fn empty() -> Self {
         Self::from_bytes(Bytes::new(), None)
+    }
+
+    /// Create a file-streaming body. Reads chunks incrementally, optionally
+    /// verifying SHA1 and deleting corrupt files after the response is sent.
+    /// Java: HTTPResponseProcessorFile with verifyFileIntegrity.
+    pub fn new_file(
+        path: PathBuf,
+        total_size: usize,
+        expected_hash: String,
+        verify: bool,
+        cache_handler: Option<Arc<crate::cache::CacheHandler>>,
+        bwm: Option<Arc<BandwidthMonitor>>,
+    ) -> std::io::Result<Self> {
+        let file = std::fs::File::open(&path)?;
+        Ok(Self {
+            source: DataSource::File {
+                file,
+                sha1: sha1::Sha1::new(),
+                expected_hash,
+                to_delete: if verify { Some(path) } else { None },
+                cache_handler,
+            },
+            offset: 0,
+            total_size,
+            bwm,
+            throttle_fut: None,
+            throttled: false,
+            wait_fut: None,
+        })
+    }
+
+    /// Create a body that generates random data per-chunk (zero pre-allocation).
+    /// Java: HTTPResponseProcessorSpeedtest.
+    pub fn new_random(total_size: usize, bwm: Option<Arc<BandwidthMonitor>>) -> Self {
+        Self {
+            source: DataSource::Random,
+            offset: 0,
+            total_size,
+            bwm,
+            throttle_fut: None,
+            throttled: false,
+            wait_fut: None,
+        }
     }
 
     fn from_bytes(data: Bytes, bwm: Option<Arc<BandwidthMonitor>>) -> Self {
@@ -139,19 +197,37 @@ impl StreamingBody {
 
 impl StreamingBody {
     /// Signal the download task that the body has finished reading.
-    fn signal_body_done(&mut self) {
-        if let DataSource::Proxy { body_done_notify, .. } = &self.source {
-            body_done_notify.notify_one();
+    /// For File mode, verify SHA1 and delete corrupt file (Java: cleanup()).
+    fn finish(&mut self) {
+        match &mut self.source {
+            DataSource::File { sha1, expected_hash, to_delete, cache_handler, .. } => {
+                if let Some(path) = to_delete.take() {
+                    let actual = crate::utils::hex_encode(&sha1.finalize_reset());
+                    if actual != *expected_hash {
+                        tracing::warn!(
+                            "Corrupt file {:?} (expected {}, got {}); deleting from cache",
+                            path, expected_hash, actual
+                        );
+                        if let Some(ch) = cache_handler {
+                            // Extract fileid from path
+                            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                                let _ = ch.delete_file_from_cache(name);
+                            }
+                        }
+                    }
+                }
+            }
+            DataSource::Proxy { body_done_notify, .. } => {
+                body_done_notify.notify_one();
+            }
+            DataSource::Static { .. } | DataSource::Random => {}
         }
     }
 }
 
 impl Drop for StreamingBody {
     fn drop(&mut self) {
-        // Safety net: if the body is dropped without finishing normally
-        // (e.g. client disconnect), still signal the download task so it
-        // doesn't wait forever.
-        self.signal_body_done();
+        self.finish();
     }
 }
 
@@ -181,7 +257,7 @@ impl Body for StreamingBody {
             if self.offset >= self.total_size {
                 // Signal download task that body has finished reading.
                 // Java: proxyThreadCompleted() → proxyThreadComplete = true
-                self.signal_body_done();
+                self.finish();
                 return Poll::Ready(None);
             }
 
@@ -199,7 +275,7 @@ impl Body for StreamingBody {
                         (self.offset + TCP_PACKET_SIZE).min(self.total_size) as u64;
                     write_offset.load(Ordering::SeqCst) < desired_end
                 }
-                DataSource::Static { .. } => false,
+                DataSource::Static { .. } | DataSource::File { .. } | DataSource::Random => false,
             };
 
             // Clear stale wait_fut when data is now available.
@@ -271,18 +347,47 @@ impl Body for StreamingBody {
             };
             let end = (self.offset + chunk_size).min(self.total_size);
 
-            let chunk: Bytes = match &self.source {
-                DataSource::Static { data } => data.slice(self.offset..end),
-                DataSource::Proxy { temp_file, .. } => {
-                    let actual_size = end - self.offset;
+            let offset = self.offset;
+            let chunk: Bytes = match &mut self.source {
+                DataSource::Static { data } => data.slice(offset..end),
+                DataSource::Random => {
+                    let actual_size = end - offset;
                     let mut buf = BytesMut::zeroed(actual_size);
-                    match std::fs::File::open(temp_file) {
+                    rand::rng().fill_bytes(&mut buf);
+                    buf.freeze()
+                }
+                DataSource::File { file, sha1, .. } => {
+                    let actual_size = end - offset;
+                    let mut buf = BytesMut::zeroed(actual_size);
+                    match file.seek(SeekFrom::Start(offset as u64)) {
+                        Ok(_) => match file.read(&mut buf[..actual_size]) {
+                            Ok(0) => return Poll::Ready(None),
+                            Ok(n) => {
+                                sha1::Digest::update(sha1, &buf[..n]);
+                                buf.truncate(n);
+                                buf.freeze()
+                            }
+                            Err(e) => {
+                                tracing::warn!("File body: read error at offset {}: {}", offset, e);
+                                return Poll::Ready(None);
+                            }
+                        },
+                        Err(e) => {
+                            tracing::warn!("File body: seek error at offset {}: {}", offset, e);
+                            return Poll::Ready(None);
+                        }
+                    }
+                }
+                DataSource::Proxy { temp_file, .. } => {
+                    let actual_size = end - offset;
+                    let mut buf = BytesMut::zeroed(actual_size);
+                    match std::fs::File::open(&*temp_file) {
                         Ok(mut file) => {
-                            if file.seek(SeekFrom::Start(self.offset as u64)).is_err() {
+                            if file.seek(SeekFrom::Start(offset as u64)).is_err() {
                                 return Poll::Ready(None);
                             }
                             match file.read(&mut buf[..actual_size]) {
-                                Ok(0) => return Poll::Ready(None), // EOF / file truncated
+                                Ok(0) => return Poll::Ready(None),
                                 Ok(n) => {
                                     buf.truncate(n);
                                     buf.freeze()
@@ -290,7 +395,7 @@ impl Body for StreamingBody {
                                 Err(e) => {
                                     tracing::warn!(
                                         "ProxyStreamingBody: read error at offset {}: {}",
-                                        self.offset, e
+                                        offset, e
                                     );
                                     return Poll::Ready(None);
                                 }
