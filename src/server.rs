@@ -611,7 +611,7 @@ async fn build_tls_acceptor(config: &Config, force_download: bool) -> Result<(Ss
 
     // Build OpenSSL SslContext with minimal configuration (matching Java's
     // SSLContext.init() which uses JVM defaults without cipher restrictions).
-    let mut ctx_builder = SslContext::builder(SslMethod::tls_server())
+    let mut ctx_builder = SslContext::builder(SslMethod::tls())
         .map_err(|e| HathError::Tls(format!("Failed to create SslContextBuilder: {}", e)))?;
     // Match Java: setEnabledProtocols("TLSv1.3", "TLSv1.2")
     ctx_builder
