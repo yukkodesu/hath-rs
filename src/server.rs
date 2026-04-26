@@ -252,7 +252,11 @@ impl Service<Request<Incoming>> for HathService {
                                                         &message,
                                                     )
                                                 } else {
-                                                    response::not_found_response()
+                                                    // Java: connection failures → 500
+                                                    response::text_response(
+                                                        hyper::StatusCode::INTERNAL_SERVER_ERROR,
+                                                        &e.to_string(),
+                                                    )
                                                 }
                                             }
                                         }
@@ -413,7 +417,7 @@ async fn handle_server_command(
                     crate::config::Config::apply_server_response(&state.config, &sr);
                     // Recreate bandwidth monitor if throttle_bytes changed
                     let cfg = state.config.load_full();
-                    if cfg.throttle_bytes > 0 {
+                    if cfg.throttle_bytes > 0 && !cfg.disable_bwm {
                         state.bandwidth_monitor.store(Some(Arc::new(
                             BandwidthMonitor::new(cfg.throttle_bytes)
                         )));
@@ -816,8 +820,8 @@ pub async fn start_server(
         }
     };
 
-    // Create bandwidth monitor if throttling is enabled
-    if config.throttle_bytes > 0 {
+    // Create bandwidth monitor if throttling is enabled and not disabled
+    if config.throttle_bytes > 0 && !config.disable_bwm {
         state.bandwidth_monitor.store(Some(Arc::new(
             BandwidthMonitor::new(config.throttle_bytes)
         )));
@@ -860,7 +864,9 @@ pub async fn start_server(
                 let host_addr = remote_addr.ip().to_string().to_lowercase();
                 let is_local = LOCAL_NETWORK_RE.is_match(&host_addr)
                     || cfg.client_host.replace("::ffff:", "") == host_addr;
-                let is_rpc = cfg.rpc_servers.iter().any(|s| s.to_string().to_lowercase() == host_addr);
+                // Java: isValidRPCServer returns true when disableIPOriginCheck is set
+                let is_rpc = cfg.disable_ip_origin_check
+                    || cfg.rpc_servers.iter().any(|s| s.to_string().to_lowercase() == host_addr);
 
                 if !allow && !is_rpc {
                     drop(stream);

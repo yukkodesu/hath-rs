@@ -136,6 +136,17 @@ impl ProxyFileDownloader {
             })?
             as u64;
 
+        // Java: check max_allowed_filesize before size match
+        if content_length > config.max_allowed_filesize {
+            return Err(HathError::ProxyDownloader {
+                status: 502,
+                message: format!(
+                    "contentLength {} exceeds max allowed filesize {}",
+                    content_length, config.max_allowed_filesize
+                ),
+            });
+        }
+
         if content_length != hv_file.size as u64 {
             return Err(HathError::ProxyDownloader {
                 status: 502,

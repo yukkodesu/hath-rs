@@ -32,11 +32,21 @@ impl RpcClient {
             let url = rpc::make_rpc_url(act, add, &cfg)?;
             let host = url.host_str().unwrap_or("unknown").to_string();
 
-            let resp = self.http.get(url).send().await
-                .map_err(|e| HathError::Rpc(format!("request failed: {}", e)))?;
-
-            let body = resp.text().await
-                .map_err(|e| HathError::Rpc(format!("read failed: {}", e)))?;
+            // Java: network failures → NO_RESPONSE → markRPCServerFailure
+            let resp = self.http.get(url.clone()).send().await;
+            let body = match resp {
+                Ok(r) => r.text().await,
+                Err(e) => Err(e),
+            };
+            let body = match body {
+                Ok(b) => b,
+                Err(e) => {
+                    let mut new = (**cfg).clone();
+                    new.rpc_last_failed = Some(host.clone());
+                    self.config.store(Arc::new(new));
+                    return Err(HathError::Rpc(format!("request failed: {}", e)));
+                }
+            };
 
             let parsed = rpc::parse_server_response(&body, &host);
 
@@ -76,10 +86,20 @@ impl RpcClient {
         let cfg = self.config.load();
         let url = rpc::make_rpc_url(Action::ServerStat, "", &cfg)?;
         let host = url.host_str().unwrap_or("unknown").to_string();
-        let resp = self.http.get(url).send().await
-            .map_err(|e| HathError::Rpc(format!("stat request failed: {}", e)))?;
-        let body = resp.text().await
-            .map_err(|e| HathError::Rpc(format!("stat read failed: {}", e)))?;
+        let resp = self.http.get(url.clone()).send().await;
+        let body = match resp {
+            Ok(r) => r.text().await,
+            Err(e) => Err(e),
+        };
+        let body = match body {
+            Ok(b) => b,
+            Err(e) => {
+                let mut new = (**cfg).clone();
+                new.rpc_last_failed = Some(host.clone());
+                self.config.store(Arc::new(new));
+                return Err(HathError::Rpc(format!("stat request failed: {}", e)));
+            }
+        };
         Ok(rpc::parse_server_response(&body, &host))
     }
 
