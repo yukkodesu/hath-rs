@@ -204,8 +204,14 @@ impl StreamingBody {
     /// Signal the download task that the body has finished reading.
     /// For File mode, verify SHA1 and delete corrupt file (Java: cleanup()).
     fn finish(&mut self) {
+        let completed = self.offset >= self.total_size;
         match &mut self.source {
             DataSource::File { sha1, expected_hash, to_delete, cache_handler, .. } => {
+                // Java skips integrity verification if the remote client closes
+                // early, because the digest only covers bytes that were sent.
+                if !completed {
+                    return;
+                }
                 if let Some(path) = to_delete.take() {
                     let actual = crate::utils::hex_encode(&sha1.finalize_reset());
                     if actual != *expected_hash {
@@ -321,7 +327,10 @@ impl Body for StreamingBody {
                     if self.wait_fut.is_none() {
                         let n = notify.clone();
                         self.wait_fut = Some(Box::pin(async move {
-                            n.notified().await;
+                            tokio::select! {
+                                _ = n.notified() => {},
+                                _ = tokio::time::sleep(Duration::from_millis(10)) => {},
+                            }
                         }));
                     }
                     if let Some(ref mut fut) = self.wait_fut {
@@ -431,5 +440,76 @@ impl Body for StreamingBody {
             hint.set_exact(self.total_size as u64);
         }
         hint
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http_body_util::BodyExt;
+
+    #[test]
+    fn file_body_skips_integrity_check_when_send_is_partial() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cached-file");
+        std::fs::write(&path, b"complete body").unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+
+        let mut body = StreamingBody::new_file(
+            file,
+            path.clone(),
+            "complete body".len(),
+            "0000000000000000000000000000000000000000".to_string(),
+            true,
+            None,
+            None,
+        );
+        body.offset = 4;
+        body.finish();
+
+        match &body.source {
+            DataSource::File { to_delete, .. } => {
+                assert!(to_delete.is_some());
+            }
+            _ => panic!("expected file data source"),
+        }
+    }
+
+    #[tokio::test]
+    async fn proxy_body_rechecks_write_offset_even_without_notify() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy-file");
+        std::fs::File::create(&path).unwrap();
+
+        let write_offset = Arc::new(AtomicU64::new(0));
+        let notify = Arc::new(Notify::new());
+        let body_done_notify = Arc::new(Notify::new());
+        let download_done = Arc::new(AtomicBool::new(false));
+        let mut body = StreamingBody::new_proxy(
+            4,
+            path.clone(),
+            write_offset.clone(),
+            notify,
+            body_done_notify,
+            download_done,
+            None,
+        )
+        .unwrap();
+
+        let reader = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_millis(250), body.frame()).await
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        std::fs::write(&path, b"data").unwrap();
+        write_offset.store(4, Ordering::SeqCst);
+
+        let frame = reader
+            .await
+            .unwrap()
+            .expect("proxy body should wake by polling even without notify")
+            .unwrap()
+            .unwrap();
+        let bytes = frame.into_data().ok().unwrap();
+        assert_eq!(&bytes[..], b"data");
     }
 }
