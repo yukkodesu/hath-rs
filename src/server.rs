@@ -72,6 +72,9 @@ pub struct AppState {
     /// Set to true by start_server() after the accept loop exits.
     /// The cert refresh watcher polls this to wait for the old server to terminate.
     pub server_terminated: Arc<AtomicBool>,
+    /// Shared HTTP client for ProxyFileDownloader requests.
+    /// 5s connect + 30s read timeout, reused across all proxy downloads.
+    pub proxy_client: Arc<reqwest::Client>,
 }
 
 #[derive(Debug, Clone)]
@@ -87,13 +90,16 @@ impl FloodControlEntry {
     }
 
     pub fn is_stale(&self, now: Instant) -> bool {
-        self.last_connect < now - Duration::from_secs(60)
+        now.checked_duration_since(self.last_connect)
+            .map_or(false, |d| d > Duration::from_secs(60))
     }
 
     /// Returns true if the connection should be allowed.
     pub fn hit(&mut self) -> bool {
         let now = Instant::now();
-        let elapsed_ms = (now - self.last_connect).as_millis() as u32;
+        let elapsed_ms = now.checked_duration_since(self.last_connect)
+            .unwrap_or_default()
+            .as_millis() as u32;
         self.connect_count = self.connect_count.saturating_sub(elapsed_ms / 1000).saturating_add(1);
         self.last_connect = now;
 
@@ -149,7 +155,7 @@ impl Service<Request<Incoming>> for HathService {
             // Determine if this is a local/RPC connection (skip bandwidth throttling)
             let host_addr = client_ip.to_string().to_lowercase();
             let is_local = LOCAL_NETWORK_RE.is_match(&host_addr)
-                || config.client_host.replace("::ffff:", "") == host_addr;
+                || config.client_host == host_addr;
             let is_rpc = config.rpc_servers.iter().any(|s| s.to_string().to_lowercase() == host_addr);
 
             // Determine bandwidth monitor for this request.
@@ -158,18 +164,15 @@ impl Service<Request<Incoming>> for HathService {
             let bwm_for_request = if is_local {
                 None
             } else {
-                state.bandwidth_monitor.load_full().clone()
+                state.bandwidth_monitor.load_full()
             };
 
-            // Build request line for parsing
-            let request_line = format!(
-                "{} {} {:?}",
-                req.method(),
+            let request_type = request::parse_request(
+                req.method().as_str(),
                 req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/"),
-                req.version()
+                client_ip,
+                &config,
             );
-
-            let request_type = request::parse_request(&request_line, client_ip, &config);
 
             // Clone BWM for later header throttling (bwm_for_request is consumed by response builders)
             let bwm_for_header = bwm_for_request.clone();
@@ -179,10 +182,10 @@ impl Service<Request<Incoming>> for HathService {
                     // Java validates fileindex/xres BEFORE cache hit check
                     // (line 194 in HTTPResponse.processRequest). Even a cached
                     // file with missing/invalid arguments returns 404.
-                    let fileindex = additional.get("fileindex");
-                    let xres = additional.get("xres");
-                    let fileindex_valid = fileindex.is_some_and(|v| v.parse::<u32>().is_ok());
-                    let xres_valid = xres.is_some_and(|v| v == "org" || v.parse::<u32>().is_ok());
+                    let fileindex_valid = additional.fileindex.as_deref()
+                        .is_some_and(|v| v.parse::<u32>().is_ok());
+                    let xres_valid = additional.xres.as_deref()
+                        .is_some_and(|v| v == "org" || v.parse::<u32>().is_ok());
 
                     if !keystamp_valid {
                         response::forbidden_response()
@@ -190,8 +193,8 @@ impl Service<Request<Incoming>> for HathService {
                         response::not_found_response()
                     } else {
                         let hv = hv_file.as_ref().unwrap();
-                        let fileindex = fileindex.unwrap();
-                        let xres = xres.unwrap();
+                        let fileindex = additional.fileindex.as_deref().unwrap();
+                        let xres = additional.xres.as_deref().unwrap();
                         let cache_path = hv.cache_path(&config.cache_dir);
                         let cache_hit = cache_path.exists()
                             && cache_path.metadata()
@@ -215,7 +218,7 @@ impl Service<Request<Incoming>> for HathService {
                                 response::file_response(
                                     hv, &config.cache_dir, bwm_for_request,
                                     verify, Some(state.cache.clone()),
-                                ).await
+                                )
                             }
                         } else {
                             match state.rpc_client.static_range_fetch(fileindex, xres, &fileid).await {
@@ -231,7 +234,7 @@ impl Service<Request<Incoming>> for HathService {
                                         // initialize() for both GET and HEAD. The init result
                                         // (connecting to source, checking Content-Length/size)
                                         // determines the status code. HEAD then skips body.
-                                        match ProxyFileDownloader::new(&fileid, &sources, &config, Some(state.cache.clone())).await {
+                                        match ProxyFileDownloader::new(&fileid, &sources, &config, Some(state.cache.clone()), &state.proxy_client).await {
                                             Ok(proxy) => {
                                                 let mime = hv.mime_type();
                                                 state.stats.record_file_sent();
@@ -358,24 +361,24 @@ impl Service<Request<Incoming>> for HathService {
     }
 }
 
-/// Helper for `threaded_proxy_test`: extract required params from add_table,
+/// Helper for `threaded_proxy_test`: extract required params from Additional,
 /// returning `INVALID_COMMAND` on missing/illegal values (matching Java's
 /// NumberFormatException → catch → INVALID_COMMAND flow).
 macro_rules! required_param {
-    ($table:expr, $key:expr) => {
-        match $table.get($key) {
+    ($add:expr, $field:ident) => {
+        match $add.$field.as_deref() {
             Some(v) => v,
             None => return response::text_response(hyper::StatusCode::OK, "INVALID_COMMAND"),
         }
     };
-    ($table:expr, $key:expr, $T:ty) => {
-        match $table.get($key).and_then(|v| v.parse::<$T>().ok()) {
+    ($add:expr, $field:ident, $T:ty) => {
+        match $add.$field.as_deref().and_then(|v| v.parse::<$T>().ok()) {
             Some(v) => v,
             None => return response::text_response(hyper::StatusCode::OK, "INVALID_COMMAND"),
         }
     };
-    ($table:expr, $key:expr, $T:ty, default $default:expr) => {
-        match $table.get($key) {
+    ($add:expr, $field:ident, $T:ty, default $default:expr) => {
+        match $add.$field.as_deref() {
             Some(v) => match v.parse::<$T>() {
                 Ok(n) => n,
                 Err(_) => return response::text_response(hyper::StatusCode::OK, "INVALID_COMMAND"),
@@ -399,15 +402,14 @@ async fn handle_server_command(
         "threaded_proxy_test" => {
             // Java: Integer.parseInt on missing/illegal params throws NFE,
             // caught by processRemoteAPICommand → returns "INVALID_COMMAND".
-            let add_table = utils::parse_additional(additional);
-            let hostname = required_param!(add_table, "hostname");
-            let protocol = required_param!(add_table, "protocol");
-            let port: u16 = required_param!(add_table, "port", u16);
-            let testsize: u64 = required_param!(add_table, "testsize", u64);
-            let testcount: u32 = required_param!(add_table, "testcount", u32);
-            let testtime: u32 = required_param!(add_table, "testtime", u32);
-            let testkey = add_table.get("testkey")
-                .map(|s| s.as_str()).unwrap_or("");
+            let add = utils::parse_additional(additional);
+            let hostname = required_param!(add, hostname);
+            let protocol = required_param!(add, protocol);
+            let port: u16 = required_param!(add, port, u16);
+            let testsize: u64 = required_param!(add, testsize, u64);
+            let testcount: u32 = required_param!(add, testcount, u32);
+            let testtime: u32 = required_param!(add, testtime, u32);
+            let testkey = add.testkey.as_deref().unwrap_or("");
 
             tracing::debug!(
                 "Running speedtest against hostname={} protocol={} port={} testsize={} testcount={} testtime={} testkey={}",
@@ -428,8 +430,8 @@ async fn handle_server_command(
         "speed_test" => {
             // Java: additional is parsed as key=value pairs via Tools.parseAdditional();
             // testsize is read from addTable with default 1_000_000. No upper limit.
-            let add_table = utils::parse_additional(additional);
-            let testsize: usize = required_param!(add_table, "testsize", usize, default 1_000_000);
+            let add = utils::parse_additional(additional);
+            let testsize: usize = required_param!(add, testsize, usize, default 1_000_000);
             response::speedtest_response(testsize, bwm)
         }
         "refresh_settings" => {
@@ -572,7 +574,7 @@ async fn build_tls_acceptor(config: &Config, force_download: bool) -> Result<(Ss
     let cert_path = config.data_dir.join("hathcert.p12");
 
     if force_download || !cert_path.exists() {
-        let cert_url = rpc::make_rpc_url(Action::GetCertificate, "", config)?;
+        let cert_url = rpc::make_rpc_url(Action::GetCertificate, "", config, &crate::rpc_client::RpcState::default())?;
         let downloader = crate::downloader::FileDownloader::new(
             cert_url, 10000, 300000,
             crate::downloader::DownloadMode::File(cert_path.clone()),
@@ -606,8 +608,10 @@ async fn build_tls_acceptor(config: &Config, force_download: bool) -> Result<(Ss
     }
 
     // Compute cert expiry as a Unix timestamp for periodic checks.
+    // ASN1_TIME_diff(from, to) returns to-from, so now.diff(not_after) gives
+    // the remaining seconds until expiry (positive while cert is still valid).
     let now_asn1 = Asn1Time::days_from_now(0)?;
-    let diff = not_after.diff(&now_asn1)?;
+    let diff = now_asn1.diff(not_after)?;
     let now_unix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
     let cert_expiry_unix = now_unix + diff.days as i64 * 86400 + diff.secs as i64;
 
@@ -952,75 +956,6 @@ pub async fn start_server(
                 };
 
                 let state = state.clone();
-                let allow = state.allow_normal_connections.load(Ordering::Relaxed);
-
-                // Load config for flood control / connection checks
-                let cfg = state.config.load();
-
-                // Flood control check for non-local, non-RPC traffic.
-                // Normalize IPv4-mapped IPv6 (::ffff:a.b.c.d) to plain IPv4 so
-                // comparisons work correctly when listening on [::] dual-stack.
-                let host_addr = utils::normalize_ip(remote_addr.ip()).to_string().to_lowercase();
-                let is_local = LOCAL_NETWORK_RE.is_match(&host_addr)
-                    || cfg.client_host.replace("::ffff:", "") == host_addr;
-                // Java: isValidRPCServer returns true when disableIPOriginCheck is set
-                let is_rpc = cfg.disable_ip_origin_check
-                    || cfg.rpc_servers.iter().any(|s| s.to_string().to_lowercase() == host_addr);
-
-                if !allow && !is_rpc {
-                    drop(stream);
-                    continue;
-                }
-
-                if !is_local && !is_rpc && !cfg.disable_flood_control {
-                    drop(cfg); // release Guard before .await
-                    let mut fc = state.flood_control.lock().await;
-                    let entry = fc.entry(host_addr.clone()).or_insert_with(|| FloodControlEntry {
-                        connect_count: 0,
-                        last_connect: Instant::now(),
-                        block_until: None,
-                    });
-                    if entry.is_blocked() || !entry.hit() {
-                        tracing::warn!("Flood control activated for {}", host_addr);
-                        continue;
-                    }
-                }
-
-                // Connection limiting for non-local, non-RPC traffic
-                // Java: HTTPServer.run() checks sessionCount vs maxConnections
-                if !is_local && !is_rpc {
-                    let max_conns = state.config.load().max_connections();
-                    let active = state.active_connections.load(Ordering::Relaxed);
-
-                    if active > max_conns {
-                        tracing::warn!(
-                            "Exceeded the maximum allowed number of incoming connections ({}).",
-                            max_conns
-                        );
-                        drop(stream);
-                        continue;
-                    }
-
-                    if active > (max_conns as f64 * 0.8) as u32 && active > 0 {
-                        tracing::warn!(
-                            "Near connection limit: {} / {} active connections",
-                            active, max_conns
-                        );
-                        // Java: ServerHandler.notifyOverload() — rate-limited to once per 30s
-                        let now = Instant::now();
-                        let mut last = state.last_overload_notification.lock().await;
-                        let should_notify = last.is_none_or(|t| now - t >= Duration::from_secs(30));
-                        if should_notify {
-                            *last = Some(now);
-                            drop(last);
-                            let _ = state.rpc_client.notify_overload().await;
-                        }
-                    }
-                }
-
-                // Increment active connections
-                let prev = state.active_connections.fetch_add(1, Ordering::Relaxed);
-                state.stats.set_open_connections(prev + 1);
 
                 // Load current TLS context (may have been refreshed)
                 let ssl_context = state.tls_acceptor.load_full()
@@ -1028,11 +963,13 @@ pub async fn start_server(
 
                 let conn_state = state.clone();
                 tokio::spawn(async move {
-                    let _guard = ConnectionGuard {
-                        active_connections: conn_state.active_connections.clone(),
-                        stats: conn_state.stats.clone(),
-                    };
+                    // Normalize IPv4-mapped IPv6 (::ffff:a.b.c.d) → plain IPv4.
+                    // Must happen inside the task so host_addr is available after
+                    // the TLS handshake for the allow/flood-control checks below.
+                    let host_addr = utils::normalize_ip(remote_addr.ip()).to_string().to_lowercase();
 
+                    // --- TLS handshake first (matches Java: SSLServerSocket.accept()
+                    //     completes the handshake before any policy checks are applied) ---
                     let ssl = match openssl::ssl::Ssl::new(ssl_context.as_ref()) {
                         Ok(s) => s,
                         Err(e) => {
@@ -1048,8 +985,6 @@ pub async fn start_server(
                         }
                     };
                     if let Err(e) = Pin::new(&mut tls_stream).accept().await {
-                        // Log at debug level for routine client disconnects (e.g. port scanners),
-                        // but at warn level so TLS handshake failures are visible in default logs.
                         let msg = e.to_string();
                         if msg.contains("connection reset") || msg.contains("unexpected EOF") {
                             tracing::debug!("TLS accept from {} closed early: {}", remote_addr, e);
@@ -1058,6 +993,73 @@ pub async fn start_server(
                         }
                         return;
                     }
+
+                    // --- Post-handshake policy checks (Java: HTTPServer.run() order) ---
+                    let cfg = conn_state.config.load();
+                    let is_local = LOCAL_NETWORK_RE.is_match(&host_addr)
+                        || cfg.client_host == host_addr;
+                    // Java: isValidRPCServer returns true when disableIPOriginCheck is set
+                    let is_rpc = cfg.disable_ip_origin_check
+                        || cfg.rpc_servers.iter().any(|s| s.to_string().to_lowercase() == host_addr);
+
+                    let allow = conn_state.allow_normal_connections.load(Ordering::Relaxed);
+                    if !allow && !is_rpc {
+                        tracing::warn!(
+                            "Rejecting connection from {} during startup (rpc_servers={:?})",
+                            host_addr, cfg.rpc_servers
+                        );
+                        return;
+                    }
+
+                    if !is_local && !is_rpc && !cfg.disable_flood_control {
+                        drop(cfg);
+                        let mut fc = conn_state.flood_control.lock().await;
+                        let entry = fc.entry(host_addr.clone()).or_insert_with(|| FloodControlEntry {
+                            connect_count: 0,
+                            last_connect: Instant::now(),
+                            block_until: None,
+                        });
+                        if entry.is_blocked() || !entry.hit() {
+                            tracing::warn!("Flood control activated for {}", host_addr);
+                            return;
+                        }
+                    }
+
+                    // Connection limiting for non-local, non-RPC traffic
+                    if !is_local && !is_rpc {
+                        let max_conns = conn_state.config.load().max_connections();
+                        let active = conn_state.active_connections.load(Ordering::Relaxed);
+
+                        if active > max_conns {
+                            tracing::warn!(
+                                "Exceeded the maximum allowed number of incoming connections ({}).",
+                                max_conns
+                            );
+                            return;
+                        }
+
+                        if active > (max_conns as f64 * 0.8) as u32 && active > 0 {
+                            tracing::warn!(
+                                "Near connection limit: {} / {} active connections",
+                                active, max_conns
+                            );
+                            let now = Instant::now();
+                            let mut last = conn_state.last_overload_notification.lock().await;
+                            let should_notify = last.is_none_or(|t| now - t >= Duration::from_secs(30));
+                            if should_notify {
+                                *last = Some(now);
+                                drop(last);
+                                let _ = conn_state.rpc_client.notify_overload().await;
+                            }
+                        }
+                    }
+
+                    let _guard = ConnectionGuard {
+                        active_connections: conn_state.active_connections.clone(),
+                        stats: conn_state.stats.clone(),
+                    };
+                    let prev = conn_state.active_connections.fetch_add(1, Ordering::Relaxed);
+                    conn_state.stats.set_open_connections(prev + 1);
 
                     let io = TokioIo::new(tls_stream);
 

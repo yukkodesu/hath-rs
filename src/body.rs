@@ -13,7 +13,7 @@ use rand::Rng;
 use sha1::Digest;
 use std::convert::Infallible;
 use std::future::Future;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::Read;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -47,6 +47,9 @@ enum DataSource {
     /// Proxy download: data is being written to a temp file by a background
     /// download task. We read it incrementally as it becomes available.
     Proxy {
+        /// File handle opened once at construction; read sequentially.
+        file: std::fs::File,
+        /// Kept for error messages only.
         temp_file: PathBuf,
         write_offset: Arc<AtomicU64>,
         notify: Arc<Notify>,
@@ -99,19 +102,19 @@ impl StreamingBody {
         Self::from_bytes(Bytes::new(), None)
     }
 
-    /// Create a file-streaming body. Reads chunks incrementally, optionally
-    /// verifying SHA1 and deleting corrupt files after the response is sent.
+    /// Create a file-streaming body from an already-open file handle.
+    /// The caller is responsible for opening the file and verifying its size.
     /// Java: HTTPResponseProcessorFile with verifyFileIntegrity.
     pub fn new_file(
+        file: std::fs::File,
         path: PathBuf,
         total_size: usize,
         expected_hash: String,
         verify: bool,
         cache_handler: Option<Arc<crate::cache::CacheHandler>>,
         bwm: Option<Arc<BandwidthMonitor>>,
-    ) -> std::io::Result<Self> {
-        let file = std::fs::File::open(&path)?;
-        Ok(Self {
+    ) -> Self {
+        Self {
             source: DataSource::File {
                 file,
                 sha1: sha1::Sha1::new(),
@@ -125,7 +128,7 @@ impl StreamingBody {
             throttle_fut: None,
             throttled: false,
             wait_fut: None,
-        })
+        }
     }
 
     /// Create a body that generates random data per-chunk (zero pre-allocation).
@@ -175,9 +178,11 @@ impl StreamingBody {
         body_done_notify: Arc<Notify>,
         download_done: Arc<AtomicBool>,
         bwm: Option<Arc<BandwidthMonitor>>,
-    ) -> Self {
-        Self {
+    ) -> std::io::Result<Self> {
+        let file = std::fs::File::open(&temp_file)?;
+        Ok(Self {
             source: DataSource::Proxy {
+                file,
                 temp_file,
                 write_offset,
                 notify,
@@ -191,7 +196,7 @@ impl StreamingBody {
             throttle_fut: None,
             throttled: false,
             wait_fut: None,
-        }
+        })
     }
 }
 
@@ -359,53 +364,32 @@ impl Body for StreamingBody {
                 DataSource::File { file, sha1, .. } => {
                     let actual_size = end - offset;
                     let mut buf = BytesMut::zeroed(actual_size);
-                    match file.seek(SeekFrom::Start(offset as u64)) {
-                        Ok(_) => match file.read(&mut buf[..actual_size]) {
-                            Ok(0) => return Poll::Ready(None),
-                            Ok(n) => {
-                                sha1::Digest::update(sha1, &buf[..n]);
-                                buf.truncate(n);
-                                buf.freeze()
-                            }
-                            Err(e) => {
-                                tracing::warn!("File body: read error at offset {}: {}", offset, e);
-                                return Poll::Ready(None);
-                            }
-                        },
+                    match file.read(&mut buf[..actual_size]) {
+                        Ok(0) => return Poll::Ready(None),
+                        Ok(n) => {
+                            sha1::Digest::update(sha1, &buf[..n]);
+                            buf.truncate(n);
+                            buf.freeze()
+                        }
                         Err(e) => {
-                            tracing::warn!("File body: seek error at offset {}: {}", offset, e);
+                            tracing::warn!("File body: read error at offset {}: {}", offset, e);
                             return Poll::Ready(None);
                         }
                     }
                 }
-                DataSource::Proxy { temp_file, .. } => {
+                DataSource::Proxy { file, temp_file, .. } => {
                     let actual_size = end - offset;
                     let mut buf = BytesMut::zeroed(actual_size);
-                    match std::fs::File::open(&*temp_file) {
-                        Ok(mut file) => {
-                            if file.seek(SeekFrom::Start(offset as u64)).is_err() {
-                                return Poll::Ready(None);
-                            }
-                            match file.read(&mut buf[..actual_size]) {
-                                Ok(0) => return Poll::Ready(None),
-                                Ok(n) => {
-                                    buf.truncate(n);
-                                    buf.freeze()
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "ProxyStreamingBody: read error at offset {}: {}",
-                                        offset, e
-                                    );
-                                    return Poll::Ready(None);
-                                }
-                            }
+                    match file.read(&mut buf[..actual_size]) {
+                        Ok(0) => return Poll::Ready(None),
+                        Ok(n) => {
+                            buf.truncate(n);
+                            buf.freeze()
                         }
                         Err(e) => {
                             tracing::warn!(
-                                "ProxyStreamingBody: cannot open temp file {}: {}",
-                                temp_file.display(),
-                                e
+                                "ProxyStreamingBody: read error at offset {}: {}",
+                                temp_file.display(), e
                             );
                             return Poll::Ready(None);
                         }

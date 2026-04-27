@@ -2,6 +2,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicI64, Ordering};
 use std::sync::RwLock;
 use std::time::Instant;
 
+const HISTORY_LEN: usize = 361;
+
 #[derive(Debug)]
 pub struct Stats {
     pub client_running: AtomicBool,
@@ -15,7 +17,13 @@ pub struct Stats {
     pub cache_count: AtomicU32,
     pub cache_size: AtomicU64,
     pub open_connections: AtomicU32,
-    pub bytes_sent_history: RwLock<Vec<u32>>,
+    /// Whether GUI listeners are active. When false (headless mode),
+    /// bytes_sent_history writes and shifts are skipped entirely.
+    /// Java: Stats.statListeners is empty in non-GUI mode.
+    gui_enabled: AtomicBool,
+    /// Per-second bytes-sent ring buffer for GUI bandwidth graph.
+    /// Only written when gui_enabled=true to avoid lock contention in headless mode.
+    bytes_sent_history: RwLock<[u64; HISTORY_LEN]>,
 }
 
 impl Stats {
@@ -32,8 +40,15 @@ impl Stats {
             cache_count: AtomicU32::new(0),
             cache_size: AtomicU64::new(0),
             open_connections: AtomicU32::new(0),
-            bytes_sent_history: RwLock::new(vec![0u32; 361]),
+            gui_enabled: AtomicBool::new(false),
+            bytes_sent_history: RwLock::new([0u64; HISTORY_LEN]),
         }
+    }
+
+    /// Enable GUI history tracking (call when a GUI listener is registered).
+    /// Java: Stats.addStatListener() implicitly enables history writes.
+    pub fn enable_gui(&self) {
+        self.gui_enabled.store(true, Ordering::Relaxed);
     }
 
     pub fn program_started(&self) {
@@ -54,9 +69,12 @@ impl Stats {
     pub fn record_bytes_sent(&self, bytes: u64) {
         self.bytes_sent.fetch_add(bytes, Ordering::Relaxed);
         if self.client_running.load(Ordering::Relaxed)
-            && let Ok(mut hist) = self.bytes_sent_history.write() {
-                hist[0] = hist[0].wrapping_add(bytes as u32);
+            && self.gui_enabled.load(Ordering::Relaxed)
+        {
+            if let Ok(mut hist) = self.bytes_sent_history.write() {
+                hist[0] = hist[0].wrapping_add(bytes as u64);
             }
+        }
     }
 
     pub fn record_bytes_rcvd(&self, bytes: u64) {
@@ -68,10 +86,11 @@ impl Stats {
     pub fn set_cache_size(&self, size: u64)         { self.cache_size.store(size, Ordering::Relaxed); }
 
     pub fn shift_bytes_sent_history(&self) {
+        if !self.gui_enabled.load(Ordering::Relaxed) {
+            return;
+        }
         if let Ok(mut hist) = self.bytes_sent_history.write() {
-            for i in (1..361).rev() {
-                hist[i] = hist[i - 1];
-            }
+            hist.copy_within(0..HISTORY_LEN - 1, 1);
             hist[0] = 0;
         }
     }
@@ -120,11 +139,22 @@ mod tests {
     #[test]
     fn test_shift_bytes_sent_history() {
         let s = Stats::new();
+        s.enable_gui();
         s.bytes_sent_history.write().unwrap()[0] = 42;
         s.shift_bytes_sent_history();
         let hist = s.bytes_sent_history.read().unwrap();
         assert_eq!(hist[0], 0);
         assert_eq!(hist[1], 42);
+    }
+
+    #[test]
+    fn test_shift_skipped_without_gui() {
+        let s = Stats::new();
+        s.bytes_sent_history.write().unwrap()[0] = 99;
+        s.shift_bytes_sent_history(); // gui_enabled=false, should no-op
+        let hist = s.bytes_sent_history.read().unwrap();
+        assert_eq!(hist[0], 99); // unchanged
+        assert_eq!(hist[1], 0);
     }
 
     #[test]

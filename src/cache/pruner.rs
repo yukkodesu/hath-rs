@@ -57,7 +57,7 @@ impl CachePruner {
             match action {
                 PruneAction::Prune(plan) => {
                     // Phase 2: execute I/O without holding any locks.
-                    let result = Self::execute_prune(&plan);
+                    let result = Self::execute_prune(&plan).await;
                     // Phase 3: apply result (brief internal lock on static_range_oldest).
                     self.cache.apply_prune_result(result);
                     self.check_frequency = 0; // Re-check immediately after pruning.
@@ -96,7 +96,7 @@ impl CachePruner {
 
     /// Delete files matching the prune plan. Called without any cache locks
     /// so file I/O and sleep delays don't block other cache operations.
-    fn execute_prune(plan: &PrunePlan) -> PruneResult {
+    async fn execute_prune(plan: &PrunePlan) -> PruneResult {
         let mut files_deleted = 0usize;
         let mut bytes_deleted = 0u64;
         let mut oldest_last_modified = u64::MAX;
@@ -135,9 +135,9 @@ impl CachePruner {
                 }
 
                 // Delay between deletions to reduce disk activity bursts.
-                std::thread::sleep(Duration::from_millis(
+                tokio::time::sleep(Duration::from_millis(
                     if plan.fast_delete { 100 } else { 1000 },
-                ));
+                )).await;
             }
         }
 

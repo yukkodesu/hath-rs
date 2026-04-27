@@ -20,6 +20,8 @@ pub struct HVFile {
     pub xres: u32,
     pub yres: u32,
     pub file_type: FileType,
+    /// Cached file ID string, computed once at construction.
+    fileid_cache: FileId,
 }
 
 impl HVFile {
@@ -43,29 +45,17 @@ impl HVFile {
             (x, y, FileType::from_ext(parts[4]))
         };
 
-        Some(Self { hash, size, xres, yres, file_type })
+        let fileid_cache = if xres > 0 {
+            FileId::new(format!("{}-{}-{}-{}-{}", hash.as_str(), size, xres, yres, file_type.as_ext()))
+        } else {
+            FileId::new(format!("{}-{}-{}", hash.as_str(), size, file_type.as_ext()))
+        };
+        Some(Self { hash, size, xres, yres, file_type, fileid_cache })
     }
 
-    /// Build the full file ID string. Uses `as_ext()` for lowercase extensions,
-    /// matching Java HVFile.getFileid() output byte-for-byte.
-    pub fn fileid(&self) -> FileId {
-        if self.xres > 0 {
-            FileId::new(format!(
-                "{}-{}-{}-{}-{}",
-                self.hash.as_str(),
-                self.size,
-                self.xres,
-                self.yres,
-                self.file_type.as_ext()
-            ))
-        } else {
-            FileId::new(format!(
-                "{}-{}-{}",
-                self.hash.as_str(),
-                self.size,
-                self.file_type.as_ext()
-            ))
-        }
+    /// Returns the file ID string. Computed once at construction, zero-cost to call.
+    pub fn fileid(&self) -> &FileId {
+        &self.fileid_cache
     }
 
     pub fn cache_path(&self, cache_dir: &Path) -> PathBuf {

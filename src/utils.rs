@@ -1,7 +1,6 @@
 use sha1::{Sha1, Digest};
 use std::net::IpAddr;
 use std::path::Path;
-use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::time::UNIX_EPOCH;
@@ -28,30 +27,71 @@ pub fn sha1_string(input: &str) -> String {
 /// Compute SHA-1 hex digest of a file.
 pub fn sha1_file(path: &Path) -> io::Result<String> {
     let data = fs::read(path)?;
+    Ok(sha1_bytes(&data))
+}
+
+/// Compute SHA-1 hex digest of a byte slice (zero-copy, no intermediate allocation).
+pub fn sha1_bytes(data: &[u8]) -> String {
     let mut hasher = Sha1::new();
-    hasher.update(&data);
-    Ok(hex_encode(&hasher.finalize()))
+    hasher.update(data);
+    hex_encode(&hasher.finalize())
 }
 
 /// Convert bytes to lowercase hex string.
 pub fn hex_encode(data: &[u8]) -> String {
-    data.iter().map(|b| format!("{:02x}", b)).collect()
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(data.len() * 2);
+    for b in data { write!(out, "{:02x}", b).unwrap(); }
+    out
 }
 
-/// Parse key=value pairs separated by semicolons into a HashMap.
+/// All key=value fields used across H@H additional segments.
+/// Covers both file-serve (/h/) and servercmd paths.
+/// Parsed directly by key name — no HashMap, no hash computation.
+#[derive(Debug, Default)]
+pub struct Additional {
+    // /h/ file-serve keys
+    pub keystamp:  Option<String>,
+    pub fileindex: Option<String>,
+    pub xres:      Option<String>,
+    // servercmd/threaded_proxy_test keys
+    pub hostname:  Option<String>,
+    pub protocol:  Option<String>,
+    pub port:      Option<String>,
+    pub testsize:  Option<String>,
+    pub testcount: Option<String>,
+    pub testtime:  Option<String>,
+    pub testkey:   Option<String>,
+}
+
+/// Parse semicolon-separated key=value pairs into an `Additional`.
 /// Replicates Java Tools.parseAdditional().
-pub fn parse_additional(additional: &str) -> HashMap<String, String> {
-    let mut map = HashMap::new();
+pub fn parse_additional(additional: &str) -> Additional {
+    let mut out = Additional::default();
     if additional.is_empty() {
-        return map;
+        return out;
     }
     for kv_pair in additional.trim().split(';') {
-        if kv_pair.len() > 2
-            && let Some((k, v)) = kv_pair.split_once('=') {
-                map.insert(k.trim().to_string(), v.trim().to_string());
+        if kv_pair.len() > 2 {
+            if let Some((k, v)) = kv_pair.split_once('=') {
+                let v = v.trim().to_string();
+                match k.trim() {
+                    "keystamp"  => out.keystamp  = Some(v),
+                    "fileindex" => out.fileindex = Some(v),
+                    "xres"      => out.xres      = Some(v),
+                    "hostname"  => out.hostname  = Some(v),
+                    "protocol"  => out.protocol  = Some(v),
+                    "port"      => out.port      = Some(v),
+                    "testsize"  => out.testsize  = Some(v),
+                    "testcount" => out.testcount = Some(v),
+                    "testtime"  => out.testtime  = Some(v),
+                    "testkey"   => out.testkey   = Some(v),
+                    _ => {}
+                }
             }
+        }
     }
-    map
+    out
 }
 
 /// Ensure a directory exists, creating it if necessary.
@@ -158,7 +198,7 @@ mod tests {
     #[test]
     fn test_parse_additional_multiple() {
         let m = parse_additional("fileindex=42;xres=org");
-        assert_eq!(m.get("fileindex").unwrap(), "42");
-        assert_eq!(m.get("xres").unwrap(), "org");
+        assert_eq!(m.fileindex.as_deref().unwrap(), "42");
+        assert_eq!(m.xres.as_deref().unwrap(), "org");
     }
 }

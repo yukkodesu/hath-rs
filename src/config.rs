@@ -80,12 +80,13 @@ pub struct Config {
     pub rpc_servers: Vec<IpAddr>,
     pub rpc_port: u16,
     pub rpc_path: String,
-    /// Cached RPC host. Set on first successful call, cleared on failure.
-    pub rpc_current: Option<String>,
-    /// Last failed RPC host, used to avoid re-picking it.
-    pub rpc_last_failed: Option<String>,
 
+    /// Java (build 174+): static ranges are only sent on startup via client_login,
+    /// as the client only needs them for startup cache pruning. Subsequent RPC
+    /// responses (still_alive, refresh_settings, etc.) do not include this field.
     pub static_ranges: HashMap<String, u8>,
+    /// Updated independently of static_ranges to reflect the current assignment
+    /// count without re-sending the full range list on every settings refresh.
     pub static_range_count: u32,
 
     pub verify_cache: bool,
@@ -159,8 +160,6 @@ impl Config {
             rpc_servers: Vec::new(),
             rpc_port: 80,
             rpc_path: "15/rpc?".to_string(),
-            rpc_current: None,
-            rpc_last_failed: None,
             static_ranges: HashMap::new(),
             static_range_count: 0,
             verify_cache: args.verify_cache.unwrap_or(false),
@@ -195,14 +194,15 @@ impl Config {
         }
     }
 
-    /// Pick an RPC host. Uses cached `rpc_current` if set and not last-failed,
+    /// Pick an RPC host using routing state from RpcClient.
+    /// Uses cached `state.rpc_current` if set and not last-failed,
     /// otherwise selects a random server from `rpc_servers`.
-    pub fn get_rpc_host(&self) -> String {
-        let host = if let Some(ref host) = self.rpc_current {
-            if let Some(ref failed) = self.rpc_last_failed
+    pub fn get_rpc_host(&self, state: &crate::rpc_client::RpcState) -> String {
+        let host = if let Some(ref host) = state.rpc_current {
+            if let Some(ref failed) = state.rpc_last_failed
                 && *host == *failed {
                     tracing::debug!("{} was marked as last failed (from cache)", failed);
-                    None // fall through to selection
+                    None
                 } else {
                     Some(host.clone())
                 }
@@ -214,18 +214,16 @@ impl Config {
             if self.rpc_servers.is_empty() {
                 return "rpc.hentaiathome.net".to_string();
             }
-            // Java: single server → use directly, skip the avoid-last-failed loop.
             if self.rpc_servers.len() == 1 {
                 return self.rpc_servers[0].to_string().to_lowercase();
             }
-            // Pick a random server and random scan direction, avoiding last failed.
-            // Java: rpcServerSelector = random index, scanDirection = Math.random() < 0.5 ? -1 : 1
-            let mut idx: isize = (rand::rng().next_u32() as usize % self.rpc_servers.len()) as isize;
-            let dir: isize = if rand::rng().next_u32() & 1 == 0 { -1 } else { 1 };
+            let mut rng = rand::rng();
+            let mut idx: isize = (rng.next_u32() as usize % self.rpc_servers.len()) as isize;
+            let dir: isize = if rng.next_u32() & 1 == 0 { -1 } else { 1 };
             let len = self.rpc_servers.len() as isize;
             loop {
                 let candidate = self.rpc_servers[((len + idx) % len) as usize].to_string().to_lowercase();
-                if let Some(ref failed) = self.rpc_last_failed
+                if let Some(ref failed) = state.rpc_last_failed
                     && candidate == *failed {
                         tracing::debug!("{} was marked as last failed", failed);
                         idx += dir;
@@ -271,19 +269,20 @@ impl Config {
             "rpc_server_ip" => {
                 self.rpc_servers = value.split(';')
                     .filter_map(|s| s.trim().parse::<IpAddr>().ok())
+                    .map(crate::utils::normalize_ip)
                     .collect();
-                // Java: clear cached host if it's no longer in the new server list
-                if let Some(ref current) = self.rpc_current {
-                    let still_valid = self.rpc_servers.iter().any(|s| {
-                        s.to_string().to_lowercase() == *current
-                    });
-                    if !still_valid {
-                        self.rpc_current = None;
-                    }
-                }
+                // Java: clear cached host if it's no longer in the new server list.
+                // rpc_current is now in RpcState inside RpcClient; the equivalent
+                // staleness check runs at the top of RpcClient::call() each time.
             }
             "rpc_path" => self.rpc_path = value.to_string(),
-            "host" => self.client_host = value.to_string(),
+            "host" => {
+                // Normalize IPv4-mapped IPv6 (::ffff:x.x.x.x) to plain IPv4
+                // so per-connection comparisons don't need String::replace.
+                self.client_host = value.parse::<IpAddr>()
+                    .map(|ip| crate::utils::normalize_ip(ip).to_string())
+                    .unwrap_or_else(|_| value.to_string());
+            }
             "port" => { if self.client_port == 0 { self.client_port = value.parse().unwrap_or(0); } }
             "throttle_bytes" => self.throttle_bytes = value.parse().unwrap_or(0),
             "disklimit_bytes" => {
@@ -418,10 +417,11 @@ mod tests {
     }
 
     #[test]
-    fn test_get_rpc_host_keeps_ipv6_raw() {
+    fn test_get_rpc_host_normalizes_ipv4_mapped() {
         let mut config = Config::load(test_cli()).unwrap();
+        // ::ffff:192.0.2.1 is IPv4-mapped IPv6 — normalize_ip strips the prefix
         config.apply_setting("rpc_server_ip", "::ffff:192.0.2.1");
 
-        assert_eq!(config.get_rpc_host(), "::ffff:192.0.2.1");
+        assert_eq!(config.get_rpc_host(&crate::rpc_client::RpcState::default()), "192.0.2.1");
     }
 }

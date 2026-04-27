@@ -4,13 +4,28 @@ use crate::rpc::{self, ServerResponse, ResponseStatus, Action};
 use crate::stats::Stats;
 use arc_swap::ArcSwap;
 use reqwest::Client;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+/// Mutable RPC routing state, separated from Config to avoid cloning the
+/// entire Config (including static_ranges HashMap) on every RPC call.
+/// Java: Settings.rpcServerCurrent / rpcServerLastFailed (static fields).
+#[derive(Default)]
+pub struct RpcState {
+    /// Currently selected RPC host. Cached until failure or periodic reset.
+    /// Java: Settings.rpcServerCurrent
+    pub rpc_current: Option<String>,
+    /// Last failed RPC host, skipped during host selection.
+    /// Java: Settings.rpcServerLastFailed
+    pub rpc_last_failed: Option<String>,
+}
 
 /// Shared HTTP client for RPC calls.
 pub struct RpcClient {
     http: Client,
     config: Arc<ArcSwap<Config>>,
+    /// Mutable routing state kept here to avoid per-call Config clone.
+    state: Mutex<RpcState>,
 }
 
 impl RpcClient {
@@ -23,7 +38,7 @@ impl RpcClient {
             .read_timeout(Duration::from_secs(30))
             .build()
             .map_err(|e| HathError::Network(e.to_string()))?;
-        Ok(Self { http, config })
+        Ok(Self { http, config, state: Mutex::new(RpcState::default()) })
     }
 
     /// Execute an RPC call and return the parsed response.
@@ -33,7 +48,20 @@ impl RpcClient {
         let mut key_expired_retries = 0u32;
         loop {
             let cfg = self.config.load();
-            let url = rpc::make_rpc_url(act, add, &cfg)?;
+            // Java: Settings.apply("rpc_server_ip") clears rpcServerCurrent if it's
+            // no longer in the new server list. We do the equivalent check here since
+            // rpc_current is now in RpcState rather than Config.
+            {
+                let mut state = self.state.lock().unwrap();
+                if let Some(ref current) = state.rpc_current {
+                    let still_valid = cfg.rpc_servers.iter()
+                        .any(|s| s.to_string().to_lowercase() == *current);
+                    if !still_valid {
+                        state.rpc_current = None;
+                    }
+                }
+            }
+            let url = rpc::make_rpc_url(act, add, &cfg, &self.state.lock().unwrap())?;
             let host = url.host_str().unwrap_or("unknown").to_string();
 
             // Java: http.keepAlive=false → Connection: close on every request
@@ -47,9 +75,7 @@ impl RpcClient {
             let body = match body {
                 Ok(b) => b,
                 Err(e) => {
-                    let mut new = (**cfg).clone();
-                    new.rpc_last_failed = Some(host.clone());
-                    self.config.store(Arc::new(new));
+                    self.state.lock().unwrap().rpc_last_failed = Some(host.clone());
                     return Err(HathError::Rpc(format!("request failed: {}", e)));
                 }
             };
@@ -64,36 +90,24 @@ impl RpcClient {
             {
                 key_expired_retries += 1;
                 tracing::info!("KEY_EXPIRED received, refreshing server stat and retrying ({}/{})...", key_expired_retries, 2);
-                // Inline server_stat to avoid recursive call()
                 match self.call_stat_inner().await {
                     Ok(stat_resp) if stat_resp.status == ResponseStatus::Ok => {
                         crate::config::Config::apply_server_response(&self.config, &stat_resp);
                     }
                     Ok(stat_resp) => {
-                        // Java: Null response → markRPCServerFailure
                         let fail_host = stat_resp.fail_host.unwrap_or_else(|| "unknown".into());
-                        let mut new = (**cfg).clone();
-                        new.rpc_last_failed = Some(fail_host);
-                        self.config.store(Arc::new(new));
+                        self.state.lock().unwrap().rpc_last_failed = Some(fail_host);
                     }
-                    Err(_) => {} // network error already marked in call_stat_inner
+                    Err(_) => {}
                 }
-                continue; // retry the original request with corrected time
+                continue;
             }
 
             if parsed.status == ResponseStatus::Null {
-                let fail_host = parsed.fail_host.as_deref().unwrap_or(&host);
-                let mut new = (**cfg).clone();
-                new.rpc_last_failed = Some(fail_host.to_string());
-                // Don't clear rpc_current — get_rpc_host() checks last_failed
-                // against cached host and will skip it if it matches.
-                self.config.store(Arc::new(new));
+                let fail_host = parsed.fail_host.as_deref().unwrap_or(&host).to_string();
+                self.state.lock().unwrap().rpc_last_failed = Some(fail_host);
             } else {
-                // Java: persist the selected RPC host so subsequent calls reuse it.
-                // rpcServerCurrent is cached until cleared on failure or periodic reset.
-                let mut new = (**cfg).clone();
-                new.rpc_current = Some(host.clone());
-                self.config.store(Arc::new(new));
+                self.state.lock().unwrap().rpc_current = Some(host.clone());
             }
 
             return Ok(parsed);
@@ -103,7 +117,7 @@ impl RpcClient {
     /// Inline server_stat HTTP call (not recursive through call()).
     async fn call_stat_inner(&self) -> Result<ServerResponse> {
         let cfg = self.config.load();
-        let url = rpc::make_rpc_url(Action::ServerStat, "", &cfg)?;
+        let url = rpc::make_rpc_url(Action::ServerStat, "", &cfg, &self.state.lock().unwrap())?;
         let host = url.host_str().unwrap_or("unknown").to_string();
         let resp = self.http.get(url.clone())
             .header("Connection", "close")
@@ -115,9 +129,7 @@ impl RpcClient {
         let body = match body {
             Ok(b) => b,
             Err(e) => {
-                let mut new = (**cfg).clone();
-                new.rpc_last_failed = Some(host.clone());
-                self.config.store(Arc::new(new));
+                self.state.lock().unwrap().rpc_last_failed = Some(host.clone());
                 return Err(HathError::Rpc(format!("stat request failed: {}", e)));
             }
         };
@@ -220,19 +232,15 @@ pub fn spawn_still_alive_heartbeat(
 
 /// Spawn periodic RPC server failure clearer (4h interval).
 pub fn spawn_rpc_failure_clearer(
-    config: Arc<ArcSwap<Config>>,
+    rpc_client: Arc<RpcClient>,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
     tokio::spawn(crate::utils::tick_every(shutdown, Duration::from_secs(14400), move || {
-        let config = config.clone();
+        let rpc_client = rpc_client.clone();
         async move {
-            let cfg = config.load();
-            if cfg.rpc_last_failed.is_some() {
-                let mut new = (**cfg).clone();
-                new.rpc_last_failed = None;
-                new.rpc_current = None;
-                config.store(Arc::new(new));
-            }
+            let mut state = rpc_client.state.lock().unwrap();
+            state.rpc_last_failed = None;
+            state.rpc_current = None;
         }
     }));
 }

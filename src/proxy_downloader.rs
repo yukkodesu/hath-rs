@@ -47,28 +47,12 @@ impl ProxyFileDownloader {
         sources: &[Url],
         config: &Config,
         cache_handler: Option<Arc<CacheHandler>>,
+        client: &Arc<Client>,
     ) -> Result<Self> {
         let hv_file = HVFile::from_fileid(fileid)
             .ok_or_else(|| HathError::Parse(format!("invalid fileid: {}", fileid)))?;
 
-        // Java: setConnectTimeout(5000), setReadTimeout(30000). 300s total in chunk loop.
-        let mut builder = Client::builder()
-            .user_agent(format!("Hentai@Home {}", crate::rpc::CLIENT_VERSION))
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .read_timeout(std::time::Duration::from_secs(30));
-
-        // Java: proxy support via Settings.getImageProxy()
-        if let (Some(proxy_type), Some(proxy_host), Some(proxy_port)) =
-            (&config.image_proxy_type, &config.image_proxy_host, config.image_proxy_port)
-        {
-            if let Ok(proxy_url) = build_proxy_url(proxy_type, proxy_host, proxy_port)
-                && let Ok(proxy) = reqwest::Proxy::all(proxy_url.as_str()) {
-                builder = builder.proxy(proxy);
-            }
-        }
-
-        let client = builder.build()
-            .map_err(|e| HathError::Network(e.to_string()))?;
+        let client = Arc::clone(client);
 
         let mut last_err = None;
 
@@ -169,27 +153,29 @@ impl ProxyFileDownloader {
         let body_done_notify = Arc::new(Notify::new());
         let download_done = Arc::new(AtomicBool::new(false));
 
+        // Build the return value first, then move the Arcs into the spawn task
+        // directly — avoids a second round of clone() for each field.
         let this = Self {
             content_length: hv_file.size as usize,
             content_type: hv_file.mime_type().to_string(),
-            temp_file: temp_file.clone(),
-            write_offset: write_offset.clone(),
+            temp_file,
+            write_offset,
             total_size: content_length,
-            notify: notify.clone(),
-            body_done_notify: body_done_notify.clone(),
-            download_done: download_done.clone(),
+            notify,
+            body_done_notify,
+            download_done,
         };
 
         // Spawn download task with inner retry matching Java's
         // do { ... } while(!streamThreadSuccess && --trycounter > 0)
-        let wo = write_offset.clone();
-        let tf = temp_file.clone();
-        let not = notify.clone();
-        let bdn = body_done_notify.clone();
-        let dd = download_done.clone();
+        let wo = this.write_offset.clone();
+        let tf = this.temp_file.clone();
+        let not = this.notify.clone();
+        let bdn = this.body_done_notify.clone();
+        let dd = this.download_done.clone();
         let hash = hv_file.hash.clone();
         let expected_size = hv_file.size as u64;
-        let fileid_owned = hv_file.fileid();
+        let fileid_owned = hv_file.fileid().clone();
         let cache_dir = config.cache_dir.clone();
         let retry_source = source.clone();
         let retry_client = client.clone();
@@ -359,7 +345,28 @@ impl ProxyFileDownloader {
 
 }
 
-fn build_proxy_url(proxy_type: &str, proxy_host: &str, proxy_port: u16) -> Result<Url> {
+/// Build the shared reqwest::Client used for all proxy file downloads.
+/// Applies image proxy settings from config if configured.
+pub fn build_proxy_client(config: &Config) -> Result<Arc<Client>> {
+    let mut builder = Client::builder()
+        .user_agent(format!("Hentai@Home {}", crate::rpc::CLIENT_VERSION))
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .read_timeout(std::time::Duration::from_secs(30));
+    if let (Some(proxy_type), Some(proxy_host), Some(proxy_port)) =
+        (&config.image_proxy_type, &config.image_proxy_host, config.image_proxy_port)
+    {
+        if let Ok(proxy_url) = build_proxy_url(proxy_type, proxy_host, proxy_port)
+            && let Ok(proxy) = reqwest::Proxy::all(proxy_url.as_str())
+        {
+            builder = builder.proxy(proxy);
+        }
+    }
+    builder.build()
+        .map(Arc::new)
+        .map_err(|e| HathError::Network(e.to_string()))
+}
+
+pub fn build_proxy_url(proxy_type: &str, proxy_host: &str, proxy_port: u16) -> Result<Url> {
     let mut url = match proxy_type {
         "socks" => Url::parse("socks://hath.invalid/"),
         "http" => Url::parse("http://hath.invalid/"),

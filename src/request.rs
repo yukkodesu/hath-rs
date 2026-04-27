@@ -1,7 +1,6 @@
 use crate::config::Config;
-use crate::utils::{self, parse_additional};
+use crate::utils::{self, parse_additional, Additional};
 use crate::hvfile::HVFile;
-use std::collections::HashMap;
 use std::net::IpAddr;
 
 #[derive(Debug)]
@@ -9,7 +8,7 @@ pub enum RequestType {
     FileServe {
         fileid: String,
         hv_file: Option<HVFile>,
-        additional: HashMap<String, String>,
+        additional: Additional,
         keystamp_valid: bool,
         /// HEAD requests: skip body construction (file read / proxy download).
         head_only: bool,
@@ -35,15 +34,12 @@ pub enum RequestType {
     BadRequest,
     MethodNotAllowed,
 }
-pub fn parse_request(request_line: &str, client_ip: IpAddr, config: &Config) -> RequestType {
-    let parts: Vec<&str> = request_line.trim().split(' ').collect();
-    if parts.len() != 3 { return RequestType::NotFound; }
-
-    let (method, uri, _ver) = (parts[0], parts[1], parts[2]);
-
+pub fn parse_request(method: &str, path_and_query: &str, client_ip: IpAddr, config: &Config) -> RequestType {
     if !matches!(method.to_uppercase().as_str(), "GET" | "HEAD") {
         return RequestType::MethodNotAllowed;
     }
+
+    let uri = path_and_query;
 
     // Strip absolute URI prefix (section 5.1.2 RFC 2616)
     let uri = if let Some(rest) = uri.strip_prefix("http://") {
@@ -82,7 +78,7 @@ fn parse_file_serve(url_parts: &[&str], config: &Config, head_only: bool) -> Req
     let fileid = url_parts[2].to_string();
     let hv_file = HVFile::from_fileid(&fileid);
     let additional = parse_additional(url_parts[3]);
-    let keystamp_valid = validate_keystamp(&fileid, additional.get("keystamp").map(|s| s.as_str()), config);
+    let keystamp_valid = validate_keystamp(&fileid, additional.keystamp.as_deref(), config);
 
     RequestType::FileServe { fileid, hv_file, additional, keystamp_valid, head_only }
 }
@@ -172,13 +168,13 @@ mod tests {
     #[test]
     fn test_favicon() {
         let c = test_config();
-        assert!(matches!(parse_request("GET /favicon.ico HTTP/1.1", "127.0.0.1".parse().unwrap(), &c), RequestType::Favicon));
+        assert!(matches!(parse_request("GET", "/favicon.ico", "127.0.0.1".parse().unwrap(), &c), RequestType::Favicon));
     }
 
     #[test]
     fn test_robots() {
         let c = test_config();
-        assert!(matches!(parse_request("GET /robots.txt HTTP/1.1", "127.0.0.1".parse().unwrap(), &c), RequestType::Robots));
+        assert!(matches!(parse_request("GET", "/robots.txt", "127.0.0.1".parse().unwrap(), &c), RequestType::Robots));
     }
 
     #[test]

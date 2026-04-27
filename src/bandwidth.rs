@@ -1,4 +1,4 @@
-use tokio::sync::Mutex;
+use std::sync::Mutex;
 use std::time::Duration;
 
 const TIME_RESOLUTION: usize = 50;
@@ -32,12 +32,11 @@ impl BandwidthMonitor {
     }
 
     /// Wait until there is enough quota for `byte_count` bytes.
-    /// Uses tokio::sync::Mutex (async-safe).
     pub async fn wait_for_quota(&self, byte_count: usize) {
         let byte_count = byte_count as u32;
         loop {
             let release = {
-                let mut inner = self.inner.lock().await;
+                let mut inner = self.inner.lock().unwrap();
                 let now_millis = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
