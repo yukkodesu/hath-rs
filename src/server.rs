@@ -606,8 +606,10 @@ async fn build_tls_acceptor(config: &Config, force_download: bool) -> Result<(Ss
     }
 
     // Compute cert expiry as a Unix timestamp for periodic checks.
+    // ASN1_TIME_diff(from, to) returns to-from, so now.diff(not_after) gives
+    // the remaining seconds until expiry (positive while cert is still valid).
     let now_asn1 = Asn1Time::days_from_now(0)?;
-    let diff = not_after.diff(&now_asn1)?;
+    let diff = now_asn1.diff(not_after)?;
     let now_unix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
     let cert_expiry_unix = now_unix + diff.days as i64 * 86400 + diff.secs as i64;
 
