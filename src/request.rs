@@ -35,15 +35,12 @@ pub enum RequestType {
     BadRequest,
     MethodNotAllowed,
 }
-pub fn parse_request(request_line: &str, client_ip: IpAddr, config: &Config) -> RequestType {
-    let parts: Vec<&str> = request_line.trim().split(' ').collect();
-    if parts.len() != 3 { return RequestType::NotFound; }
-
-    let (method, uri, _ver) = (parts[0], parts[1], parts[2]);
-
+pub fn parse_request(method: &str, path_and_query: &str, client_ip: IpAddr, config: &Config) -> RequestType {
     if !matches!(method.to_uppercase().as_str(), "GET" | "HEAD") {
         return RequestType::MethodNotAllowed;
     }
+
+    let uri = path_and_query;
 
     // Strip absolute URI prefix (section 5.1.2 RFC 2616)
     let uri = if let Some(rest) = uri.strip_prefix("http://") {
@@ -172,13 +169,13 @@ mod tests {
     #[test]
     fn test_favicon() {
         let c = test_config();
-        assert!(matches!(parse_request("GET /favicon.ico HTTP/1.1", "127.0.0.1".parse().unwrap(), &c), RequestType::Favicon));
+        assert!(matches!(parse_request("GET", "/favicon.ico", "127.0.0.1".parse().unwrap(), &c), RequestType::Favicon));
     }
 
     #[test]
     fn test_robots() {
         let c = test_config();
-        assert!(matches!(parse_request("GET /robots.txt HTTP/1.1", "127.0.0.1".parse().unwrap(), &c), RequestType::Robots));
+        assert!(matches!(parse_request("GET", "/robots.txt", "127.0.0.1".parse().unwrap(), &c), RequestType::Robots));
     }
 
     #[test]

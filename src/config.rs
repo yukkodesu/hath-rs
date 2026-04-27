@@ -284,7 +284,13 @@ impl Config {
                 }
             }
             "rpc_path" => self.rpc_path = value.to_string(),
-            "host" => self.client_host = value.to_string(),
+            "host" => {
+                // Normalize IPv4-mapped IPv6 (::ffff:x.x.x.x) to plain IPv4
+                // so per-connection comparisons don't need String::replace.
+                self.client_host = value.parse::<IpAddr>()
+                    .map(|ip| crate::utils::normalize_ip(ip).to_string())
+                    .unwrap_or_else(|_| value.to_string());
+            }
             "port" => { if self.client_port == 0 { self.client_port = value.parse().unwrap_or(0); } }
             "throttle_bytes" => self.throttle_bytes = value.parse().unwrap_or(0),
             "disklimit_bytes" => {
@@ -419,10 +425,11 @@ mod tests {
     }
 
     #[test]
-    fn test_get_rpc_host_keeps_ipv6_raw() {
+    fn test_get_rpc_host_normalizes_ipv4_mapped() {
         let mut config = Config::load(test_cli()).unwrap();
+        // ::ffff:192.0.2.1 is IPv4-mapped IPv6 — normalize_ip strips the prefix
         config.apply_setting("rpc_server_ip", "::ffff:192.0.2.1");
 
-        assert_eq!(config.get_rpc_host(), "::ffff:192.0.2.1");
+        assert_eq!(config.get_rpc_host(), "192.0.2.1");
     }
 }

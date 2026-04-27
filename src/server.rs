@@ -152,7 +152,7 @@ impl Service<Request<Incoming>> for HathService {
             // Determine if this is a local/RPC connection (skip bandwidth throttling)
             let host_addr = client_ip.to_string().to_lowercase();
             let is_local = LOCAL_NETWORK_RE.is_match(&host_addr)
-                || config.client_host.replace("::ffff:", "") == host_addr;
+                || config.client_host == host_addr;
             let is_rpc = config.rpc_servers.iter().any(|s| s.to_string().to_lowercase() == host_addr);
 
             // Determine bandwidth monitor for this request.
@@ -161,18 +161,15 @@ impl Service<Request<Incoming>> for HathService {
             let bwm_for_request = if is_local {
                 None
             } else {
-                state.bandwidth_monitor.load_full().clone()
+                state.bandwidth_monitor.load_full()
             };
 
-            // Build request line for parsing
-            let request_line = format!(
-                "{} {} {:?}",
-                req.method(),
+            let request_type = request::parse_request(
+                req.method().as_str(),
                 req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/"),
-                req.version()
+                client_ip,
+                &config,
             );
-
-            let request_type = request::parse_request(&request_line, client_ip, &config);
 
             // Clone BWM for later header throttling (bwm_for_request is consumed by response builders)
             let bwm_for_header = bwm_for_request.clone();
@@ -998,7 +995,7 @@ pub async fn start_server(
                     // --- Post-handshake policy checks (Java: HTTPServer.run() order) ---
                     let cfg = conn_state.config.load();
                     let is_local = LOCAL_NETWORK_RE.is_match(&host_addr)
-                        || cfg.client_host.replace("::ffff:", "") == host_addr;
+                        || cfg.client_host == host_addr;
                     // Java: isValidRPCServer returns true when disableIPOriginCheck is set
                     let is_rpc = cfg.disable_ip_origin_check
                         || cfg.rpc_servers.iter().any(|s| s.to_string().to_lowercase() == host_addr);
