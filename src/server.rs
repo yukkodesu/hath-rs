@@ -249,16 +249,26 @@ impl Service<Request<Incoming>> for HathService {
                                                     proxy.body_done_notify.notify_one();
                                                     response::head_response(mime, proxy.total_size as usize)
                                                 } else {
-                                                    response::proxy_response(
+                                                    let total_size = proxy.total_size as usize;
+                                                    let response = response::proxy_response(
                                                         mime,
-                                                        proxy.total_size as usize,
+                                                        total_size,
                                                         proxy.temp_file,
                                                         proxy.write_offset,
                                                         proxy.notify,
                                                         proxy.body_done_notify,
                                                         proxy.download_done,
                                                         bwm_for_request,
-                                                    )
+                                                    );
+                                                    if response.is_ok() {
+                                                        tracing::info!(
+                                                            "Proxy download: returning body for {} ({} bytes, {})",
+                                                            fileid,
+                                                            total_size,
+                                                            mime
+                                                        );
+                                                    }
+                                                    response
                                                 }
                                             }
                                             Err(e) => {
