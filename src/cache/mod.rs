@@ -395,14 +395,15 @@ impl CacheHandler {
             )));
         }
 
-        let actual_hash = utils::sha1_file(file).map_err(|e| {
+        let data = fs::read(file).map_err(|e| {
             HathError::Cache(format!(
-                "Failed to hash file {}: {}",
+                "Failed to read file {}: {}",
                 file.display(),
                 e
             ))
         })?;
 
+        let actual_hash = utils::sha1_bytes(&data);
         if actual_hash != expected_hash {
             return Err(HathError::Cache(format!(
                 "Incorrect file hash while reading {} (expected {}, got {})",
@@ -411,14 +412,6 @@ impl CacheHandler {
                 actual_hash
             )));
         }
-
-        let data = fs::read(file).map_err(|e| {
-            HathError::Cache(format!(
-                "Failed to read file {}: {}",
-                file.display(),
-                e
-            ))
-        })?;
 
         bincode::deserialize(&data).map_err(|e| {
             HathError::Cache(format!(
@@ -447,32 +440,31 @@ impl CacheHandler {
         let info_path = cfg.data_dir.join("pcache_info");
 
         let result: std::result::Result<(), String> = (|| {
-            // 1. Serialize and write pcache_ages
-            {
+            // 1. Serialize under lock, drop lock, write to disk, hash from buffer.
+            let ages_data = {
                 let ages = self.static_range_oldest.lock().unwrap();
-                let ages_data = bincode::serialize(&*ages)
-                    .map_err(|e| format!("Failed to serialize ages: {}", e))?;
-                fs::write(&ages_path, &ages_data)
-                    .map_err(|e| format!("Failed to write ages: {}", e))?;
-            }
-            let ages_hash = utils::sha1_file(&ages_path)
-                .map_err(|e| format!("Failed to hash ages: {}", e))?;
+                bincode::serialize(&*ages)
+                    .map_err(|e| format!("Failed to serialize ages: {}", e))?
+            };
+            fs::write(&ages_path, &ages_data)
+                .map_err(|e| format!("Failed to write ages: {}", e))?;
+            let ages_hash = utils::sha1_bytes(&ages_data);
 
-            // 2. Serialize and write pcache_lru
-            {
+            // 2. Capture lru_clear_pointer in the same lock scope (avoids a
+            //    third redundant acquisition), serialize, then write and hash.
+            let (lru_data, lru_clear_pointer) = {
                 let lru = self.lru.lock().unwrap();
-                let lru_data = bincode::serialize(&lru.lru_cache_table[..])
+                let data = bincode::serialize(&lru.lru_cache_table[..])
                     .map_err(|e| format!("Failed to serialize lru: {}", e))?;
-                fs::write(&lru_path, &lru_data)
-                    .map_err(|e| format!("Failed to write lru: {}", e))?;
-            }
-            let lru_hash = utils::sha1_file(&lru_path)
-                .map_err(|e| format!("Failed to hash lru: {}", e))?;
+                (data, lru.lru_clear_pointer)
+            };
+            fs::write(&lru_path, &lru_data)
+                .map_err(|e| format!("Failed to write lru: {}", e))?;
+            let lru_hash = utils::sha1_bytes(&lru_data);
 
             // 3. Write pcache_info (plain text key=value)
             let cache_count = self.cache_count.load(Ordering::Relaxed);
             let cache_size = self.cache_size.load(Ordering::Relaxed);
-            let lru_clear_pointer = self.lru.lock().unwrap().lru_clear_pointer;
 
             let info = format!(
                 "cacheCount={}\ncacheSize={}\nlruClearPointer={}\nagesHash={}\nlruHash={}",

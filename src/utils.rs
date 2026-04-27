@@ -28,14 +28,22 @@ pub fn sha1_string(input: &str) -> String {
 /// Compute SHA-1 hex digest of a file.
 pub fn sha1_file(path: &Path) -> io::Result<String> {
     let data = fs::read(path)?;
+    Ok(sha1_bytes(&data))
+}
+
+/// Compute SHA-1 hex digest of a byte slice (zero-copy, no intermediate allocation).
+pub fn sha1_bytes(data: &[u8]) -> String {
     let mut hasher = Sha1::new();
-    hasher.update(&data);
-    Ok(hex_encode(&hasher.finalize()))
+    hasher.update(data);
+    hex_encode(&hasher.finalize())
 }
 
 /// Convert bytes to lowercase hex string.
 pub fn hex_encode(data: &[u8]) -> String {
-    data.iter().map(|b| format!("{:02x}", b)).collect()
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(data.len() * 2);
+    for b in data { write!(out, "{:02x}", b).unwrap(); }
+    out
 }
 
 /// Parse key=value pairs separated by semicolons into a HashMap.
