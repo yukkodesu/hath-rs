@@ -1,4 +1,5 @@
 use sha1::{Sha1, Digest};
+use std::net::IpAddr;
 use std::path::Path;
 use std::collections::HashMap;
 use std::fs;
@@ -6,6 +7,16 @@ use std::io;
 use std::time::UNIX_EPOCH;
 use std::time::Duration;
 use tracing;
+
+/// Normalize an IP address for comparison: maps IPv4-mapped IPv6 addresses
+/// (e.g. `::ffff:1.2.3.4`) to plain IPv4. Needed when the server listens on
+/// `[::]` (dual-stack) and receives IPv4 connections as mapped addresses.
+pub fn normalize_ip(addr: IpAddr) -> IpAddr {
+    match addr {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6)),
+        v4 => v4,
+    }
+}
 
 /// Compute SHA-1 hex digest of a string.
 pub fn sha1_string(input: &str) -> String {

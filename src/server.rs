@@ -22,7 +22,7 @@ use hyper::header;
 use openssl::asn1::Asn1Time;
 use openssl::pkcs12::Pkcs12;
 use openssl::provider::Provider;
-use openssl::ssl::{SslContext, SslMethod};
+use openssl::ssl::{SslAcceptor, SslContext, SslMethod, SslMode, SslOptions};
 use reqwest::Url;
 use std::collections::HashMap;
 use std::future::Future;
@@ -140,9 +140,11 @@ impl Service<Request<Incoming>> for HathService {
         let remote_addr = self.remote_addr;
 
         Box::pin(async move {
-            let client_ip = remote_addr.ip();
             // Load config once for this request (owned Arc, safe across .await)
             let config = state.config.load_full();
+
+            // Normalize IPv4-mapped IPv6 to plain IPv4 (dual-stack listener).
+            let client_ip = utils::normalize_ip(remote_addr.ip());
 
             // Determine if this is a local/RPC connection (skip bandwidth throttling)
             let host_addr = client_ip.to_string().to_lowercase();
@@ -609,20 +611,37 @@ async fn build_tls_acceptor(config: &Config, force_download: bool) -> Result<(Ss
     let now_unix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
     let cert_expiry_unix = now_unix + diff.days as i64 * 86400 + diff.secs as i64;
 
-    // Build OpenSSL SslContext with minimal configuration (matching Java's
-    // SSLContext.init() which uses JVM defaults without cipher restrictions).
-    let mut ctx_builder = SslContext::builder(SslMethod::tls())
-        .map_err(|e| HathError::Tls(format!("Failed to create SslContextBuilder: {}", e)))?;
+    // Build OpenSSL SslContext for server-side TLS.
+    // Use SslAcceptor as base to get proper server defaults (AUTO_RETRY, bug
+    // workarounds via SslOptions::ALL, DH params, etc.) that a raw
+    // SslContext::builder does not set. This matches how Java's SSLContext
+    // initialises its server socket with JVM-managed defaults.
+    let mut ctx_builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls_server())
+        .map_err(|e| HathError::Tls(format!("Failed to create SslAcceptorBuilder: {}", e)))?;
+
     // Match Java: setEnabledProtocols("TLSv1.3", "TLSv1.2")
     ctx_builder
         .set_min_proto_version(Some(openssl::ssl::SslVersion::TLS1_2))
         .map_err(|e| HathError::Tls(format!("Failed to set min protocol: {}", e)))?;
+
+    // Ensure AUTO_RETRY and write-buffer modes are set (included in mozilla_intermediate_v5
+    // via the internal ctx() helper, but set explicitly for clarity).
+    ctx_builder.set_mode(
+        SslMode::AUTO_RETRY | SslMode::ACCEPT_MOVING_WRITE_BUFFER | SslMode::ENABLE_PARTIAL_WRITE,
+    );
+
+    // Additional compatibility options on top of SslOptions::ALL already set by the builder.
+    ctx_builder.set_options(SslOptions::NO_SSLV2 | SslOptions::NO_SSLV3);
+
+    ctx_builder
+        .set_certificate(cert)
+        .map_err(|e| HathError::Tls(format!("Failed to set certificate: {}", e)))?;
     ctx_builder
         .set_private_key(key)
         .map_err(|e| HathError::Tls(format!("Failed to set private key: {}", e)))?;
     ctx_builder
-        .set_certificate(cert)
-        .map_err(|e| HathError::Tls(format!("Failed to set certificate: {}", e)))?;
+        .check_private_key()
+        .map_err(|e| HathError::Tls(format!("Certificate/key mismatch: {}", e)))?;
     if let Some(chain) = pkcs12.ca {
         for ca in chain {
             ctx_builder
@@ -630,7 +649,7 @@ async fn build_tls_acceptor(config: &Config, force_download: bool) -> Result<(Ss
                 .map_err(|e| HathError::Tls(format!("Failed to add chain cert: {}", e)))?;
         }
     }
-    let ctx = ctx_builder.build();
+    let ctx = ctx_builder.build().into_context();
     Ok((ctx, cert_expiry_unix))
 }
 
@@ -901,9 +920,17 @@ pub async fn start_server(
     state.tls_acceptor.store(Some(Arc::new(tls_acceptor)));
     *state.cert_expiry.lock().await = Some(cert_expiry);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], config.client_port));
     let port = config.client_port;
-    let listener = TcpListener::bind(addr).await.map_err(HathError::Io)?;
+    // Bind to [::] (IPv6 dual-stack) which also accepts IPv4 on Linux/macOS.
+    // Falls back to 0.0.0.0 (IPv4-only) if the OS doesn't support dual-stack.
+    let addr_v6 = SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port));
+    let listener = match TcpListener::bind(addr_v6).await {
+        Ok(l) => l,
+        Err(_) => {
+            let addr_v4 = SocketAddr::from(([0, 0, 0, 0], port));
+            TcpListener::bind(addr_v4).await.map_err(HathError::Io)?
+        }
+    };
 
     if let Some(tx) = ready_tx {
         let _ = tx.send(Ok(port));
@@ -930,8 +957,10 @@ pub async fn start_server(
                 // Load config for flood control / connection checks
                 let cfg = state.config.load();
 
-                // Flood control check for non-local, non-RPC traffic
-                let host_addr = remote_addr.ip().to_string().to_lowercase();
+                // Flood control check for non-local, non-RPC traffic.
+                // Normalize IPv4-mapped IPv6 (::ffff:a.b.c.d) to plain IPv4 so
+                // comparisons work correctly when listening on [::] dual-stack.
+                let host_addr = utils::normalize_ip(remote_addr.ip()).to_string().to_lowercase();
                 let is_local = LOCAL_NETWORK_RE.is_match(&host_addr)
                     || cfg.client_host.replace("::ffff:", "") == host_addr;
                 // Java: isValidRPCServer returns true when disableIPOriginCheck is set
@@ -1007,19 +1036,26 @@ pub async fn start_server(
                     let ssl = match openssl::ssl::Ssl::new(ssl_context.as_ref()) {
                         Ok(s) => s,
                         Err(e) => {
-                            tracing::error!("SSL Ssl::new failed: {:?}", e);
+                            tracing::error!("SSL Ssl::new failed from {}: {:?}", remote_addr, e);
                             return;
                         }
                     };
                     let mut tls_stream = match tokio_openssl::SslStream::new(ssl, stream) {
                         Ok(s) => s,
                         Err(e) => {
-                            tracing::error!("SslStream::new failed: {:?}", e);
+                            tracing::error!("SslStream::new failed from {}: {:?}", remote_addr, e);
                             return;
                         }
                     };
                     if let Err(e) = Pin::new(&mut tls_stream).accept().await {
-                        tracing::error!("TLS accept failed: {:?}", e);
+                        // Log at debug level for routine client disconnects (e.g. port scanners),
+                        // but at warn level so TLS handshake failures are visible in default logs.
+                        let msg = e.to_string();
+                        if msg.contains("connection reset") || msg.contains("unexpected EOF") {
+                            tracing::debug!("TLS accept from {} closed early: {}", remote_addr, e);
+                        } else {
+                            tracing::warn!("TLS accept failed from {}: {:?}", remote_addr, e);
+                        }
                         return;
                     }
 
