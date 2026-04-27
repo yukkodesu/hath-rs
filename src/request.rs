@@ -1,7 +1,6 @@
 use crate::config::Config;
-use crate::utils::{self, parse_additional};
+use crate::utils::{self, parse_additional, Additional};
 use crate::hvfile::HVFile;
-use std::collections::HashMap;
 use std::net::IpAddr;
 
 #[derive(Debug)]
@@ -9,7 +8,7 @@ pub enum RequestType {
     FileServe {
         fileid: String,
         hv_file: Option<HVFile>,
-        additional: HashMap<String, String>,
+        additional: Additional,
         keystamp_valid: bool,
         /// HEAD requests: skip body construction (file read / proxy download).
         head_only: bool,
@@ -79,7 +78,7 @@ fn parse_file_serve(url_parts: &[&str], config: &Config, head_only: bool) -> Req
     let fileid = url_parts[2].to_string();
     let hv_file = HVFile::from_fileid(&fileid);
     let additional = parse_additional(url_parts[3]);
-    let keystamp_valid = validate_keystamp(&fileid, additional.get("keystamp").map(|s| s.as_str()), config);
+    let keystamp_valid = validate_keystamp(&fileid, additional.keystamp.as_deref(), config);
 
     RequestType::FileServe { fileid, hv_file, additional, keystamp_valid, head_only }
 }

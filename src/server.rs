@@ -182,10 +182,10 @@ impl Service<Request<Incoming>> for HathService {
                     // Java validates fileindex/xres BEFORE cache hit check
                     // (line 194 in HTTPResponse.processRequest). Even a cached
                     // file with missing/invalid arguments returns 404.
-                    let fileindex = additional.get("fileindex");
-                    let xres = additional.get("xres");
-                    let fileindex_valid = fileindex.is_some_and(|v| v.parse::<u32>().is_ok());
-                    let xres_valid = xres.is_some_and(|v| v == "org" || v.parse::<u32>().is_ok());
+                    let fileindex_valid = additional.fileindex.as_deref()
+                        .is_some_and(|v| v.parse::<u32>().is_ok());
+                    let xres_valid = additional.xres.as_deref()
+                        .is_some_and(|v| v == "org" || v.parse::<u32>().is_ok());
 
                     if !keystamp_valid {
                         response::forbidden_response()
@@ -193,8 +193,8 @@ impl Service<Request<Incoming>> for HathService {
                         response::not_found_response()
                     } else {
                         let hv = hv_file.as_ref().unwrap();
-                        let fileindex = fileindex.unwrap();
-                        let xres = xres.unwrap();
+                        let fileindex = additional.fileindex.as_deref().unwrap();
+                        let xres = additional.xres.as_deref().unwrap();
                         let cache_path = hv.cache_path(&config.cache_dir);
                         let cache_hit = cache_path.exists()
                             && cache_path.metadata()
@@ -361,24 +361,24 @@ impl Service<Request<Incoming>> for HathService {
     }
 }
 
-/// Helper for `threaded_proxy_test`: extract required params from add_table,
+/// Helper for `threaded_proxy_test`: extract required params from Additional,
 /// returning `INVALID_COMMAND` on missing/illegal values (matching Java's
 /// NumberFormatException → catch → INVALID_COMMAND flow).
 macro_rules! required_param {
-    ($table:expr, $key:expr) => {
-        match $table.get($key) {
+    ($add:expr, $field:ident) => {
+        match $add.$field.as_deref() {
             Some(v) => v,
             None => return response::text_response(hyper::StatusCode::OK, "INVALID_COMMAND"),
         }
     };
-    ($table:expr, $key:expr, $T:ty) => {
-        match $table.get($key).and_then(|v| v.parse::<$T>().ok()) {
+    ($add:expr, $field:ident, $T:ty) => {
+        match $add.$field.as_deref().and_then(|v| v.parse::<$T>().ok()) {
             Some(v) => v,
             None => return response::text_response(hyper::StatusCode::OK, "INVALID_COMMAND"),
         }
     };
-    ($table:expr, $key:expr, $T:ty, default $default:expr) => {
-        match $table.get($key) {
+    ($add:expr, $field:ident, $T:ty, default $default:expr) => {
+        match $add.$field.as_deref() {
             Some(v) => match v.parse::<$T>() {
                 Ok(n) => n,
                 Err(_) => return response::text_response(hyper::StatusCode::OK, "INVALID_COMMAND"),
@@ -402,15 +402,14 @@ async fn handle_server_command(
         "threaded_proxy_test" => {
             // Java: Integer.parseInt on missing/illegal params throws NFE,
             // caught by processRemoteAPICommand → returns "INVALID_COMMAND".
-            let add_table = utils::parse_additional(additional);
-            let hostname = required_param!(add_table, "hostname");
-            let protocol = required_param!(add_table, "protocol");
-            let port: u16 = required_param!(add_table, "port", u16);
-            let testsize: u64 = required_param!(add_table, "testsize", u64);
-            let testcount: u32 = required_param!(add_table, "testcount", u32);
-            let testtime: u32 = required_param!(add_table, "testtime", u32);
-            let testkey = add_table.get("testkey")
-                .map(|s| s.as_str()).unwrap_or("");
+            let add = utils::parse_additional(additional);
+            let hostname = required_param!(add, hostname);
+            let protocol = required_param!(add, protocol);
+            let port: u16 = required_param!(add, port, u16);
+            let testsize: u64 = required_param!(add, testsize, u64);
+            let testcount: u32 = required_param!(add, testcount, u32);
+            let testtime: u32 = required_param!(add, testtime, u32);
+            let testkey = add.testkey.as_deref().unwrap_or("");
 
             tracing::debug!(
                 "Running speedtest against hostname={} protocol={} port={} testsize={} testcount={} testtime={} testkey={}",
@@ -431,8 +430,8 @@ async fn handle_server_command(
         "speed_test" => {
             // Java: additional is parsed as key=value pairs via Tools.parseAdditional();
             // testsize is read from addTable with default 1_000_000. No upper limit.
-            let add_table = utils::parse_additional(additional);
-            let testsize: usize = required_param!(add_table, "testsize", usize, default 1_000_000);
+            let add = utils::parse_additional(additional);
+            let testsize: usize = required_param!(add, testsize, usize, default 1_000_000);
             response::speedtest_response(testsize, bwm)
         }
         "refresh_settings" => {
