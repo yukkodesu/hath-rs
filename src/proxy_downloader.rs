@@ -173,7 +173,7 @@ impl ProxyFileDownloader {
         let dd = download_done.clone();
         let hash = hv_file.hash.clone();
         let expected_size = hv_file.size as u64;
-        let fileid_owned = hv_file.fileid();
+        let fileid_owned = hv_file.fileid().clone();
         let cache_dir = config.cache_dir.clone();
         let retry_source = source.clone();
         let retry_client = client.clone();
