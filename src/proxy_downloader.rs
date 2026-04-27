@@ -153,24 +153,26 @@ impl ProxyFileDownloader {
         let body_done_notify = Arc::new(Notify::new());
         let download_done = Arc::new(AtomicBool::new(false));
 
+        // Build the return value first, then move the Arcs into the spawn task
+        // directly — avoids a second round of clone() for each field.
         let this = Self {
             content_length: hv_file.size as usize,
             content_type: hv_file.mime_type().to_string(),
-            temp_file: temp_file.clone(),
-            write_offset: write_offset.clone(),
+            temp_file,
+            write_offset,
             total_size: content_length,
-            notify: notify.clone(),
-            body_done_notify: body_done_notify.clone(),
-            download_done: download_done.clone(),
+            notify,
+            body_done_notify,
+            download_done,
         };
 
         // Spawn download task with inner retry matching Java's
         // do { ... } while(!streamThreadSuccess && --trycounter > 0)
-        let wo = write_offset.clone();
-        let tf = temp_file.clone();
-        let not = notify.clone();
-        let bdn = body_done_notify.clone();
-        let dd = download_done.clone();
+        let wo = this.write_offset.clone();
+        let tf = this.temp_file.clone();
+        let not = this.notify.clone();
+        let bdn = this.body_done_notify.clone();
+        let dd = this.download_done.clone();
         let hash = hv_file.hash.clone();
         let expected_size = hv_file.size as u64;
         let fileid_owned = hv_file.fileid().clone();

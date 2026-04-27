@@ -220,8 +220,9 @@ impl Config {
             }
             // Pick a random server and random scan direction, avoiding last failed.
             // Java: rpcServerSelector = random index, scanDirection = Math.random() < 0.5 ? -1 : 1
-            let mut idx: isize = (rand::rng().next_u32() as usize % self.rpc_servers.len()) as isize;
-            let dir: isize = if rand::rng().next_u32() & 1 == 0 { -1 } else { 1 };
+            let mut rng = rand::rng();
+            let mut idx: isize = (rng.next_u32() as usize % self.rpc_servers.len()) as isize;
+            let dir: isize = if rng.next_u32() & 1 == 0 { -1 } else { 1 };
             let len = self.rpc_servers.len() as isize;
             loop {
                 let candidate = self.rpc_servers[((len + idx) % len) as usize].to_string().to_lowercase();
