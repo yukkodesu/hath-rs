@@ -968,6 +968,10 @@ pub async fn start_server(
                     || cfg.rpc_servers.iter().any(|s| s.to_string().to_lowercase() == host_addr);
 
                 if !allow && !is_rpc {
+                    tracing::debug!(
+                        "Rejecting connection from {} during startup (allow={} is_rpc={} rpc_servers={:?})",
+                        host_addr, allow, is_rpc, cfg.rpc_servers
+                    );
                     drop(stream);
                     continue;
                 }
