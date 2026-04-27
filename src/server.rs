@@ -952,79 +952,6 @@ pub async fn start_server(
                 };
 
                 let state = state.clone();
-                let allow = state.allow_normal_connections.load(Ordering::Relaxed);
-
-                // Load config for flood control / connection checks
-                let cfg = state.config.load();
-
-                // Flood control check for non-local, non-RPC traffic.
-                // Normalize IPv4-mapped IPv6 (::ffff:a.b.c.d) to plain IPv4 so
-                // comparisons work correctly when listening on [::] dual-stack.
-                let host_addr = utils::normalize_ip(remote_addr.ip()).to_string().to_lowercase();
-                let is_local = LOCAL_NETWORK_RE.is_match(&host_addr)
-                    || cfg.client_host.replace("::ffff:", "") == host_addr;
-                // Java: isValidRPCServer returns true when disableIPOriginCheck is set
-                let is_rpc = cfg.disable_ip_origin_check
-                    || cfg.rpc_servers.iter().any(|s| s.to_string().to_lowercase() == host_addr);
-
-                if !allow && !is_rpc {
-                    tracing::debug!(
-                        "Rejecting connection from {} during startup (allow={} is_rpc={} rpc_servers={:?})",
-                        host_addr, allow, is_rpc, cfg.rpc_servers
-                    );
-                    drop(stream);
-                    continue;
-                }
-
-                if !is_local && !is_rpc && !cfg.disable_flood_control {
-                    drop(cfg); // release Guard before .await
-                    let mut fc = state.flood_control.lock().await;
-                    let entry = fc.entry(host_addr.clone()).or_insert_with(|| FloodControlEntry {
-                        connect_count: 0,
-                        last_connect: Instant::now(),
-                        block_until: None,
-                    });
-                    if entry.is_blocked() || !entry.hit() {
-                        tracing::warn!("Flood control activated for {}", host_addr);
-                        continue;
-                    }
-                }
-
-                // Connection limiting for non-local, non-RPC traffic
-                // Java: HTTPServer.run() checks sessionCount vs maxConnections
-                if !is_local && !is_rpc {
-                    let max_conns = state.config.load().max_connections();
-                    let active = state.active_connections.load(Ordering::Relaxed);
-
-                    if active > max_conns {
-                        tracing::warn!(
-                            "Exceeded the maximum allowed number of incoming connections ({}).",
-                            max_conns
-                        );
-                        drop(stream);
-                        continue;
-                    }
-
-                    if active > (max_conns as f64 * 0.8) as u32 && active > 0 {
-                        tracing::warn!(
-                            "Near connection limit: {} / {} active connections",
-                            active, max_conns
-                        );
-                        // Java: ServerHandler.notifyOverload() — rate-limited to once per 30s
-                        let now = Instant::now();
-                        let mut last = state.last_overload_notification.lock().await;
-                        let should_notify = last.is_none_or(|t| now - t >= Duration::from_secs(30));
-                        if should_notify {
-                            *last = Some(now);
-                            drop(last);
-                            let _ = state.rpc_client.notify_overload().await;
-                        }
-                    }
-                }
-
-                // Increment active connections
-                let prev = state.active_connections.fetch_add(1, Ordering::Relaxed);
-                state.stats.set_open_connections(prev + 1);
 
                 // Load current TLS context (may have been refreshed)
                 let ssl_context = state.tls_acceptor.load_full()
@@ -1032,11 +959,13 @@ pub async fn start_server(
 
                 let conn_state = state.clone();
                 tokio::spawn(async move {
-                    let _guard = ConnectionGuard {
-                        active_connections: conn_state.active_connections.clone(),
-                        stats: conn_state.stats.clone(),
-                    };
+                    // Normalize IPv4-mapped IPv6 (::ffff:a.b.c.d) → plain IPv4.
+                    // Must happen inside the task so host_addr is available after
+                    // the TLS handshake for the allow/flood-control checks below.
+                    let host_addr = utils::normalize_ip(remote_addr.ip()).to_string().to_lowercase();
 
+                    // --- TLS handshake first (matches Java: SSLServerSocket.accept()
+                    //     completes the handshake before any policy checks are applied) ---
                     let ssl = match openssl::ssl::Ssl::new(ssl_context.as_ref()) {
                         Ok(s) => s,
                         Err(e) => {
@@ -1052,8 +981,6 @@ pub async fn start_server(
                         }
                     };
                     if let Err(e) = Pin::new(&mut tls_stream).accept().await {
-                        // Log at debug level for routine client disconnects (e.g. port scanners),
-                        // but at warn level so TLS handshake failures are visible in default logs.
                         let msg = e.to_string();
                         if msg.contains("connection reset") || msg.contains("unexpected EOF") {
                             tracing::debug!("TLS accept from {} closed early: {}", remote_addr, e);
@@ -1062,6 +989,73 @@ pub async fn start_server(
                         }
                         return;
                     }
+
+                    // --- Post-handshake policy checks (Java: HTTPServer.run() order) ---
+                    let cfg = conn_state.config.load();
+                    let is_local = LOCAL_NETWORK_RE.is_match(&host_addr)
+                        || cfg.client_host.replace("::ffff:", "") == host_addr;
+                    // Java: isValidRPCServer returns true when disableIPOriginCheck is set
+                    let is_rpc = cfg.disable_ip_origin_check
+                        || cfg.rpc_servers.iter().any(|s| s.to_string().to_lowercase() == host_addr);
+
+                    let allow = conn_state.allow_normal_connections.load(Ordering::Relaxed);
+                    if !allow && !is_rpc {
+                        tracing::warn!(
+                            "Rejecting connection from {} during startup (rpc_servers={:?})",
+                            host_addr, cfg.rpc_servers
+                        );
+                        return;
+                    }
+
+                    if !is_local && !is_rpc && !cfg.disable_flood_control {
+                        drop(cfg);
+                        let mut fc = conn_state.flood_control.lock().await;
+                        let entry = fc.entry(host_addr.clone()).or_insert_with(|| FloodControlEntry {
+                            connect_count: 0,
+                            last_connect: Instant::now(),
+                            block_until: None,
+                        });
+                        if entry.is_blocked() || !entry.hit() {
+                            tracing::warn!("Flood control activated for {}", host_addr);
+                            return;
+                        }
+                    }
+
+                    // Connection limiting for non-local, non-RPC traffic
+                    if !is_local && !is_rpc {
+                        let max_conns = conn_state.config.load().max_connections();
+                        let active = conn_state.active_connections.load(Ordering::Relaxed);
+
+                        if active > max_conns {
+                            tracing::warn!(
+                                "Exceeded the maximum allowed number of incoming connections ({}).",
+                                max_conns
+                            );
+                            return;
+                        }
+
+                        if active > (max_conns as f64 * 0.8) as u32 && active > 0 {
+                            tracing::warn!(
+                                "Near connection limit: {} / {} active connections",
+                                active, max_conns
+                            );
+                            let now = Instant::now();
+                            let mut last = conn_state.last_overload_notification.lock().await;
+                            let should_notify = last.is_none_or(|t| now - t >= Duration::from_secs(30));
+                            if should_notify {
+                                *last = Some(now);
+                                drop(last);
+                                let _ = conn_state.rpc_client.notify_overload().await;
+                            }
+                        }
+                    }
+
+                    let _guard = ConnectionGuard {
+                        active_connections: conn_state.active_connections.clone(),
+                        stats: conn_state.stats.clone(),
+                    };
+                    let prev = conn_state.active_connections.fetch_add(1, Ordering::Relaxed);
+                    conn_state.stats.set_open_connections(prev + 1);
 
                     let io = TokioIo::new(tls_stream);
 
