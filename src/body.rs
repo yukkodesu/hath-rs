@@ -289,29 +289,35 @@ impl Body for StreamingBody {
             }
 
             if need_wait {
-                // Re-borrow self.source to get notify + start_time + download_done.
-                if let DataSource::Proxy { notify, start_time, download_done, .. } = &self.source {
-                    // If the download task has completed (success or failure) and
-                    // there isn't enough data, terminate immediately. No point
-                    // waiting for data that will never arrive.
-                    if download_done.load(Ordering::SeqCst) {
-                        tracing::debug!(
-                            "ProxyStreamingBody: download done, terminating at offset {}",
-                            self.offset
-                        );
-                        return Poll::Ready(None);
+                // Check termination conditions first (short borrow on self.source).
+                let early_exit = match &self.source {
+                    DataSource::Proxy { download_done, start_time, .. } => {
+                        if download_done.load(Ordering::SeqCst) {
+                            tracing::debug!(
+                                "ProxyStreamingBody: download done, terminating at offset {}",
+                                self.offset
+                            );
+                            true
+                        } else if start_time.elapsed() > Duration::from_secs(300) {
+                            tracing::warn!(
+                                "ProxyStreamingBody: timeout waiting for data at offset {}",
+                                self.offset
+                            );
+                            true
+                        } else {
+                            false
+                        }
                     }
+                    _ => false,
+                };
 
-                    // Check timeout (5 minutes, Java: timeout > 30000 * 10ms = 300s)
-                    if start_time.elapsed() > Duration::from_secs(300) {
-                        tracing::warn!(
-                            "ProxyStreamingBody: timeout waiting for data at offset {}",
-                            self.offset
-                        );
-                        return Poll::Ready(None);
-                    }
+                if early_exit {
+                    self.finish();
+                    return Poll::Ready(None);
+                }
 
-                    // Start/poll wait future
+                // Re-borrow self.source to get notify for the wait future.
+                if let DataSource::Proxy { notify, .. } = &self.source {
                     if self.wait_fut.is_none() {
                         let n = notify.clone();
                         self.wait_fut = Some(Box::pin(async move {
@@ -343,7 +349,7 @@ impl Body for StreamingBody {
             
             self.throttled = false;
 
-            // Step 5: Produce the chunk
+            // Step 5: Produce the chunk.
             // Static without throttling → send all remaining data at once.
             // Proxy always uses TCP_PACKET_SIZE chunks (matching Java HTTPSession.write loop).
             let chunk_size = match &self.source {
@@ -353,27 +359,36 @@ impl Body for StreamingBody {
             let end = (self.offset + chunk_size).min(self.total_size);
 
             let offset = self.offset;
-            let chunk: Bytes = match &mut self.source {
-                DataSource::Static { data } => data.slice(offset..end),
+
+            // Separate early-termination from chunk production so that
+            // self.finish() — which borrows self.source — is never called
+            // while self.source is mutably borrowed by the match arm.
+            enum ChunkResult {
+                Data(Bytes),
+                Done,
+            }
+
+            let result = match &mut self.source {
+                DataSource::Static { data } => ChunkResult::Data(data.slice(offset..end)),
                 DataSource::Random => {
                     let actual_size = end - offset;
                     let mut buf = BytesMut::zeroed(actual_size);
                     rand::rng().fill_bytes(&mut buf);
-                    buf.freeze()
+                    ChunkResult::Data(buf.freeze())
                 }
                 DataSource::File { file, sha1, .. } => {
                     let actual_size = end - offset;
                     let mut buf = BytesMut::zeroed(actual_size);
                     match file.read(&mut buf[..actual_size]) {
-                        Ok(0) => return Poll::Ready(None),
+                        Ok(0) => ChunkResult::Done,
                         Ok(n) => {
                             sha1::Digest::update(sha1, &buf[..n]);
                             buf.truncate(n);
-                            buf.freeze()
+                            ChunkResult::Data(buf.freeze())
                         }
                         Err(e) => {
                             tracing::warn!("File body: read error at offset {}: {}", offset, e);
-                            return Poll::Ready(None);
+                            ChunkResult::Done
                         }
                     }
                 }
@@ -381,25 +396,32 @@ impl Body for StreamingBody {
                     let actual_size = end - offset;
                     let mut buf = BytesMut::zeroed(actual_size);
                     match file.read(&mut buf[..actual_size]) {
-                        Ok(0) => return Poll::Ready(None),
+                        Ok(0) => ChunkResult::Done,
                         Ok(n) => {
                             buf.truncate(n);
-                            buf.freeze()
+                            ChunkResult::Data(buf.freeze())
                         }
                         Err(e) => {
                             tracing::warn!(
                                 "ProxyStreamingBody: read error at offset {}: {}",
                                 temp_file.display(), e
                             );
-                            return Poll::Ready(None);
+                            ChunkResult::Done
                         }
                     }
                 }
             };
 
-            self.offset += chunk.len();
-
-            return Poll::Ready(Some(Ok(Frame::data(chunk))));
+            match result {
+                ChunkResult::Data(chunk) => {
+                    self.offset += chunk.len();
+                    return Poll::Ready(Some(Ok(Frame::data(chunk))));
+                }
+                ChunkResult::Done => {
+                    self.finish();
+                    return Poll::Ready(None);
+                }
+            }
         }
     }
 

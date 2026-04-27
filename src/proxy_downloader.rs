@@ -192,73 +192,79 @@ impl ProxyFileDownloader {
                 let mut file = match tokio::fs::File::create(&tf).await {
                     Ok(f) => f,
                     Err(_) => {
+                        dd.store(true, Ordering::SeqCst);
                         not.notify_waiters();
                         return;
                     }
                 };
 
-                let mut sha1 = sha1::Sha1::new();
-                let mut downloaded = 0u64;
-                let download_start = std::time::Instant::now();
-
-                // Java: each retry opens a new InputStream on the connection
-                let mut resp = match retry_client
+                // Java: each retry opens a new InputStream on the connection.
+                // Rust: make a fresh HTTP request for each retry.
+                let resp_result = retry_client
                     .get(retry_source.clone())
                     .header("Hath-Request", &retry_hath)
                     .header("User-Agent", format!("Hentai@Home {}", crate::rpc::CLIENT_VERSION))
                     .send()
-                    .await
-                {
-                    Ok(r) => r,
-                    Err(e) => {
-                        tracing::warn!("Proxy download: request failed for {}: {}", fileid_owned, e);
-                        break;
-                    }
-                };
+                    .await;
 
-                loop {
-                    let chunk = match resp.chunk().await {
-                        Ok(Some(data)) => data,
-                        Ok(None) => {
-                            if downloaded == expected_size {
-                                stream_success = true;
-                                final_digest = utils::hex_encode(&sha1.finalize());
-                            } else {
+                match resp_result {
+                    Ok(mut resp) => {
+                        let mut sha1 = sha1::Sha1::new();
+                        let mut downloaded = 0u64;
+                        let download_start = std::time::Instant::now();
+
+                        loop {
+                            let chunk = match resp.chunk().await {
+                                Ok(Some(data)) => data,
+                                Ok(None) => {
+                                    if downloaded == expected_size {
+                                        stream_success = true;
+                                        final_digest = utils::hex_encode(&sha1.finalize());
+                                    } else {
+                                        tracing::warn!(
+                                            "Proxy download: premature EOF for {} ({} of {} bytes)",
+                                            fileid_owned, downloaded, expected_size
+                                        );
+                                    }
+                                    break;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "Proxy download: error for {} ({} of {} bytes): {}",
+                                        fileid_owned, downloaded, expected_size, e
+                                    );
+                                    break;
+                                }
+                            };
+
+                            if download_start.elapsed() > std::time::Duration::from_secs(300) {
                                 tracing::warn!(
-                                    "Proxy download: premature EOF for {} ({} of {} bytes)",
-                                    fileid_owned, downloaded, expected_size
+                                    "Proxy download: total time limit exceeded for {}",
+                                    fileid_owned
                                 );
+                                break;
                             }
-                            break;
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "Proxy download: error for {} ({} of {} bytes): {}",
-                                fileid_owned, downloaded, expected_size, e
-                            );
-                            break;
-                        }
-                    };
 
-                    if download_start.elapsed() > std::time::Duration::from_secs(300) {
-                        tracing::warn!(
-                            "Proxy download: total time limit exceeded for {}",
-                            fileid_owned
-                        );
-                        break;
+                            sha1::Digest::update(&mut sha1, &chunk);
+                            if file.write_all(&chunk).await.is_err() {
+                                tracing::warn!(
+                                    "Proxy download: disk write error for {}",
+                                    fileid_owned
+                                );
+                                break;
+                            }
+                            downloaded += chunk.len() as u64;
+                            wo.store(downloaded, std::sync::atomic::Ordering::SeqCst);
+                            not.notify_waiters();
+                        }
                     }
-
-                    sha1::Digest::update(&mut sha1, &chunk);
-                    if file.write_all(&chunk).await.is_err() {
+                    Err(e) => {
                         tracing::warn!(
-                            "Proxy download: disk write error for {}",
-                            fileid_owned
+                            "Proxy download: request failed for {}: {}",
+                            fileid_owned, e
                         );
-                        break;
+                        // stream_success stays false; falls through to retry logic below
                     }
-                    downloaded += chunk.len() as u64;
-                    wo.store(downloaded, std::sync::atomic::Ordering::SeqCst);
-                    not.notify_waiters();
                 }
 
                 drop(file);
@@ -285,7 +291,12 @@ impl ProxyFileDownloader {
             // Wait for the body to finish reading.
             let timeout = std::time::Duration::from_secs(300);
             tokio::select! {
-                _ = bdn.notified() => {},
+                _ = bdn.notified() => {
+                    tracing::info!(
+                        "Proxy download: body done for {}",
+                        fileid_owned
+                    );
+                }
                 _ = tokio::time::sleep(timeout) => {
                     tracing::warn!(
                         "Proxy download: timeout waiting for body {}",
