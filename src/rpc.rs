@@ -85,8 +85,8 @@ pub fn make_rpc_query(act: Action, add: &str, config: &Config) -> String {
 }
 
 /// Build the full RPC URL for a given action.
-pub fn make_rpc_url(act: Action, add: &str, config: &Config) -> Result<Url> {
-    let host = config.get_rpc_host();
+pub fn make_rpc_url(act: Action, add: &str, config: &Config, state: &crate::rpc_client::RpcState) -> Result<Url> {
+    let host = config.get_rpc_host(state);
     let query = make_rpc_query(act, add, config);
     let mut url = Url::parse("http://rpc.hentaiathome.net/")
         .map_err(|e| HathError::Rpc(format!("invalid URL base: {}", e)))?;
@@ -196,7 +196,7 @@ mod tests {
         // ::ffff:192.0.2.1 normalizes to plain IPv4 192.0.2.1
         config.apply_setting("rpc_server_ip", "::ffff:192.0.2.1");
 
-        let url = make_rpc_url(Action::GetCertificate, "", &config).unwrap();
+        let url = make_rpc_url(Action::GetCertificate, "", &config, &crate::rpc_client::RpcState::default()).unwrap();
 
         assert!(url
             .as_str()
@@ -209,7 +209,7 @@ mod tests {
         config.apply_setting("rpc_server_ip", "192.0.2.1");
         config.apply_setting("rpc_server_port", "8080");
 
-        let url = make_rpc_url(Action::GetCertificate, "", &config).unwrap();
+        let url = make_rpc_url(Action::GetCertificate, "", &config, &crate::rpc_client::RpcState::default()).unwrap();
 
         assert!(url
             .as_str()

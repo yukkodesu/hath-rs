@@ -574,7 +574,7 @@ async fn build_tls_acceptor(config: &Config, force_download: bool) -> Result<(Ss
     let cert_path = config.data_dir.join("hathcert.p12");
 
     if force_download || !cert_path.exists() {
-        let cert_url = rpc::make_rpc_url(Action::GetCertificate, "", config)?;
+        let cert_url = rpc::make_rpc_url(Action::GetCertificate, "", config, &crate::rpc_client::RpcState::default())?;
         let downloader = crate::downloader::FileDownloader::new(
             cert_url, 10000, 300000,
             crate::downloader::DownloadMode::File(cert_path.clone()),

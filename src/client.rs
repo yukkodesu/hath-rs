@@ -204,7 +204,7 @@ pub async fn run() -> Result<()> {
         server::spawn_flood_control_pruner(app_state.clone(), shutdown.clone());
         rpc_client::spawn_still_alive_heartbeat(rpc_client.clone(), stats.clone(), shutdown.clone());
         server::spawn_time_cert_check(config.clone(), app_state.clone(), shutdown.clone());
-        rpc_client::spawn_rpc_failure_clearer(config.clone(), shutdown.clone());
+        rpc_client::spawn_rpc_failure_clearer(rpc_client.clone(), shutdown.clone());
         cache::spawn_blacklist_fetcher(rpc_client.clone(), cache.clone(), shutdown.clone());
         server::spawn_cert_refresh_watcher(app_state.clone(), rpc_client.clone(), shutdown.clone());
     }
