@@ -47,28 +47,12 @@ impl ProxyFileDownloader {
         sources: &[Url],
         config: &Config,
         cache_handler: Option<Arc<CacheHandler>>,
+        client: &Arc<Client>,
     ) -> Result<Self> {
         let hv_file = HVFile::from_fileid(fileid)
             .ok_or_else(|| HathError::Parse(format!("invalid fileid: {}", fileid)))?;
 
-        // Java: setConnectTimeout(5000), setReadTimeout(30000). 300s total in chunk loop.
-        let mut builder = Client::builder()
-            .user_agent(format!("Hentai@Home {}", crate::rpc::CLIENT_VERSION))
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .read_timeout(std::time::Duration::from_secs(30));
-
-        // Java: proxy support via Settings.getImageProxy()
-        if let (Some(proxy_type), Some(proxy_host), Some(proxy_port)) =
-            (&config.image_proxy_type, &config.image_proxy_host, config.image_proxy_port)
-        {
-            if let Ok(proxy_url) = build_proxy_url(proxy_type, proxy_host, proxy_port)
-                && let Ok(proxy) = reqwest::Proxy::all(proxy_url.as_str()) {
-                builder = builder.proxy(proxy);
-            }
-        }
-
-        let client = builder.build()
-            .map_err(|e| HathError::Network(e.to_string()))?;
+        let client = Arc::clone(client);
 
         let mut last_err = None;
 
@@ -359,7 +343,28 @@ impl ProxyFileDownloader {
 
 }
 
-fn build_proxy_url(proxy_type: &str, proxy_host: &str, proxy_port: u16) -> Result<Url> {
+/// Build the shared reqwest::Client used for all proxy file downloads.
+/// Applies image proxy settings from config if configured.
+pub fn build_proxy_client(config: &Config) -> Result<Arc<Client>> {
+    let mut builder = Client::builder()
+        .user_agent(format!("Hentai@Home {}", crate::rpc::CLIENT_VERSION))
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .read_timeout(std::time::Duration::from_secs(30));
+    if let (Some(proxy_type), Some(proxy_host), Some(proxy_port)) =
+        (&config.image_proxy_type, &config.image_proxy_host, config.image_proxy_port)
+    {
+        if let Ok(proxy_url) = build_proxy_url(proxy_type, proxy_host, proxy_port)
+            && let Ok(proxy) = reqwest::Proxy::all(proxy_url.as_str())
+        {
+            builder = builder.proxy(proxy);
+        }
+    }
+    builder.build()
+        .map(Arc::new)
+        .map_err(|e| HathError::Network(e.to_string()))
+}
+
+pub fn build_proxy_url(proxy_type: &str, proxy_host: &str, proxy_port: u16) -> Result<Url> {
     let mut url = match proxy_type {
         "socks" => Url::parse("socks://hath.invalid/"),
         "http" => Url::parse("http://hath.invalid/"),

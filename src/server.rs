@@ -72,6 +72,9 @@ pub struct AppState {
     /// Set to true by start_server() after the accept loop exits.
     /// The cert refresh watcher polls this to wait for the old server to terminate.
     pub server_terminated: Arc<AtomicBool>,
+    /// Shared HTTP client for ProxyFileDownloader requests.
+    /// 5s connect + 30s read timeout, reused across all proxy downloads.
+    pub proxy_client: Arc<reqwest::Client>,
 }
 
 #[derive(Debug, Clone)]
@@ -231,7 +234,7 @@ impl Service<Request<Incoming>> for HathService {
                                         // initialize() for both GET and HEAD. The init result
                                         // (connecting to source, checking Content-Length/size)
                                         // determines the status code. HEAD then skips body.
-                                        match ProxyFileDownloader::new(&fileid, &sources, &config, Some(state.cache.clone())).await {
+                                        match ProxyFileDownloader::new(&fileid, &sources, &config, Some(state.cache.clone()), &state.proxy_client).await {
                                             Ok(proxy) => {
                                                 let mime = hv.mime_type();
                                                 state.stats.record_file_sent();

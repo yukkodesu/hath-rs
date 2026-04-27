@@ -95,6 +95,8 @@ pub async fn run() -> Result<()> {
     let report_shutdown = Arc::new(AtomicBool::new(false));
     let flood_control = Arc::new(Mutex::new(HashMap::new()));
 
+    let proxy_client = crate::proxy_downloader::build_proxy_client(&config.load())?;
+
     let app_state = AppState {
         config: config.clone(),
         stats: stats.clone(),
@@ -112,6 +114,7 @@ pub async fn run() -> Result<()> {
         cert_refresh_notify: Arc::new(Notify::new()),
         server_restart_token: Arc::new(ArcSwapOption::const_empty()),
         server_terminated: Arc::new(AtomicBool::new(false)),
+        proxy_client,
     };
 
     let (ready_rx, restart_token) = server::spawn_server(app_state.clone(), shutdown.clone());
