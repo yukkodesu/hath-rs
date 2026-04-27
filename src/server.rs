@@ -90,13 +90,16 @@ impl FloodControlEntry {
     }
 
     pub fn is_stale(&self, now: Instant) -> bool {
-        self.last_connect < now - Duration::from_secs(60)
+        now.checked_duration_since(self.last_connect)
+            .map_or(false, |d| d > Duration::from_secs(60))
     }
 
     /// Returns true if the connection should be allowed.
     pub fn hit(&mut self) -> bool {
         let now = Instant::now();
-        let elapsed_ms = (now - self.last_connect).as_millis() as u32;
+        let elapsed_ms = now.checked_duration_since(self.last_connect)
+            .unwrap_or_default()
+            .as_millis() as u32;
         self.connect_count = self.connect_count.saturating_sub(elapsed_ms / 1000).saturating_add(1);
         self.last_connect = now;
 
