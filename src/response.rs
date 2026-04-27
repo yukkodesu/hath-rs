@@ -165,7 +165,7 @@ pub fn proxy_response(
 /// Serve a cached file with optional bandwidth throttling and inline integrity
 /// check. Java: HTTPResponseProcessorFile streams from disk via FileChannel,
 /// computes SHA1 incrementally, deletes corrupt file in cleanup() after send.
-pub async fn file_response(
+pub fn file_response(
     hv_file: &HVFile,
     cache_dir: &Path,
     bwm: Option<Arc<BandwidthMonitor>>,
@@ -173,16 +173,18 @@ pub async fn file_response(
     cache_handler: Option<Arc<crate::cache::CacheHandler>>,
 ) -> Result<Response<StreamingBody>> {
     let path = hv_file.cache_path(cache_dir);
-    let size = hv_file.size as usize;
+    let expected_size = hv_file.size as usize;
 
-    // Quick size check via metadata (avoids loading entire file into memory)
-    let actual_len = tokio::fs::metadata(&path).await
+    // Open first, then stat via the open fd — one syscall, no TOCTOU window.
+    let file = std::fs::File::open(&path)
+        .map_err(|e| HathError::Cache(format!("cannot open {}: {}", path.display(), e)))?;
+    let actual_len = file.metadata()
         .map_err(|e| HathError::Cache(format!("cannot stat {}: {}", path.display(), e)))?
         .len() as usize;
-    if actual_len != size {
+    if actual_len != expected_size {
         return Err(HathError::Cache(format!(
             "file size mismatch for {}: expected {}, got {}",
-            hv_file.fileid(), size, actual_len
+            hv_file.fileid(), expected_size, actual_len
         )));
     }
 
@@ -191,18 +193,19 @@ pub async fn file_response(
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, mime)
         .header(header::CONNECTION, "close");
-    if size > 0 {
+    if expected_size > 0 {
         builder = builder
             .header(header::CACHE_CONTROL, "public, max-age=31536000")
-            .header(header::CONTENT_LENGTH, size);
+            .header(header::CONTENT_LENGTH, expected_size);
     }
     let body = StreamingBody::new_file(
+        file,
         path,
-        size,
+        expected_size,
         hv_file.hash.to_string(),
         verify,
         cache_handler,
         bwm,
-    ).map_err(|e| HathError::Cache(format!("cannot open file: {}", e)))?;
+    );
     builder.body(body).map_err(HathError::Http)
 }

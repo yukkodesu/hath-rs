@@ -102,19 +102,19 @@ impl StreamingBody {
         Self::from_bytes(Bytes::new(), None)
     }
 
-    /// Create a file-streaming body. Reads chunks incrementally, optionally
-    /// verifying SHA1 and deleting corrupt files after the response is sent.
+    /// Create a file-streaming body from an already-open file handle.
+    /// The caller is responsible for opening the file and verifying its size.
     /// Java: HTTPResponseProcessorFile with verifyFileIntegrity.
     pub fn new_file(
+        file: std::fs::File,
         path: PathBuf,
         total_size: usize,
         expected_hash: String,
         verify: bool,
         cache_handler: Option<Arc<crate::cache::CacheHandler>>,
         bwm: Option<Arc<BandwidthMonitor>>,
-    ) -> std::io::Result<Self> {
-        let file = std::fs::File::open(&path)?;
-        Ok(Self {
+    ) -> Self {
+        Self {
             source: DataSource::File {
                 file,
                 sha1: sha1::Sha1::new(),
@@ -128,7 +128,7 @@ impl StreamingBody {
             throttle_fut: None,
             throttled: false,
             wait_fut: None,
-        })
+        }
     }
 
     /// Create a body that generates random data per-chunk (zero pre-allocation).

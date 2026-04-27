@@ -215,7 +215,7 @@ impl Service<Request<Incoming>> for HathService {
                                 response::file_response(
                                     hv, &config.cache_dir, bwm_for_request,
                                     verify, Some(state.cache.clone()),
-                                ).await
+                                )
                             }
                         } else {
                             match state.rpc_client.static_range_fetch(fileindex, xres, &fileid).await {
