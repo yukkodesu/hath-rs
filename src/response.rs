@@ -150,17 +150,16 @@ pub fn proxy_response(
             .header(header::CACHE_CONTROL, "public, max-age=31536000")
             .header(header::CONTENT_LENGTH, total_size);
     }
-    builder
-        .body(StreamingBody::new_proxy(
-            total_size,
-            temp_file,
-            write_offset,
-            notify,
-            body_done_notify,
-            download_done,
-            bwm,
-        ))
-        .map_err(HathError::Http)
+    let body = StreamingBody::new_proxy(
+        total_size,
+        temp_file,
+        write_offset,
+        notify,
+        body_done_notify,
+        download_done,
+        bwm,
+    ).map_err(HathError::Io)?;
+    builder.body(body).map_err(HathError::Http)
 }
 
 /// Serve a cached file with optional bandwidth throttling and inline integrity
