@@ -271,6 +271,7 @@ impl Config {
             "rpc_server_ip" => {
                 self.rpc_servers = value.split(';')
                     .filter_map(|s| s.trim().parse::<IpAddr>().ok())
+                    .map(crate::utils::normalize_ip)
                     .collect();
                 // Java: clear cached host if it's no longer in the new server list
                 if let Some(ref current) = self.rpc_current {
