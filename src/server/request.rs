@@ -8,7 +8,7 @@ pub enum RequestType {
     FileServe {
         fileid: String,
         hv_file: Option<HVFile>,
-        additional: Additional,
+        additional: Box<Additional>,
         keystamp_valid: bool,
         /// HEAD requests: skip body construction (file read / proxy download).
         head_only: bool,
@@ -88,7 +88,7 @@ fn parse_file_serve(url_parts: &[&str], config: &Config, head_only: bool) -> Req
     RequestType::FileServe {
         fileid,
         hv_file,
-        additional,
+        additional: Box::new(additional),
         keystamp_valid,
         head_only,
     }

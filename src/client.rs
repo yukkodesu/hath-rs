@@ -228,10 +228,10 @@ pub async fn run() -> Result<()> {
     // Java: reportShutdown is only set after successful notifyStart().
     // Unlike allow_connections, it's never toggled during cert refresh.
     tracing::info!("Shutting down...");
-    if report_shutdown.load(Ordering::Relaxed) {
-        if let Err(e) = rpc_client.client_stop().await {
-            tracing::warn!("Failed to notify server about shutdown: {}", e);
-        }
+    if report_shutdown.load(Ordering::Relaxed)
+        && let Err(e) = rpc_client.client_stop().await
+    {
+        tracing::warn!("Failed to notify server about shutdown: {}", e);
     }
     tokio::time::sleep(Duration::from_secs(5)).await;
     server::stop_server(&app_state).await;

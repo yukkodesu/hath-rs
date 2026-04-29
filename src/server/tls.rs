@@ -243,15 +243,15 @@ pub fn spawn_time_cert_check(
                 if config.load().server_time_delta.abs() > 86400 {
                     tracing::warn!("System time off by >24h. Correct your system clock.");
                 }
-                if let Some(expiry) = *state.cert_expiry.lock().await {
-                    if tls::is_cert_expired(expiry) {
-                        tracing::error!(
-                            "Either the system clock is significantly wrong, or something has \
+                if let Some(expiry) = *state.cert_expiry.lock().await
+                    && tls::is_cert_expired(expiry)
+                {
+                    tracing::error!(
+                        "Either the system clock is significantly wrong, or something has \
                          gone wrong with certificate renewal. Check your system clock and \
                          internet connection, then restart the client manually."
-                        );
-                        shutdown_signal.cancel();
-                    }
+                    );
+                    shutdown_signal.cancel();
                 }
             }
         },

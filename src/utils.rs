@@ -77,22 +77,22 @@ pub fn parse_additional(additional: &str) -> Additional {
         return out;
     }
     for kv_pair in additional.trim().split(';') {
-        if kv_pair.len() > 2 {
-            if let Some((k, v)) = kv_pair.split_once('=') {
-                let v = v.trim().to_string();
-                match k.trim() {
-                    "keystamp" => out.keystamp = Some(v),
-                    "fileindex" => out.fileindex = Some(v),
-                    "xres" => out.xres = Some(v),
-                    "hostname" => out.hostname = Some(v),
-                    "protocol" => out.protocol = Some(v),
-                    "port" => out.port = Some(v),
-                    "testsize" => out.testsize = Some(v),
-                    "testcount" => out.testcount = Some(v),
-                    "testtime" => out.testtime = Some(v),
-                    "testkey" => out.testkey = Some(v),
-                    _ => {}
-                }
+        if kv_pair.len() > 2
+            && let Some((k, v)) = kv_pair.split_once('=')
+        {
+            let v = v.trim().to_string();
+            match k.trim() {
+                "keystamp" => out.keystamp = Some(v),
+                "fileindex" => out.fileindex = Some(v),
+                "xres" => out.xres = Some(v),
+                "hostname" => out.hostname = Some(v),
+                "protocol" => out.protocol = Some(v),
+                "port" => out.port = Some(v),
+                "testsize" => out.testsize = Some(v),
+                "testcount" => out.testcount = Some(v),
+                "testtime" => out.testtime = Some(v),
+                "testkey" => out.testkey = Some(v),
+                _ => {}
             }
         }
     }

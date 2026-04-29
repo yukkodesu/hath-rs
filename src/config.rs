@@ -216,7 +216,7 @@ impl Config {
             None
         };
 
-        let host = host.unwrap_or_else(|| {
+        host.unwrap_or_else(|| {
             if self.rpc_servers.is_empty() {
                 return "rpc.hentaiathome.net".to_string();
             }
@@ -241,9 +241,7 @@ impl Config {
                 tracing::debug!("Selected rpcServerCurrent={}", candidate);
                 break candidate;
             }
-        });
-
-        host
+        })
     }
 
     pub fn is_static_range(&self, range: &str) -> bool {

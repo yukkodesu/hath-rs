@@ -6,7 +6,7 @@ use bytes::Bytes;
 use hyper::{Response, StatusCode, header};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use tokio::sync::Notify;
 
 /// Build a Hyper Response with proper headers.
@@ -138,33 +138,35 @@ pub fn speedtest_response(
 /// Build a response for a proxy file download in progress.
 /// The body will stream data from the temp file as the background download
 /// task writes to it. Java: HTTPResponseProcessorProxy + ProxyFileDownloader.
-pub fn proxy_response(
-    content_type: &str,
-    total_size: usize,
-    temp_file: PathBuf,
-    write_offset: Arc<AtomicU64>,
-    notify: Arc<Notify>,
-    body_done_notify: Arc<Notify>,
-    download_done: Arc<std::sync::atomic::AtomicBool>,
-    bwm: Option<Arc<BandwidthMonitor>>,
-) -> Result<Response<StreamingBody>> {
+pub struct ProxyResponseParts<'a> {
+    pub content_type: &'a str,
+    pub total_size: usize,
+    pub temp_file: PathBuf,
+    pub write_offset: Arc<AtomicU64>,
+    pub notify: Arc<Notify>,
+    pub body_done_notify: Arc<Notify>,
+    pub download_done: Arc<AtomicBool>,
+    pub bwm: Option<Arc<BandwidthMonitor>>,
+}
+
+pub fn proxy_response(parts: ProxyResponseParts<'_>) -> Result<Response<StreamingBody>> {
     let mut builder = Response::builder()
         .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CONTENT_TYPE, parts.content_type)
         .header(header::CONNECTION, "close");
-    if total_size > 0 {
+    if parts.total_size > 0 {
         builder = builder
             .header(header::CACHE_CONTROL, "public, max-age=31536000")
-            .header(header::CONTENT_LENGTH, total_size);
+            .header(header::CONTENT_LENGTH, parts.total_size);
     }
     let body = StreamingBody::new_proxy(
-        total_size,
-        temp_file,
-        write_offset,
-        notify,
-        body_done_notify,
-        download_done,
-        bwm,
+        parts.total_size,
+        parts.temp_file,
+        parts.write_offset,
+        parts.notify,
+        parts.body_done_notify,
+        parts.download_done,
+        parts.bwm,
     )
     .map_err(HathError::Io)?;
     builder.body(body).map_err(HathError::Http)
