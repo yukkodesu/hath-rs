@@ -1,6 +1,6 @@
 use crate::config::Config;
-use crate::utils::{self, parse_additional, Additional};
 use crate::hvfile::HVFile;
+use crate::utils::{self, Additional, parse_additional};
 use std::net::IpAddr;
 
 #[derive(Debug)]
@@ -20,8 +20,6 @@ pub enum RequestType {
     },
     SpeedTest {
         testsize: u32,
-        testtime: i64,
-        testkey: String,
         valid: bool,
         /// Distinguishes 403 (invalid key) from 400 (malformed URL) when valid=false.
         forbidden: bool,
@@ -34,7 +32,12 @@ pub enum RequestType {
     BadRequest,
     MethodNotAllowed,
 }
-pub fn parse_request(method: &str, path_and_query: &str, client_ip: IpAddr, config: &Config) -> RequestType {
+pub fn parse_request(
+    method: &str,
+    path_and_query: &str,
+    client_ip: IpAddr,
+    config: &Config,
+) -> RequestType {
     if !matches!(method.to_uppercase().as_str(), "GET" | "HEAD") {
         return RequestType::MethodNotAllowed;
     }
@@ -74,20 +77,32 @@ pub fn parse_request(method: &str, path_and_query: &str, client_ip: IpAddr, conf
 }
 
 fn parse_file_serve(url_parts: &[&str], config: &Config, head_only: bool) -> RequestType {
-    if url_parts.len() < 4 { return RequestType::BadRequest; }
+    if url_parts.len() < 4 {
+        return RequestType::BadRequest;
+    }
     let fileid = url_parts[2].to_string();
     let hv_file = HVFile::from_fileid(&fileid);
     let additional = parse_additional(url_parts[3]);
     let keystamp_valid = validate_keystamp(&fileid, additional.keystamp.as_deref(), config);
 
-    RequestType::FileServe { fileid, hv_file, additional, keystamp_valid, head_only }
+    RequestType::FileServe {
+        fileid,
+        hv_file,
+        additional,
+        keystamp_valid,
+        head_only,
+    }
 }
 
 fn parse_server_command(url_parts: &[&str], client_ip: IpAddr, config: &Config) -> RequestType {
     let is_from_rpc = config.rpc_servers.contains(&client_ip) || config.disable_ip_origin_check;
 
     if url_parts.len() < 6 {
-        return RequestType::ServerCommand { command: String::new(), additional: String::new(), valid: false };
+        return RequestType::ServerCommand {
+            command: String::new(),
+            additional: String::new(),
+            valid: false,
+        };
     }
 
     let command = url_parts[2].to_string();
@@ -97,57 +112,101 @@ fn parse_server_command(url_parts: &[&str], client_ip: IpAddr, config: &Config) 
 
     let valid = is_from_rpc && validate_servercmd(&command, &additional, command_time, key, config);
 
-    RequestType::ServerCommand { command, additional, valid }
+    RequestType::ServerCommand {
+        command,
+        additional,
+        valid,
+    }
 }
 
 fn parse_speed_test(url_parts: &[&str], config: &Config, head_only: bool) -> RequestType {
     if url_parts.len() < 5 {
         // Java: responseStatusCode = 400 when urlparts.length < 5
-        return RequestType::SpeedTest { testsize: 0, testtime: 0, testkey: String::new(), valid: false, forbidden: false, head_only };
+        return RequestType::SpeedTest {
+            testsize: 0,
+            valid: false,
+            forbidden: false,
+            head_only,
+        };
     }
     let testsize: u32 = url_parts[2].parse().unwrap_or(0);
     let testtime: i64 = url_parts[3].parse().unwrap_or(0);
     let testkey = url_parts[4].to_string();
     let valid = validate_speedtest(testsize, testtime, &testkey, config);
     // Java: responseStatusCode = 403 for expired or invalid key
-    RequestType::SpeedTest { testsize, testtime, testkey, valid, forbidden: !valid, head_only }
+    RequestType::SpeedTest {
+        testsize,
+        valid,
+        forbidden: !valid,
+        head_only,
+    }
 }
 
 /// Validate keystamp for /h/ requests.
 /// Java: |serverTime - ts| < 900 && SHA1(...)[0..10].equalsIgnoreCase(provided)
 pub fn validate_keystamp(fileid: &str, keystamp: Option<&str>, config: &Config) -> bool {
-    let keystamp = match keystamp { Some(k) => k, None => return false };
+    let keystamp = match keystamp {
+        Some(k) => k,
+        None => return false,
+    };
     let (timestamp_str, provided_prefix) = match keystamp.split_once('-') {
         Some((t, p)) => (t, p),
         None => return false,
     };
-    let timestamp: i64 = match timestamp_str.parse() { Ok(t) => t, Err(_) => return false };
+    let timestamp: i64 = match timestamp_str.parse() {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
 
-    if (config.server_time() - timestamp).abs() >= 900 { return false; }
-    if provided_prefix.len() != 10 { return false; }
+    if (config.server_time() - timestamp).abs() >= 900 {
+        return false;
+    }
+    if provided_prefix.len() != 10 {
+        return false;
+    }
 
     let expected = utils::sha1_string(&format!(
-        "{}-{}-{}-hotlinkthis", timestamp, fileid, config.client_key.as_str()
+        "{}-{}-{}-hotlinkthis",
+        timestamp,
+        fileid,
+        config.client_key.as_str()
     ));
 
     // Case-insensitive comparison, exactly first 10 chars
     expected[..10].eq_ignore_ascii_case(provided_prefix)
 }
 
-fn validate_servercmd(command: &str, additional: &str, time: i64, key: &str, config: &Config) -> bool {
-    if (time - config.server_time()).abs() > 300 { return false; }
+fn validate_servercmd(
+    command: &str,
+    additional: &str,
+    time: i64,
+    key: &str,
+    config: &Config,
+) -> bool {
+    if (time - config.server_time()).abs() > 300 {
+        return false;
+    }
     let expected = utils::sha1_string(&format!(
         "hentai@home-servercmd-{}-{}-{}-{}-{}",
-        command, additional, config.client_id.0, time, config.client_key.as_str()
+        command,
+        additional,
+        config.client_id.0,
+        time,
+        config.client_key.as_str()
     ));
     expected == key
 }
 
 fn validate_speedtest(testsize: u32, testtime: i64, testkey: &str, config: &Config) -> bool {
-    if (testtime - config.server_time()).abs() > 300 { return false; }
+    if (testtime - config.server_time()).abs() > 300 {
+        return false;
+    }
     let expected = utils::sha1_string(&format!(
         "hentai@home-speedtest-{}-{}-{}-{}",
-        testsize, testtime, config.client_id.0, config.client_key.as_str()
+        testsize,
+        testtime,
+        config.client_id.0,
+        config.client_key.as_str()
     ));
     expected == testkey
 }
@@ -160,21 +219,32 @@ mod tests {
 
     fn test_config() -> Config {
         let args = CliArgs::try_parse_from([
-            "hath-rs", "--client-id", "123", "--client-key", "abcde12345abcde12345",
-        ]).unwrap();
+            "hath-rs",
+            "--client-id",
+            "123",
+            "--client-key",
+            "abcde12345abcde12345",
+        ])
+        .unwrap();
         Config::load(args).unwrap()
     }
 
     #[test]
     fn test_favicon() {
         let c = test_config();
-        assert!(matches!(parse_request("GET", "/favicon.ico", "127.0.0.1".parse().unwrap(), &c), RequestType::Favicon));
+        assert!(matches!(
+            parse_request("GET", "/favicon.ico", "127.0.0.1".parse().unwrap(), &c),
+            RequestType::Favicon
+        ));
     }
 
     #[test]
     fn test_robots() {
         let c = test_config();
-        assert!(matches!(parse_request("GET", "/robots.txt", "127.0.0.1".parse().unwrap(), &c), RequestType::Robots));
+        assert!(matches!(
+            parse_request("GET", "/robots.txt", "127.0.0.1".parse().unwrap(), &c),
+            RequestType::Robots
+        ));
     }
 
     #[test]

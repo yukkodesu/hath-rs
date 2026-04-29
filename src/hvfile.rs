@@ -1,6 +1,6 @@
 use crate::types::{FileId, FileType, Sha1Hash};
-use std::path::{Path, PathBuf};
 use regex::Regex;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 static FILEID_WITH_RES: LazyLock<Regex> = LazyLock::new(|| {
@@ -9,8 +9,7 @@ static FILEID_WITH_RES: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 static FILEID_WITHOUT_RES: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^[a-f0-9]{40}-\d{1,10}-(jpg|png|gif|mp4|wbm|wbp|avf|jxl)$")
-        .expect("invalid regex")
+    Regex::new(r"^[a-f0-9]{40}-\d{1,10}-(jpg|png|gif|mp4|wbm|wbp|avf|jxl)$").expect("invalid regex")
 });
 
 #[derive(Debug, Clone)]
@@ -46,11 +45,25 @@ impl HVFile {
         };
 
         let fileid_cache = if xres > 0 {
-            FileId::new(format!("{}-{}-{}-{}-{}", hash.as_str(), size, xres, yres, file_type.as_ext()))
+            FileId::new(format!(
+                "{}-{}-{}-{}-{}",
+                hash.as_str(),
+                size,
+                xres,
+                yres,
+                file_type.as_ext()
+            ))
         } else {
             FileId::new(format!("{}-{}-{}", hash.as_str(), size, file_type.as_ext()))
         };
-        Some(Self { hash, size, xres, yres, file_type, fileid_cache })
+        Some(Self {
+            hash,
+            size,
+            xres,
+            yres,
+            file_type,
+            fileid_cache,
+        })
     }
 
     /// Returns the file ID string. Computed once at construction, zero-cost to call.

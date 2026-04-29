@@ -1,22 +1,22 @@
 pub mod persistent;
 pub mod pruner;
 
+use crate::cache::persistent::PersistentCacheState;
+use crate::cache::pruner::CachePruner;
 use crate::config::Config;
 use crate::error::{HathError, Result};
 use crate::hvfile::HVFile;
+use crate::rpc_client::RpcClient;
 use crate::stats::Stats;
 use crate::utils;
-use crate::rpc_client::RpcClient;
-use crate::cache::persistent::PersistentCacheState;
-use crate::cache::pruner::CachePruner;
 use arc_swap::ArcSwap;
 use sha1::{Digest, Sha1};
 use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
@@ -115,7 +115,11 @@ impl LruState {
     pub fn cycle(&mut self) {
         let clear_until = (self.lru_clear_pointer + 17).min(LRU_CACHE_SIZE);
         self.lru_cache_table[self.lru_clear_pointer..clear_until].fill(0);
-        self.lru_clear_pointer = if clear_until >= LRU_CACHE_SIZE { 0 } else { clear_until };
+        self.lru_clear_pointer = if clear_until >= LRU_CACHE_SIZE {
+            0
+        } else {
+            clear_until
+        };
     }
 }
 
@@ -141,7 +145,11 @@ pub struct CacheHandler {
 }
 
 impl CacheHandler {
-    pub fn new(config: Arc<ArcSwap<Config>>, stats: Arc<Stats>, shutdown: tokio_util::sync::CancellationToken) -> Result<Self> {
+    pub fn new(
+        config: Arc<ArcSwap<Config>>,
+        stats: Arc<Stats>,
+        shutdown: tokio_util::sync::CancellationToken,
+    ) -> Result<Self> {
         let cfg = config.load();
 
         // Java: dieWithError if cache root directory exists but is unreadable
@@ -158,7 +166,10 @@ impl CacheHandler {
         for entry in utils::list_sorted_files(&cfg.temp_dir) {
             if entry.is_file() {
                 let name = entry.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if !name.starts_with("log_") && !name.starts_with("pcache_") && name != "client_login" {
+                if !name.starts_with("log_")
+                    && !name.starts_with("pcache_")
+                    && name != "client_login"
+                {
                     utils::remove_file(&entry);
                 }
             }
@@ -166,35 +177,43 @@ impl CacheHandler {
 
         // Try persistent load first
         let cache_loaded;
-        let (lru, cache_count, cache_size, static_range_oldest) =
-            if !cfg.rescan_cache {
-                if let Some(state) = Self::try_load_persistent(&cfg) {
-                    tracing::info!("Successfully loaded persistent cache data");
-                    let mut lru = LruState::new();
-                    let len = state.lru_cache_table.len().min(LRU_CACHE_SIZE);
-                    lru.lru_cache_table[..len].copy_from_slice(&state.lru_cache_table[..len]);
-                    lru.lru_clear_pointer = state.lru_clear_pointer;
-                    cache_loaded = true;
-                    (lru, state.cache_count, state.cache_size, state.static_range_ages)
-                } else {
-                    // Java: delete old persistent data BEFORE rescan to prevent
-                    // stale files from misleading the next startup after a crash.
-                    Self::delete_persistent_data(&cfg);
-                    Self::startup_cache_cleanup(&cfg)?;
-                    let (lru, count, size, ages) = Self::full_rescan(&cfg, &stats, cfg.verify_cache)?;
-                    cache_loaded = true;
-                    (lru, count, size, ages)
-                }
+        let (lru, cache_count, cache_size, static_range_oldest) = if !cfg.rescan_cache {
+            if let Some(state) = Self::try_load_persistent(&cfg) {
+                tracing::info!("Successfully loaded persistent cache data");
+                let mut lru = LruState::new();
+                let len = state.lru_cache_table.len().min(LRU_CACHE_SIZE);
+                lru.lru_cache_table[..len].copy_from_slice(&state.lru_cache_table[..len]);
+                lru.lru_clear_pointer = state.lru_clear_pointer;
+                cache_loaded = true;
+                (
+                    lru,
+                    state.cache_count,
+                    state.cache_size,
+                    state.static_range_ages,
+                )
             } else {
+                // Java: delete old persistent data BEFORE rescan to prevent
+                // stale files from misleading the next startup after a crash.
                 Self::delete_persistent_data(&cfg);
                 Self::startup_cache_cleanup(&cfg)?;
                 let (lru, count, size, ages) = Self::full_rescan(&cfg, &stats, cfg.verify_cache)?;
                 cache_loaded = true;
                 (lru, count, size, ages)
-            };
+            }
+        } else {
+            Self::delete_persistent_data(&cfg);
+            Self::startup_cache_cleanup(&cfg)?;
+            let (lru, count, size, ages) = Self::full_rescan(&cfg, &stats, cfg.verify_cache)?;
+            cache_loaded = true;
+            (lru, count, size, ages)
+        };
 
         stats.set_cache_count(cache_count);
-        stats.set_cache_size(Self::cache_size_with_overhead(cache_size, cache_count, &cfg));
+        stats.set_cache_size(Self::cache_size_with_overhead(
+            cache_size,
+            cache_count,
+            &cfg,
+        ));
 
         // Java: startup safety checks (CacheHandler constructor lines 111-127)
         // Java: Settings.getStaticRangeCount() — server-assigned ranges, not cached ranges
@@ -203,8 +222,13 @@ impl CacheHandler {
         if !cfg.skip_free_space_check
             && let Ok(free) = fs2::free_space(&cfg.cache_dir)
         {
-            let needed = cfg.disklimit_bytes.saturating_sub(
-                Self::cache_size_with_overhead(cache_size, cache_count, &cfg));
+            let needed = cfg
+                .disklimit_bytes
+                .saturating_sub(Self::cache_size_with_overhead(
+                    cache_size,
+                    cache_count,
+                    &cfg,
+                ));
             if free < needed {
                 tracing::error!(
                     "The storage device does not have enough space available to \
@@ -223,7 +247,9 @@ impl CacheHandler {
                  ranges from the H@H settings page."
             );
             shutdown.cancel();
-            return Err(HathError::Fatal("empty cache with static ranges assigned".into()));
+            return Err(HathError::Fatal(
+                "empty cache with static ranges assigned".into(),
+            ));
         }
 
         Ok(Self {
@@ -256,12 +282,17 @@ impl CacheHandler {
             }
 
             for entry in &l2_entries {
-                if entry.is_dir() { continue; }
+                if entry.is_dir() {
+                    continue;
+                }
 
                 let filename = entry.file_name().and_then(|n| n.to_str()).unwrap_or("");
                 let hv = match HVFile::from_fileid(filename) {
                     Some(h) => h,
-                    None => { utils::remove_file(entry); continue; }
+                    None => {
+                        utils::remove_file(entry);
+                        continue;
+                    }
                 };
 
                 if !config.is_static_range(&hv.static_range()) {
@@ -276,7 +307,12 @@ impl CacheHandler {
                     continue;
                 }
                 if let Err(e) = fs::rename(entry, &target) {
-                    tracing::warn!("Failed to move {} to {}: {}", entry.display(), target.display(), e);
+                    tracing::warn!(
+                        "Failed to move {} to {}: {}",
+                        entry.display(),
+                        target.display(),
+                        e
+                    );
                 }
             }
         }
@@ -309,7 +345,10 @@ impl CacheHandler {
                 match key {
                     "cacheCount" => {
                         cache_count = value.parse().ok()?;
-                        tracing::debug!("CacheHandler: Loaded persistent cacheCount={}", cache_count);
+                        tracing::debug!(
+                            "CacheHandler: Loaded persistent cacheCount={}",
+                            cache_count
+                        );
                         info_checksum |= 1;
                     }
                     "cacheSize" => {
@@ -319,7 +358,10 @@ impl CacheHandler {
                     }
                     "lruClearPointer" => {
                         lru_clear_pointer = value.parse().ok()?;
-                        tracing::debug!("CacheHandler: Loaded persistent lruClearPointer={}", lru_clear_pointer);
+                        tracing::debug!(
+                            "CacheHandler: Loaded persistent lruClearPointer={}",
+                            lru_clear_pointer
+                        );
                         info_checksum |= 4;
                     }
                     "agesHash" => {
@@ -356,21 +398,27 @@ impl CacheHandler {
             match Self::read_persistent_object(&ages_path, &ages_hash) {
                 Ok(ages) => ages,
                 Err(e) => {
-                    tracing::warn!("CacheHandler: Failed to load pcache_ages: {}, forcing rescan", e);
+                    tracing::warn!(
+                        "CacheHandler: Failed to load pcache_ages: {}, forcing rescan",
+                        e
+                    );
                     return None;
                 }
             };
         tracing::info!("CacheHandler: Loaded static range ages");
 
         // Verify SHA-1 and deserialize pcache_lru
-        let lru_cache_table_vec: Vec<u16> =
-            match Self::read_persistent_object(&lru_path, &lru_hash) {
-                Ok(lru) => lru,
-                Err(e) => {
-                    tracing::warn!("CacheHandler: Failed to load pcache_lru: {}, forcing rescan", e);
-                    return None;
-                }
-            };
+        let lru_cache_table_vec: Vec<u16> = match Self::read_persistent_object(&lru_path, &lru_hash)
+        {
+            Ok(lru) => lru,
+            Err(e) => {
+                tracing::warn!(
+                    "CacheHandler: Failed to load pcache_lru: {}, forcing rescan",
+                    e
+                );
+                return None;
+            }
+        };
         tracing::info!("CacheHandler: Loaded LRU cache");
 
         Some(PersistentCacheState {
@@ -396,11 +444,7 @@ impl CacheHandler {
         }
 
         let data = fs::read(file).map_err(|e| {
-            HathError::Cache(format!(
-                "Failed to read file {}: {}",
-                file.display(),
-                e
-            ))
+            HathError::Cache(format!("Failed to read file {}: {}", file.display(), e))
         })?;
 
         let actual_hash = utils::sha1_bytes(&data);
@@ -414,11 +458,7 @@ impl CacheHandler {
         }
 
         bincode::deserialize(&data).map_err(|e| {
-            HathError::Cache(format!(
-                "Failed to deserialize {}: {}",
-                file.display(),
-                e
-            ))
+            HathError::Cache(format!("Failed to deserialize {}: {}", file.display(), e))
         })
     }
 
@@ -458,8 +498,7 @@ impl CacheHandler {
                     .map_err(|e| format!("Failed to serialize lru: {}", e))?;
                 (data, lru.lru_clear_pointer)
             };
-            fs::write(&lru_path, &lru_data)
-                .map_err(|e| format!("Failed to write lru: {}", e))?;
+            fs::write(&lru_path, &lru_data).map_err(|e| format!("Failed to write lru: {}", e))?;
             let lru_hash = utils::sha1_bytes(&lru_data);
 
             // 3. Write pcache_info (plain text key=value)
@@ -491,14 +530,20 @@ impl CacheHandler {
     /// Java: startupInitCache — returns LRU initialized with recently-accessed files
     /// (modified within 7 days) so that the first request for a recent file won't
     /// update its mtime unnecessarily.
-    fn full_rescan(config: &Config, stats: &Stats, verify_cache: bool) -> Result<(LruState, u32, u64, HashMap<String, u64>)> {
+    fn full_rescan(
+        config: &Config,
+        stats: &Stats,
+        verify_cache: bool,
+    ) -> Result<(LruState, u32, u64, HashMap<String, u64>)> {
         // Java: create a single MessageDigest + ByteBuffer and reuse across all files
         let mut hasher = Sha1::new();
         let mut read_buf = vec![0u8; 65536];
         let print_freq: u32 = if verify_cache { 1000 } else { 10000 };
 
         if verify_cache {
-            tracing::info!("CacheHandler: Loading cache with full file verification. Depending on the size of your cache, this can take a long time.");
+            tracing::info!(
+                "CacheHandler: Loading cache with full file verification. Depending on the size of your cache, this can take a long time."
+            );
         } else {
             tracing::info!("Loading cache...");
         }
@@ -511,26 +556,38 @@ impl CacheHandler {
         let recently_accessed_cutoff = utils::millis_now().saturating_sub(604_800_000);
 
         for l1_dir in &utils::list_sorted_files(&config.cache_dir) {
-            if !l1_dir.is_dir() { continue; }
+            if !l1_dir.is_dir() {
+                continue;
+            }
             let l1_name = l1_dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
             for l2_dir in &utils::list_sorted_files(l1_dir) {
-                if !l2_dir.is_dir() { continue; }
+                if !l2_dir.is_dir() {
+                    continue;
+                }
                 let l2_name = l2_dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
                 let static_range = format!("{}{}", l1_name, l2_name);
 
                 let files = utils::list_sorted_files(l2_dir);
-                if files.is_empty() { utils::remove_dir(l2_dir); continue; }
+                if files.is_empty() {
+                    utils::remove_dir(l2_dir);
+                    continue;
+                }
 
                 let mut oldest_modified = u64::MAX;
 
                 for file in &files {
-                    if !file.is_file() { continue; }
+                    if !file.is_file() {
+                        continue;
+                    }
 
                     let filename = file.file_name().and_then(|n| n.to_str()).unwrap_or("");
                     let hv = match HVFile::from_fileid(filename) {
                         Some(h) => h,
-                        None => { utils::remove_file(file); continue; }
+                        None => {
+                            utils::remove_file(file);
+                            continue;
+                        }
                     };
 
                     // Size validation (Java: HVFile.getHVFileFromFile checks this first)
@@ -551,7 +608,10 @@ impl CacheHandler {
                                 match f.read(&mut read_buf) {
                                     Ok(0) => break,
                                     Ok(n) => hasher.update(&read_buf[..n]),
-                                    Err(_) => { read_ok = false; break; }
+                                    Err(_) => {
+                                        read_ok = false;
+                                        break;
+                                    }
                                 }
                             }
                             if read_ok {
@@ -600,8 +660,12 @@ impl CacheHandler {
         stats.set_cache_count(count);
         stats.set_cache_size(Self::cache_size_with_overhead(size, count, config));
 
-        tracing::info!("Cache init complete: {} files, {} apparent bytes, {} estimated on disk",
-            count, size, Self::cache_size_with_overhead(size, count, config));
+        tracing::info!(
+            "Cache init complete: {} files, {} apparent bytes, {} estimated on disk",
+            count,
+            size,
+            Self::cache_size_with_overhead(size, count, config)
+        );
 
         Ok((lru, count, size, range_ages))
     }
@@ -639,7 +703,8 @@ impl CacheHandler {
                 self.cache_size.fetch_sub(hv.size as u64, Ordering::Relaxed);
                 let count = self.cache_count.load(Ordering::Relaxed);
                 self.stats.set_cache_count(count);
-                self.stats.set_cache_size(self.get_cache_size_with_overhead());
+                self.stats
+                    .set_cache_size(self.get_cache_size_with_overhead());
             }
         }
         Ok(())
@@ -675,10 +740,12 @@ impl CacheHandler {
     pub fn register_proxy_file(&self, hv_file: &HVFile) {
         // addFileToActiveCache
         self.cache_count.fetch_add(1, Ordering::Relaxed);
-        self.cache_size.fetch_add(hv_file.size as u64, Ordering::Relaxed);
+        self.cache_size
+            .fetch_add(hv_file.size as u64, Ordering::Relaxed);
         let count = self.cache_count.load(Ordering::Relaxed);
         self.stats.set_cache_count(count);
-        self.stats.set_cache_size(self.get_cache_size_with_overhead());
+        self.stats
+            .set_cache_size(self.get_cache_size_with_overhead());
 
         // markRecentlyAccessed with skipMetaUpdate=true
         if let Ok(mut lru) = self.lru.try_lock() {
@@ -725,7 +792,8 @@ impl CacheHandler {
             // the cache (with overhead) is larger than the limit
             bytes_to_free = want_free + cache_size_with_overhead - cache_limit;
             fast_delete = true;
-        } else if count > 0 && !range_ages.is_empty()
+        } else if count > 0
+            && !range_ages.is_empty()
             && cache_limit.saturating_sub(cache_size_with_overhead) < want_free
         {
             // there is less than 100 MiB available cache space
@@ -744,9 +812,11 @@ impl CacheHandler {
             .min_by_key(|(_, age)| **age)
         {
             Some((r, age)) => (r.clone(), *age),
-            None => return PruneAction::NoPrune {
-                frequency: prune_frequency(cache_limit, cache_size_with_overhead, want_free),
-            },
+            None => {
+                return PruneAction::NoPrune {
+                    frequency: prune_frequency(cache_limit, cache_size_with_overhead, want_free),
+                };
+            }
         };
 
         let now = SystemTime::now()
@@ -808,11 +878,14 @@ impl CacheHandler {
             }
         } // release range_ages lock
 
-        self.cache_count.fetch_sub(result.files_deleted as u32, Ordering::Relaxed);
-        self.cache_size.fetch_sub(result.bytes_deleted, Ordering::Relaxed);
+        self.cache_count
+            .fetch_sub(result.files_deleted as u32, Ordering::Relaxed);
+        self.cache_size
+            .fetch_sub(result.bytes_deleted, Ordering::Relaxed);
         let count = self.cache_count.load(Ordering::Relaxed);
         self.stats.set_cache_count(count);
-        self.stats.set_cache_size(self.get_cache_size_with_overhead());
+        self.stats
+            .set_cache_size(self.get_cache_size_with_overhead());
     }
 }
 
@@ -832,16 +905,20 @@ pub fn spawn_periodic_stats(
     stats: Arc<Stats>,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
-    tokio::spawn(crate::utils::tick_every(shutdown, Duration::from_secs(10), move || {
-        let cache = cache.clone();
-        let stats = stats.clone();
-        async move {
-            if let Ok(mut lru) = cache.lru.try_lock() {
-                lru.cycle();
+    tokio::spawn(crate::utils::tick_every(
+        shutdown,
+        Duration::from_secs(10),
+        move || {
+            let cache = cache.clone();
+            let stats = stats.clone();
+            async move {
+                if let Ok(mut lru) = cache.lru.try_lock() {
+                    lru.cycle();
+                }
+                stats.shift_bytes_sent_history();
             }
-            stats.shift_bytes_sent_history();
-        }
-    }));
+        },
+    ));
 }
 
 /// Synchronous initial blacklist fetch at startup.
@@ -866,20 +943,26 @@ pub fn spawn_blacklist_fetcher(
     cache: Arc<CacheHandler>,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
-    tokio::spawn(crate::utils::tick_every(shutdown, Duration::from_secs(21600), move || {
-        let rpc_client = rpc_client.clone();
-        let cache = cache.clone();
-        async move {
-            match rpc_client.get_blacklist(43200).await {
-                Ok(resp) if resp.status == crate::rpc::ResponseStatus::Ok => {
-                    for fileid in &resp.lines {
-                        let _ = cache.delete_file_from_cache(fileid);
+    tokio::spawn(crate::utils::tick_every(
+        shutdown,
+        Duration::from_secs(21600),
+        move || {
+            let rpc_client = rpc_client.clone();
+            let cache = cache.clone();
+            async move {
+                match rpc_client.get_blacklist(43200).await {
+                    Ok(resp) if resp.status == crate::rpc::ResponseStatus::Ok => {
+                        for fileid in &resp.lines {
+                            let _ = cache.delete_file_from_cache(fileid);
+                        }
+                    }
+                    _ => {
+                        tracing::warn!(
+                            "CacheHandler: Failed to retrieve file blacklist, will try again later."
+                        );
                     }
                 }
-                _ => {
-                    tracing::warn!("CacheHandler: Failed to retrieve file blacklist, will try again later.");
-                }
             }
-        }
-    }));
+        },
+    ));
 }

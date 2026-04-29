@@ -11,6 +11,7 @@ use clap::Parser;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::time::Duration;
 use tokio::sync::{Mutex, Notify};
 
 /// Main client entry point. Follows Java HentaiAtHomeClient.run() lifecycle.
@@ -36,12 +37,15 @@ pub async fn run() -> Result<()> {
 
     let shutdown = tokio_util::sync::CancellationToken::new();
 
-    // Handle Ctrl+C / SIGTERM for graceful shutdown (Java: ShutdownHook)
+    // Handle shutdown signals for graceful exit (Java: ShutdownHook).
+    // On Unix: SIGINT (Ctrl+C), SIGTERM (docker stop / systemctl stop), SIGQUIT.
+    // On Windows: ctrl_c() covers Ctrl+C, Ctrl+Break, and console close events.
+    // SIGTERM must be caught on Unix — docker stop sends SIGTERM, and without a
+    // handler the process is SIGKILL'd before persistent cache data can be saved.
     {
         let s = shutdown.clone();
         tokio::spawn(async move {
-            tokio::signal::ctrl_c().await.ok();
-            tracing::info!("Interrupt received, shutting down gracefully...");
+            shutdown_signal().await;
             s.cancel();
         });
     }
@@ -85,7 +89,11 @@ pub async fn run() -> Result<()> {
 
     // 7. Init cache
     let stats = Arc::new(Stats::new());
-    let cache = Arc::new(CacheHandler::new(config.clone(), stats.clone(), shutdown.clone())?);
+    let cache = Arc::new(CacheHandler::new(
+        config.clone(),
+        stats.clone(),
+        shutdown.clone(),
+    )?);
 
     // 8. Build AppState and spawn HTTP server
     let allow_connections = Arc::new(AtomicBool::new(false));
@@ -112,15 +120,15 @@ pub async fn run() -> Result<()> {
         last_overload_notification: Arc::new(Mutex::new(None)),
         do_cert_refresh: Arc::new(AtomicBool::new(false)),
         cert_refresh_notify: Arc::new(Notify::new()),
-        server_restart_token: Arc::new(ArcSwapOption::const_empty()),
+        server_shutdown_token: Arc::new(ArcSwapOption::const_empty()),
         server_terminated: Arc::new(AtomicBool::new(false)),
         proxy_client,
     };
 
-    let (ready_rx, restart_token) = server::spawn_server(app_state.clone(), shutdown.clone());
+    let (ready_rx, server_shutdown_token) = server::start_server(app_state.clone());
     app_state
-        .server_restart_token
-        .store(Some(Arc::new(restart_token)));
+        .server_shutdown_token
+        .store(Some(Arc::new(server_shutdown_token)));
 
     // Wait for server to bind before notifying the RPC server
     match ready_rx.await {
@@ -202,7 +210,11 @@ pub async fn run() -> Result<()> {
         cache::spawn_pruner(cache.clone(), config.clone(), shutdown.clone());
         cache::spawn_periodic_stats(cache.clone(), stats.clone(), shutdown.clone());
         server::spawn_flood_control_pruner(app_state.clone(), shutdown.clone());
-        rpc_client::spawn_still_alive_heartbeat(rpc_client.clone(), stats.clone(), shutdown.clone());
+        rpc_client::spawn_still_alive_heartbeat(
+            rpc_client.clone(),
+            stats.clone(),
+            shutdown.clone(),
+        );
         server::spawn_time_cert_check(config.clone(), app_state.clone(), shutdown.clone());
         rpc_client::spawn_rpc_failure_clearer(rpc_client.clone(), shutdown.clone());
         cache::spawn_blacklist_fetcher(rpc_client.clone(), cache.clone(), shutdown.clone());
@@ -212,13 +224,17 @@ pub async fn run() -> Result<()> {
     // Wait for shutdown signal
     shutdown.cancelled().await;
 
-    // Graceful shutdown (Java order: client_stop → drain connections → save data).
+    // Graceful shutdown (Java order: client_stop → stop listener → drain → save data).
     // Java: reportShutdown is only set after successful notifyStart().
     // Unlike allow_connections, it's never toggled during cert refresh.
     tracing::info!("Shutting down...");
     if report_shutdown.load(Ordering::Relaxed) {
-        rpc_client.client_stop().await.ok();
+        if let Err(e) = rpc_client.client_stop().await {
+            tracing::warn!("Failed to notify server about shutdown: {}", e);
+        }
     }
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    server::stop_server(&app_state).await;
     cache.save_persistent_data();
     {
         let cfg = config.load();
@@ -226,4 +242,27 @@ pub async fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Wait for any shutdown signal.
+/// Unix: SIGINT, SIGTERM, or SIGQUIT.
+/// Windows: Ctrl+C, Ctrl+Break, or console close (all via ctrl_c()).
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut sigterm =
+            signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
+        let mut sigquit = signal(SignalKind::quit()).expect("failed to register SIGQUIT handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => tracing::info!("SIGINT received, shutting down gracefully..."),
+            _ = sigterm.recv() => tracing::info!("SIGTERM received, shutting down gracefully..."),
+            _ = sigquit.recv() => tracing::info!("SIGQUIT received, shutting down gracefully..."),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await.ok();
+        tracing::info!("Interrupt received, shutting down gracefully...");
+    }
 }

@@ -38,9 +38,16 @@ impl Action {
     /// URL/add-based calls (still_alive, get_blacklist, srfetch, etc.) do
     /// not retry on KEY_EXPIRED.
     pub fn supports_key_expired_retry(self) -> bool {
-        matches!(self, Self::ClientLogin | Self::ClientSettings | Self::ClientStart
-            | Self::ClientSuspend | Self::ClientResume | Self::ClientStop
-            | Self::Overload)
+        matches!(
+            self,
+            Self::ClientLogin
+                | Self::ClientSettings
+                | Self::ClientStart
+                | Self::ClientSuspend
+                | Self::ClientResume
+                | Self::ClientStop
+                | Self::Overload
+        )
     }
 }
 
@@ -75,7 +82,11 @@ pub fn make_rpc_query(act: Action, add: &str, config: &Config) -> String {
     let act_str = act.to_string();
     let plain = format!(
         "hentai@home-{}-{}-{}-{}-{}",
-        act_str, add, config.client_id.0, corrected_time, config.client_key.as_str()
+        act_str,
+        add,
+        config.client_id.0,
+        corrected_time,
+        config.client_key.as_str()
     );
     let actkey = utils::sha1_string(&plain);
     format!(
@@ -85,7 +96,12 @@ pub fn make_rpc_query(act: Action, add: &str, config: &Config) -> String {
 }
 
 /// Build the full RPC URL for a given action.
-pub fn make_rpc_url(act: Action, add: &str, config: &Config, state: &crate::rpc_client::RpcState) -> Result<Url> {
+pub fn make_rpc_url(
+    act: Action,
+    add: &str,
+    config: &Config,
+    state: &crate::rpc_client::RpcState,
+) -> Result<Url> {
     let host = config.get_rpc_host(state);
     let query = make_rpc_query(act, add, config);
     let mut url = Url::parse("http://rpc.hentaiathome.net/")
@@ -110,7 +126,11 @@ pub fn make_rpc_url(act: Action, add: &str, config: &Config, state: &crate::rpc_
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub enum ResponseStatus { Ok, Fail, Null }
+pub enum ResponseStatus {
+    Ok,
+    Fail,
+    Null,
+}
 
 #[derive(Debug)]
 pub struct ServerResponse {
@@ -167,8 +187,13 @@ mod tests {
 
     fn test_config() -> Config {
         let args = CliArgs::try_parse_from([
-            "hath-rs", "--client-id", "12345", "--client-key", "abcde12345abcde12345",
-        ]).unwrap();
+            "hath-rs",
+            "--client-id",
+            "12345",
+            "--client-key",
+            "abcde12345abcde12345",
+        ])
+        .unwrap();
         Config::load(args).unwrap()
     }
 
@@ -196,11 +221,18 @@ mod tests {
         // ::ffff:192.0.2.1 normalizes to plain IPv4 192.0.2.1
         config.apply_setting("rpc_server_ip", "::ffff:192.0.2.1");
 
-        let url = make_rpc_url(Action::GetCertificate, "", &config, &crate::rpc_client::RpcState::default()).unwrap();
+        let url = make_rpc_url(
+            Action::GetCertificate,
+            "",
+            &config,
+            &crate::rpc_client::RpcState::default(),
+        )
+        .unwrap();
 
-        assert!(url
-            .as_str()
-            .starts_with("http://192.0.2.1/15/rpc?clientbuild=178&act=get_cert"));
+        assert!(
+            url.as_str()
+                .starts_with("http://192.0.2.1/15/rpc?clientbuild=178&act=get_cert")
+        );
     }
 
     #[test]
@@ -209,11 +241,18 @@ mod tests {
         config.apply_setting("rpc_server_ip", "192.0.2.1");
         config.apply_setting("rpc_server_port", "8080");
 
-        let url = make_rpc_url(Action::GetCertificate, "", &config, &crate::rpc_client::RpcState::default()).unwrap();
+        let url = make_rpc_url(
+            Action::GetCertificate,
+            "",
+            &config,
+            &crate::rpc_client::RpcState::default(),
+        )
+        .unwrap();
 
-        assert!(url
-            .as_str()
-            .starts_with("http://192.0.2.1:8080/15/rpc?clientbuild=178&act=get_cert"));
+        assert!(
+            url.as_str()
+                .starts_with("http://192.0.2.1:8080/15/rpc?clientbuild=178&act=get_cert")
+        );
     }
 
     #[test]

@@ -82,7 +82,10 @@ where
             .unwrap_or_else(|| "/".to_string());
         let version = format!("{:?}", req.version());
         let head_only = req.method() == hyper::Method::HEAD;
-        let prefix = access_log_prefix(self.conn_id, crate::utils::normalize_ip(self.remote_addr.ip()));
+        let prefix = access_log_prefix(
+            self.conn_id,
+            crate::utils::normalize_ip(self.remote_addr.ip()),
+        );
         let start = Instant::now();
         let fut = self.inner.call(req);
 

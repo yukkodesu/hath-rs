@@ -206,7 +206,13 @@ impl StreamingBody {
     fn finish(&mut self) {
         let completed = self.offset >= self.total_size;
         match &mut self.source {
-            DataSource::File { sha1, expected_hash, to_delete, cache_handler, .. } => {
+            DataSource::File {
+                sha1,
+                expected_hash,
+                to_delete,
+                cache_handler,
+                ..
+            } => {
                 // Java skips integrity verification if the remote client closes
                 // early, because the digest only covers bytes that were sent.
                 if !completed {
@@ -217,7 +223,9 @@ impl StreamingBody {
                     if actual != *expected_hash {
                         tracing::warn!(
                             "Corrupt file {:?} (expected {}, got {}); deleting from cache",
-                            path, expected_hash, actual
+                            path,
+                            expected_hash,
+                            actual
                         );
                         if let Some(ch) = cache_handler {
                             // Extract fileid from path
@@ -228,7 +236,9 @@ impl StreamingBody {
                     }
                 }
             }
-            DataSource::Proxy { body_done_notify, .. } => {
+            DataSource::Proxy {
+                body_done_notify, ..
+            } => {
                 body_done_notify.notify_one();
             }
             DataSource::Static { .. } | DataSource::Random => {}
@@ -282,8 +292,7 @@ impl Body for StreamingBody {
             //       while (nextReadThrehold > proxyDownloader.getCurrentWriteoff()) { sleep(10); }
             let need_wait = match &self.source {
                 DataSource::Proxy { write_offset, .. } => {
-                    let desired_end =
-                        (self.offset + TCP_PACKET_SIZE).min(self.total_size) as u64;
+                    let desired_end = (self.offset + TCP_PACKET_SIZE).min(self.total_size) as u64;
                     write_offset.load(Ordering::SeqCst) < desired_end
                 }
                 DataSource::Static { .. } | DataSource::File { .. } | DataSource::Random => false,
@@ -297,7 +306,11 @@ impl Body for StreamingBody {
             if need_wait {
                 // Check termination conditions first (short borrow on self.source).
                 let early_exit = match &self.source {
-                    DataSource::Proxy { download_done, start_time, .. } => {
+                    DataSource::Proxy {
+                        download_done,
+                        start_time,
+                        ..
+                    } => {
                         if download_done.load(Ordering::SeqCst) {
                             tracing::debug!(
                                 "ProxyStreamingBody: download done, terminating at offset {}",
@@ -355,7 +368,7 @@ impl Body for StreamingBody {
                 }));
                 continue;
             }
-            
+
             self.throttled = false;
 
             // Step 5: Produce the chunk.
@@ -401,7 +414,9 @@ impl Body for StreamingBody {
                         }
                     }
                 }
-                DataSource::Proxy { file, temp_file, .. } => {
+                DataSource::Proxy {
+                    file, temp_file, ..
+                } => {
                     let actual_size = end - offset;
                     let mut buf = BytesMut::zeroed(actual_size);
                     match file.read(&mut buf[..actual_size]) {
@@ -413,7 +428,8 @@ impl Body for StreamingBody {
                         Err(e) => {
                             tracing::warn!(
                                 "ProxyStreamingBody: read error at offset {}: {}",
-                                temp_file.display(), e
+                                temp_file.display(),
+                                e
                             );
                             ChunkResult::Done
                         }

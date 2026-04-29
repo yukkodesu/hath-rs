@@ -1,5 +1,5 @@
+use super::body::StreamingBody;
 use crate::bandwidth::BandwidthMonitor;
-use crate::body::StreamingBody;
 use crate::error::{HathError, Result};
 use crate::hvfile::HVFile;
 use bytes::Bytes;
@@ -12,6 +12,7 @@ use tokio::sync::Notify;
 /// Build a Hyper Response with proper headers.
 /// Java: Cache-Control + Content-Length only added when contentLength > 0.
 /// Server and Date headers are set at the Hyper service layer.
+#[allow(dead_code)]
 pub fn ok_response(body: Bytes, content_type: &str) -> Result<Response<StreamingBody>> {
     let len = body.len();
     let mut builder = Response::builder()
@@ -46,7 +47,10 @@ pub fn method_not_allowed_response() -> Result<Response<StreamingBody>> {
         .header(header::ALLOW, "GET, HEAD")
         .header(header::CONTENT_TYPE, "text/html; charset=iso-8859-1")
         .header(header::CONNECTION, "close")
-        .body(StreamingBody::new(Bytes::from_static(b"Method Not Allowed"), None))
+        .body(StreamingBody::new(
+            Bytes::from_static(b"Method Not Allowed"),
+            None,
+        ))
         .map_err(HathError::Http)
 }
 
@@ -62,7 +66,10 @@ pub fn text_response(status: StatusCode, text: &str) -> Result<Response<Streamin
             .header(header::CONTENT_LENGTH, len);
     }
     builder
-        .body(StreamingBody::new(Bytes::copy_from_slice(text.as_bytes()), None))
+        .body(StreamingBody::new(
+            Bytes::copy_from_slice(text.as_bytes()),
+            None,
+        ))
         .map_err(HathError::Http)
 }
 
@@ -158,7 +165,8 @@ pub fn proxy_response(
         body_done_notify,
         download_done,
         bwm,
-    ).map_err(HathError::Io)?;
+    )
+    .map_err(HathError::Io)?;
     builder.body(body).map_err(HathError::Http)
 }
 
@@ -178,13 +186,16 @@ pub fn file_response(
     // Open first, then stat via the open fd — one syscall, no TOCTOU window.
     let file = std::fs::File::open(&path)
         .map_err(|e| HathError::Cache(format!("cannot open {}: {}", path.display(), e)))?;
-    let actual_len = file.metadata()
+    let actual_len = file
+        .metadata()
         .map_err(|e| HathError::Cache(format!("cannot stat {}: {}", path.display(), e)))?
         .len() as usize;
     if actual_len != expected_size {
         return Err(HathError::Cache(format!(
             "file size mismatch for {}: expected {}, got {}",
-            hv_file.fileid(), expected_size, actual_len
+            hv_file.fileid(),
+            expected_size,
+            actual_len
         )));
     }
 

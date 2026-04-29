@@ -1,10 +1,10 @@
-use sha1::{Sha1, Digest};
-use std::net::IpAddr;
-use std::path::Path;
+use sha1::{Digest, Sha1};
 use std::fs;
 use std::io;
-use std::time::UNIX_EPOCH;
+use std::net::IpAddr;
+use std::path::Path;
 use std::time::Duration;
+use std::time::UNIX_EPOCH;
 use tracing;
 
 /// Normalize an IP address for comparison: maps IPv4-mapped IPv6 addresses
@@ -12,7 +12,10 @@ use tracing;
 /// `[::]` (dual-stack) and receives IPv4 connections as mapped addresses.
 pub fn normalize_ip(addr: IpAddr) -> IpAddr {
     match addr {
-        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6)),
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(v6)),
         v4 => v4,
     }
 }
@@ -41,7 +44,9 @@ pub fn sha1_bytes(data: &[u8]) -> String {
 pub fn hex_encode(data: &[u8]) -> String {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(data.len() * 2);
-    for b in data { write!(out, "{:02x}", b).unwrap(); }
+    for b in data {
+        write!(out, "{:02x}", b).unwrap();
+    }
     out
 }
 
@@ -51,17 +56,17 @@ pub fn hex_encode(data: &[u8]) -> String {
 #[derive(Debug, Default)]
 pub struct Additional {
     // /h/ file-serve keys
-    pub keystamp:  Option<String>,
+    pub keystamp: Option<String>,
     pub fileindex: Option<String>,
-    pub xres:      Option<String>,
+    pub xres: Option<String>,
     // servercmd/threaded_proxy_test keys
-    pub hostname:  Option<String>,
-    pub protocol:  Option<String>,
-    pub port:      Option<String>,
-    pub testsize:  Option<String>,
+    pub hostname: Option<String>,
+    pub protocol: Option<String>,
+    pub port: Option<String>,
+    pub testsize: Option<String>,
     pub testcount: Option<String>,
-    pub testtime:  Option<String>,
-    pub testkey:   Option<String>,
+    pub testtime: Option<String>,
+    pub testkey: Option<String>,
 }
 
 /// Parse semicolon-separated key=value pairs into an `Additional`.
@@ -76,16 +81,16 @@ pub fn parse_additional(additional: &str) -> Additional {
             if let Some((k, v)) = kv_pair.split_once('=') {
                 let v = v.trim().to_string();
                 match k.trim() {
-                    "keystamp"  => out.keystamp  = Some(v),
+                    "keystamp" => out.keystamp = Some(v),
                     "fileindex" => out.fileindex = Some(v),
-                    "xres"      => out.xres      = Some(v),
-                    "hostname"  => out.hostname  = Some(v),
-                    "protocol"  => out.protocol  = Some(v),
-                    "port"      => out.port      = Some(v),
-                    "testsize"  => out.testsize  = Some(v),
+                    "xres" => out.xres = Some(v),
+                    "hostname" => out.hostname = Some(v),
+                    "protocol" => out.protocol = Some(v),
+                    "port" => out.port = Some(v),
+                    "testsize" => out.testsize = Some(v),
                     "testcount" => out.testcount = Some(v),
-                    "testtime"  => out.testtime  = Some(v),
-                    "testkey"   => out.testkey   = Some(v),
+                    "testtime" => out.testtime = Some(v),
+                    "testkey" => out.testkey = Some(v),
                     _ => {}
                 }
             }
@@ -128,17 +133,19 @@ pub fn list_sorted_files(dir: &Path) -> Vec<std::path::PathBuf> {
 /// Remove a file, logging a warning on failure (never silently swallow).
 pub fn remove_file(path: &Path) {
     if let Err(e) = fs::remove_file(path)
-        && e.kind() != io::ErrorKind::NotFound {
-            tracing::warn!("Failed to remove file {}: {}", path.display(), e);
-        }
+        && e.kind() != io::ErrorKind::NotFound
+    {
+        tracing::warn!("Failed to remove file {}: {}", path.display(), e);
+    }
 }
 
 /// Remove a directory, logging a warning on failure.
 pub fn remove_dir(path: &Path) {
     if let Err(e) = fs::remove_dir(path)
-        && e.kind() != io::ErrorKind::NotFound {
-            tracing::warn!("Failed to remove dir {}: {}", path.display(), e);
-        }
+        && e.kind() != io::ErrorKind::NotFound
+    {
+        tracing::warn!("Failed to remove dir {}: {}", path.display(), e);
+    }
 }
 
 /// Get the last-modified timestamp of a file as milliseconds since Unix epoch.
@@ -159,8 +166,11 @@ pub fn millis_now() -> u64 {
 }
 
 /// Run `f` on each tick of an interval, until `shutdown` fires.
-pub async fn tick_every<F, Fut>(shutdown: tokio_util::sync::CancellationToken, every: Duration, mut f: F)
-where
+pub async fn tick_every<F, Fut>(
+    shutdown: tokio_util::sync::CancellationToken,
+    every: Duration,
+    mut f: F,
+) where
     F: FnMut() -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()> + Send,
 {

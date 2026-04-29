@@ -1,40 +1,43 @@
+mod access_log;
+mod body;
+mod request;
+mod response;
+mod tls;
+
+use self::access_log::AccessLogService;
+use self::body::StreamingBody;
+use self::request::RequestType;
+pub use self::tls::{spawn_cert_refresh_watcher, spawn_time_cert_check};
 use crate::bandwidth::BandwidthMonitor;
+use crate::cache::CacheHandler;
 use crate::config::Config;
 use crate::error::{HathError, Result};
-use crate::request::{self, RequestType};
-use crate::response;
-use crate::stats::Stats;
-use crate::cache::CacheHandler;
-use crate::access_log::AccessLogService;
-use crate::rpc_client::RpcClient;
-use crate::rpc::{self, Action};
-use crate::utils;
 use crate::proxy_downloader::ProxyFileDownloader;
+use crate::rpc;
+use crate::rpc_client::RpcClient;
+use crate::stats::Stats;
+use crate::utils;
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use hyper::body::Incoming;
+use hyper::header;
 use hyper::server::conn::http1;
 use hyper::service::Service;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
-use crate::body::StreamingBody;
-use hyper::header;
-use openssl::asn1::Asn1Time;
-use openssl::pkcs12::Pkcs12;
-use openssl::provider::Provider;
-use openssl::ssl::{SslAcceptor, SslContext, SslMethod, SslMode, SslOptions};
+use openssl::ssl::SslContext;
+use regex::Regex;
 use reqwest::Url;
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, Notify};
-use regex::Regex;
-use std::sync::LazyLock;
 
 /// Shared state accessible from all request handlers.
 #[derive(Clone)]
@@ -68,7 +71,7 @@ pub struct AppState {
     pub cert_refresh_notify: Arc<Notify>,
     /// Shutdown token for the currently-running server accept loop.
     /// Swapped during cert refresh to terminate the old listener and start a new one.
-    pub server_restart_token: Arc<ArcSwapOption<tokio_util::sync::CancellationToken>>,
+    pub server_shutdown_token: Arc<ArcSwapOption<tokio_util::sync::CancellationToken>>,
     /// Set to true by start_server() after the accept loop exits.
     /// The cert refresh watcher polls this to wait for the old server to terminate.
     pub server_terminated: Arc<AtomicBool>,
@@ -97,10 +100,14 @@ impl FloodControlEntry {
     /// Returns true if the connection should be allowed.
     pub fn hit(&mut self) -> bool {
         let now = Instant::now();
-        let elapsed_ms = now.checked_duration_since(self.last_connect)
+        let elapsed_ms = now
+            .checked_duration_since(self.last_connect)
             .unwrap_or_default()
             .as_millis() as u32;
-        self.connect_count = self.connect_count.saturating_sub(elapsed_ms / 1000).saturating_add(1);
+        self.connect_count = self
+            .connect_count
+            .saturating_sub(elapsed_ms / 1000)
+            .saturating_add(1);
         self.last_connect = now;
 
         if self.connect_count > 10 {
@@ -139,7 +146,8 @@ pub struct HathService {
 impl Service<Request<Incoming>> for HathService {
     type Response = Response<StreamingBody>;
     type Error = hyper::Error;
-    type Future = Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Self::Error>> + Send>>;
+    type Future =
+        Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Self::Error>> + Send>>;
 
     fn call(&self, req: Request<Incoming>) -> Self::Future {
         let state = self.state.clone();
@@ -154,9 +162,11 @@ impl Service<Request<Incoming>> for HathService {
 
             // Determine if this is a local/RPC connection (skip bandwidth throttling)
             let host_addr = client_ip.to_string().to_lowercase();
-            let is_local = LOCAL_NETWORK_RE.is_match(&host_addr)
-                || config.client_host == host_addr;
-            let is_rpc = config.rpc_servers.iter().any(|s| s.to_string().to_lowercase() == host_addr);
+            let is_local = LOCAL_NETWORK_RE.is_match(&host_addr) || config.client_host == host_addr;
+            let is_rpc = config
+                .rpc_servers
+                .iter()
+                .any(|s| s.to_string().to_lowercase() == host_addr);
 
             // Determine bandwidth monitor for this request.
             // Java: Only local connections skip throttling.
@@ -169,7 +179,10 @@ impl Service<Request<Incoming>> for HathService {
 
             let request_type = request::parse_request(
                 req.method().as_str(),
-                req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/"),
+                req.uri()
+                    .path_and_query()
+                    .map(|p| p.as_str())
+                    .unwrap_or("/"),
                 client_ip,
                 &config,
             );
@@ -178,13 +191,23 @@ impl Service<Request<Incoming>> for HathService {
             let bwm_for_header = bwm_for_request.clone();
 
             let mut resp = match request_type {
-                RequestType::FileServe { fileid, hv_file, additional, keystamp_valid, head_only } => {
+                RequestType::FileServe {
+                    fileid,
+                    hv_file,
+                    additional,
+                    keystamp_valid,
+                    head_only,
+                } => {
                     // Java validates fileindex/xres BEFORE cache hit check
                     // (line 194 in HTTPResponse.processRequest). Even a cached
                     // file with missing/invalid arguments returns 404.
-                    let fileindex_valid = additional.fileindex.as_deref()
+                    let fileindex_valid = additional
+                        .fileindex
+                        .as_deref()
                         .is_some_and(|v| v.parse::<u32>().is_ok());
-                    let xres_valid = additional.xres.as_deref()
+                    let xres_valid = additional
+                        .xres
+                        .as_deref()
                         .is_some_and(|v| v == "org" || v.parse::<u32>().is_ok());
 
                     if !keystamp_valid {
@@ -197,7 +220,8 @@ impl Service<Request<Incoming>> for HathService {
                         let xres = additional.xres.as_deref().unwrap();
                         let cache_path = hv.cache_path(&config.cache_dir);
                         let cache_hit = cache_path.exists()
-                            && cache_path.metadata()
+                            && cache_path
+                                .metadata()
                                 .map(|m| m.len() == hv.size as u64)
                                 .unwrap_or(false);
                         if cache_hit {
@@ -216,14 +240,23 @@ impl Service<Request<Incoming>> for HathService {
                                     && !config.disable_file_verification
                                     && !state.cache.is_file_verification_on_cooldown();
                                 response::file_response(
-                                    hv, &config.cache_dir, bwm_for_request,
-                                    verify, Some(state.cache.clone()),
+                                    hv,
+                                    &config.cache_dir,
+                                    bwm_for_request,
+                                    verify,
+                                    Some(state.cache.clone()),
                                 )
                             }
                         } else {
-                            match state.rpc_client.static_range_fetch(fileindex, xres, &fileid).await {
+                            match state
+                                .rpc_client
+                                .static_range_fetch(fileindex, xres, &fileid)
+                                .await
+                            {
                                 Ok(sr) if sr.status == crate::rpc::ResponseStatus::Ok => {
-                                    let sources: Vec<Url> = sr.lines.iter()
+                                    let sources: Vec<Url> = sr
+                                        .lines
+                                        .iter()
                                         .filter(|s| !s.is_empty())
                                         .filter_map(|s| Url::parse(s).ok())
                                         .collect();
@@ -234,7 +267,15 @@ impl Service<Request<Incoming>> for HathService {
                                         // initialize() for both GET and HEAD. The init result
                                         // (connecting to source, checking Content-Length/size)
                                         // determines the status code. HEAD then skips body.
-                                        match ProxyFileDownloader::new(&fileid, &sources, &config, Some(state.cache.clone()), &state.proxy_client).await {
+                                        match ProxyFileDownloader::new(
+                                            &fileid,
+                                            &sources,
+                                            &config,
+                                            Some(state.cache.clone()),
+                                            &state.proxy_client,
+                                        )
+                                        .await
+                                        {
                                             Ok(proxy) => {
                                                 let mime = hv.mime_type();
                                                 state.stats.record_file_sent();
@@ -247,7 +288,10 @@ impl Service<Request<Incoming>> for HathService {
                                                     // that the body side is done so it can finalize
                                                     // immediately instead of waiting 300s.
                                                     proxy.body_done_notify.notify_one();
-                                                    response::head_response(mime, proxy.total_size as usize)
+                                                    response::head_response(
+                                                        mime,
+                                                        proxy.total_size as usize,
+                                                    )
                                                 } else {
                                                     let total_size = proxy.total_size as usize;
                                                     let response = response::proxy_response(
@@ -272,8 +316,16 @@ impl Service<Request<Incoming>> for HathService {
                                                 }
                                             }
                                             Err(e) => {
-                                                tracing::warn!("Proxy download failed for {}: {}", fileid, e);
-                                                if let crate::error::HathError::ProxyDownloader { status, message } = e {
+                                                tracing::warn!(
+                                                    "Proxy download failed for {}: {}",
+                                                    fileid,
+                                                    e
+                                                );
+                                                if let crate::error::HathError::ProxyDownloader {
+                                                    status,
+                                                    message,
+                                                } = e
+                                                {
                                                     response::text_response(
                                                         hyper::StatusCode::from_u16(status).unwrap_or(hyper::StatusCode::INTERNAL_SERVER_ERROR),
                                                         &message,
@@ -294,21 +346,34 @@ impl Service<Request<Incoming>> for HathService {
                         }
                     }
                 }
-                RequestType::ServerCommand { command, additional, valid } => {
+                RequestType::ServerCommand {
+                    command,
+                    additional,
+                    valid,
+                } => {
                     if valid {
                         handle_server_command(&command, &additional, &state, bwm_for_request).await
                     } else {
                         response::forbidden_response()
                     }
                 }
-                RequestType::SpeedTest { testsize, valid, forbidden, head_only, .. } => {
+                RequestType::SpeedTest {
+                    testsize,
+                    valid,
+                    forbidden,
+                    head_only,
+                    ..
+                } => {
                     if valid {
                         if !head_only && !is_local && !is_rpc {
                             state.stats.record_bytes_sent(testsize as u64);
                         }
                         if head_only {
                             // Java: speedtest inherits CONTENT_TYPE_DEFAULT = text/html
-                            response::head_response("text/html; charset=iso-8859-1", testsize as usize)
+                            response::head_response(
+                                "text/html; charset=iso-8859-1",
+                                testsize as usize,
+                            )
                         } else {
                             response::speedtest_response(testsize as usize, bwm_for_request)
                         }
@@ -320,7 +385,9 @@ impl Service<Request<Incoming>> for HathService {
                         response::bad_request_response()
                     }
                 }
-                RequestType::Favicon => response::redirect_response("https://e-hentai.org/favicon.ico"),
+                RequestType::Favicon => {
+                    response::redirect_response("https://e-hentai.org/favicon.ico")
+                }
                 RequestType::Robots => response::robots_response(),
                 RequestType::BadRequest => response::bad_request_response(),
                 RequestType::MethodNotAllowed => response::method_not_allowed_response(),
@@ -333,10 +400,14 @@ impl Service<Request<Incoming>> for HathService {
             if let Ok(ref mut r) = resp {
                 r.headers_mut().insert(
                     header::SERVER,
-                    header::HeaderValue::from_static("Genetic Lifeform and Distributed Open Server 1.6.5")
+                    header::HeaderValue::from_static(
+                        "Genetic Lifeform and Distributed Open Server 1.6.5",
+                    ),
                 );
                 // Add Date header
-                let date = chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+                let date = chrono::Utc::now()
+                    .format("%a, %d %b %Y %H:%M:%S GMT")
+                    .to_string();
                 if let Ok(v) = header::HeaderValue::from_str(&date) {
                     r.headers_mut().insert(header::DATE, v);
                 }
@@ -346,16 +417,19 @@ impl Service<Request<Incoming>> for HathService {
             // Java: bwm.waitForQuota(myThread, headerBytes.length) where headerBytes
             // is the full serialized HTTP response header.
             if let Some(ref bwm) = bwm_for_header
-                && let Ok(ref r) = resp {
-                    let reason_len = r.status().canonical_reason().map_or(0, |s| s.len());
-                    // Status line: "HTTP/1.1 XXX reason\r\n"
-                    let status_line_len = 13 + reason_len; // "HTTP/1.1 " + "XXX " + reason + "\r\n"
-                    let headers_len: usize = r.headers().iter()
-                        .map(|(k, v)| k.as_str().len() + 2 + v.as_bytes().len() + 2) // "Key: Value\r\n"
-                        .sum();
-                    let total_header_bytes = status_line_len + headers_len + 2; // + trailing \r\n
-                    bwm.wait_for_quota(total_header_bytes).await;
-                }
+                && let Ok(ref r) = resp
+            {
+                let reason_len = r.status().canonical_reason().map_or(0, |s| s.len());
+                // Status line: "HTTP/1.1 XXX reason\r\n"
+                let status_line_len = 13 + reason_len; // "HTTP/1.1 " + "XXX " + reason + "\r\n"
+                let headers_len: usize = r
+                    .headers()
+                    .iter()
+                    .map(|(k, v)| k.as_str().len() + 2 + v.as_bytes().len() + 2) // "Key: Value\r\n"
+                    .sum();
+                let total_header_bytes = status_line_len + headers_len + 2; // + trailing \r\n
+                bwm.wait_for_quota(total_header_bytes).await;
+            }
 
             match resp {
                 Ok(r) => Ok(r),
@@ -363,7 +437,10 @@ impl Service<Request<Incoming>> for HathService {
                     tracing::error!("Error building response: {}", e);
                     Ok(Response::builder()
                         .status(500)
-                        .body(StreamingBody::new(bytes::Bytes::from_static(b"Internal Server Error"), None))
+                        .body(StreamingBody::new(
+                            bytes::Bytes::from_static(b"Internal Server Error"),
+                            None,
+                        ))
                         .unwrap())
                 }
             }
@@ -406,9 +483,10 @@ async fn handle_server_command(
     bwm: Option<Arc<BandwidthMonitor>>,
 ) -> crate::error::Result<Response<StreamingBody>> {
     match command.to_lowercase().as_str() {
-        "still_alive" => {
-            response::text_response(hyper::StatusCode::OK, "I feel FANTASTIC and I'm still alive")
-        }
+        "still_alive" => response::text_response(
+            hyper::StatusCode::OK,
+            "I feel FANTASTIC and I'm still alive",
+        ),
         "threaded_proxy_test" => {
             // Java: Integer.parseInt on missing/illegal params throws NFE,
             // caught by processRemoteAPICommand → returns "INVALID_COMMAND".
@@ -423,19 +501,33 @@ async fn handle_server_command(
 
             tracing::debug!(
                 "Running speedtest against hostname={} protocol={} port={} testsize={} testcount={} testtime={} testkey={}",
-                hostname, protocol, port, testsize, testcount, testtime, testkey
+                hostname,
+                protocol,
+                port,
+                testsize,
+                testcount,
+                testtime,
+                testkey
             );
 
             let result = run_threaded_proxy_test(
                 hostname, protocol, port, testsize, testcount, testtime, testkey,
-            ).await;
+            )
+            .await;
 
             tracing::debug!(
                 "Ran speedtest against hostname={} testsize={} testcount={}, reporting successfulTests={} totalTimeMillis={}",
-                hostname, testsize, testcount, result.0, result.1
+                hostname,
+                testsize,
+                testcount,
+                result.0,
+                result.1
             );
 
-            response::text_response(hyper::StatusCode::OK, &format!("OK:{}-{}", result.0, result.1))
+            response::text_response(
+                hyper::StatusCode::OK,
+                &format!("OK:{}-{}", result.0, result.1),
+            )
         }
         "speed_test" => {
             // Java: additional is parsed as key=value pairs via Tools.parseAdditional();
@@ -451,9 +543,9 @@ async fn handle_server_command(
                     // Recreate bandwidth monitor if throttle_bytes changed
                     let cfg = state.config.load_full();
                     if cfg.throttle_bytes > 0 && !cfg.disable_bwm {
-                        state.bandwidth_monitor.store(Some(Arc::new(
-                            BandwidthMonitor::new(cfg.throttle_bytes)
-                        )));
+                        state
+                            .bandwidth_monitor
+                            .store(Some(Arc::new(BandwidthMonitor::new(cfg.throttle_bytes))));
                     } else {
                         state.bandwidth_monitor.store(None);
                     }
@@ -462,9 +554,7 @@ async fn handle_server_command(
                 _ => response::text_response(hyper::StatusCode::OK, ""),
             }
         }
-        "start_downloader" => {
-            response::text_response(hyper::StatusCode::OK, "")
-        }
+        "start_downloader" => response::text_response(hyper::StatusCode::OK, ""),
         "refresh_certs" => {
             // Java: client.setCertRefresh() — just set the flag, main loop does
             // the actual work (suspend → shutdown → restart → resume).
@@ -516,16 +606,16 @@ async fn run_threaded_proxy_test(
             let start = Instant::now();
             // Java: FileDownloader(source, 10000, 60000, true) — 10s connect, 60s total.
             // testtime only affects the /t URL and key, not the timeout.
-            let result = timeout(
-                Duration::from_secs(60),
-                async {
-                    let resp = client.get(url).send().await.map_err(|_| ())?;
-                    let len = resp.content_length().unwrap_or(0);
-                    if len < testsize { return Err(()); }
-                    resp.bytes().await.map_err(|_| ())?;
-                    Ok(())
-                },
-            ).await;
+            let result = timeout(Duration::from_secs(60), async {
+                let resp = client.get(url).send().await.map_err(|_| ())?;
+                let len = resp.content_length().unwrap_or(0);
+                if len < testsize {
+                    return Err(());
+                }
+                resp.bytes().await.map_err(|_| ())?;
+                Ok(())
+            })
+            .await;
 
             match result {
                 Ok(Ok(())) => Some(start.elapsed().as_millis() as u64),
@@ -576,313 +666,85 @@ fn build_threaded_proxy_test_url(
     Ok(url)
 }
 
-/// Build an OpenSSL SslContext from the PKCS12 certificate.
-/// Uses OpenSSL for both PKCS12 parsing and TLS context building.
-/// If `force_download` is true, always re-download the cert from the RPC server.
-/// Returns (context, cert_expiry_unix_seconds).
-async fn build_tls_acceptor(config: &Config, force_download: bool) -> Result<(SslContext, i64)> {
-    let cert_path = config.data_dir.join("hathcert.p12");
-
-    if force_download || !cert_path.exists() {
-        let cert_url = rpc::make_rpc_url(Action::GetCertificate, "", config, &crate::rpc_client::RpcState::default())?;
-        let downloader = crate::downloader::FileDownloader::new(
-            cert_url, 10000, 300000,
-            crate::downloader::DownloadMode::File(cert_path.clone()),
-            false,
-        );
-        downloader.download().await?;
-    }
-
-    let cert_data = std::fs::read(&cert_path)?;
-    let pkcs12 = Pkcs12::from_der(&cert_data)?;
-    // OpenSSL 3.x disables legacy algorithms (including RC2-40-CBC used by
-    // the H@H server's PKCS12 certificate bags) unless the legacy provider is
-    // explicitly loaded. retain_fallbacks=true keeps the default provider active.
-    let _legacy = Provider::try_load(None, "legacy", true)?;
-    let pkcs12 = pkcs12.parse2(config.client_key.as_str())?;
-
-    let cert = pkcs12.cert.as_ref()
-        .ok_or_else(|| HathError::Tls("no certificate in PKCS12".into()))?;
-    let key = pkcs12.pkey.as_ref()
-        .ok_or_else(|| HathError::Tls("no private key in PKCS12".into()))?;
-
-    // Java: isCertExpired() — cert must not expire within the next 24 hours
-    let one_day_from_now = Asn1Time::days_from_now(1)?;
-    let not_after = cert.not_after();
-    if not_after.compare(&one_day_from_now)? == std::cmp::Ordering::Less {
-        tracing::error!(
-            "The retrieved certificate is expired, or the system time is off by more than a day. \
-             Correct the system time and try again."
-        );
-        return Err(HathError::CertExpired);
-    }
-
-    // Compute cert expiry as a Unix timestamp for periodic checks.
-    // ASN1_TIME_diff(from, to) returns to-from, so now.diff(not_after) gives
-    // the remaining seconds until expiry (positive while cert is still valid).
-    let now_asn1 = Asn1Time::days_from_now(0)?;
-    let diff = now_asn1.diff(not_after)?;
-    let now_unix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
-    let cert_expiry_unix = now_unix + diff.days as i64 * 86400 + diff.secs as i64;
-
-    // Build OpenSSL SslContext for server-side TLS.
-    // Use SslAcceptor as base to get proper server defaults (AUTO_RETRY, bug
-    // workarounds via SslOptions::ALL, DH params, etc.) that a raw
-    // SslContext::builder does not set. This matches how Java's SSLContext
-    // initialises its server socket with JVM-managed defaults.
-    let mut ctx_builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls_server())
-        .map_err(|e| HathError::Tls(format!("Failed to create SslAcceptorBuilder: {}", e)))?;
-
-    // Match Java: setEnabledProtocols("TLSv1.3", "TLSv1.2")
-    ctx_builder
-        .set_min_proto_version(Some(openssl::ssl::SslVersion::TLS1_2))
-        .map_err(|e| HathError::Tls(format!("Failed to set min protocol: {}", e)))?;
-
-    // Ensure AUTO_RETRY and write-buffer modes are set (included in mozilla_intermediate_v5
-    // via the internal ctx() helper, but set explicitly for clarity).
-    ctx_builder.set_mode(
-        SslMode::AUTO_RETRY | SslMode::ACCEPT_MOVING_WRITE_BUFFER | SslMode::ENABLE_PARTIAL_WRITE,
-    );
-
-    // Additional compatibility options on top of SslOptions::ALL already set by the builder.
-    ctx_builder.set_options(SslOptions::NO_SSLV2 | SslOptions::NO_SSLV3);
-
-    ctx_builder
-        .set_certificate(cert)
-        .map_err(|e| HathError::Tls(format!("Failed to set certificate: {}", e)))?;
-    ctx_builder
-        .set_private_key(key)
-        .map_err(|e| HathError::Tls(format!("Failed to set private key: {}", e)))?;
-    ctx_builder
-        .check_private_key()
-        .map_err(|e| HathError::Tls(format!("Certificate/key mismatch: {}", e)))?;
-    if let Some(chain) = pkcs12.ca {
-        for ca in chain {
-            ctx_builder
-                .add_extra_chain_cert(ca)
-                .map_err(|e| HathError::Tls(format!("Failed to add chain cert: {}", e)))?;
-        }
-    }
-    let ctx = ctx_builder.build().into_context();
-    Ok((ctx, cert_expiry_unix))
-}
-
-/// Spawn the HTTP server. Returns a oneshot receiver that fires when
-/// the server binds, and the restart token (to store in AppState).
-pub fn spawn_server(
+/// Start one HTTP server generation. Returns a oneshot receiver that fires when
+/// the server binds, and the generation shutdown token (to store in AppState).
+pub fn start_server(
     state: AppState,
-    shutdown: tokio_util::sync::CancellationToken,
 ) -> (
     tokio::sync::oneshot::Receiver<std::result::Result<u16, String>>,
     tokio_util::sync::CancellationToken,
 ) {
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-    let restart_token = tokio_util::sync::CancellationToken::new();
-    let restart_clone = restart_token.clone();
-    let shutdown_clone = shutdown.clone();
+    let server_shutdown_token = tokio_util::sync::CancellationToken::new();
+    let server_shutdown = server_shutdown_token.clone();
+    state.server_terminated.store(false, Ordering::Release);
     tokio::spawn(async move {
-        if let Err(e) = start_server(state, shutdown_clone, restart_clone, Some(ready_tx)).await {
+        if let Err(e) = run_server(state, server_shutdown, Some(ready_tx)).await {
             tracing::error!("Server error: {}", e);
         }
     });
-    (ready_rx, restart_token)
+    (ready_rx, server_shutdown_token)
 }
 
-/// Spawn the certificate refresh watcher.
-/// Watches for refresh_certs RPC commands and performs a full server restart
-/// (suspend → reject new connections → drain → shutdown old listener → restart → resume).
-pub fn spawn_cert_refresh_watcher(
-    state: AppState,
-    rpc_client: Arc<RpcClient>,
-    shutdown: tokio_util::sync::CancellationToken,
-) {
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = state.cert_refresh_notify.notified() => {},
-                _ = shutdown.cancelled() => break,
-            }
-            if !state.do_cert_refresh.load(Ordering::Acquire) {
-                continue;
-            }
-            tracing::info!("Starting certificate refresh (full server restart)...");
+/// Stop the current HTTP server generation and drain in-flight requests.
+///
+/// RPC lifecycle actions such as client_stop/client_suspend are intentionally
+/// handled by callers. This helper only quiesces the local HTTP server.
+pub async fn stop_server(state: &AppState) {
+    state
+        .allow_normal_connections
+        .store(false, Ordering::SeqCst);
 
-            // 1. Suspend traffic
-            match rpc_client.client_suspend().await {
-                Ok(resp) if resp.status == rpc::ResponseStatus::Ok => {
-                    tracing::info!("Suspend notification successful");
-                }
-                _ => {
-                    tracing::warn!(
-                        "Failed to contact server to suspend client traffic; will retry"
-                    );
-                    tokio::time::sleep(Duration::from_secs(10)).await;
-                    state.cert_refresh_notify.notify_one();
-                    continue;
-                }
-            }
+    if let Some(token) = state.server_shutdown_token.load_full() {
+        token.cancel();
+    }
 
-            // 2. Stop accepting new connections
-            state.allow_normal_connections.store(false, Ordering::SeqCst);
-
-            // 3. Wait for in-flight requests to drain (Java: up to ~25s)
-            for _ in 0..5 {
-                let active = state.active_connections.load(Ordering::Relaxed);
-                if active == 0 { break; }
-                tracing::info!("Waiting for {} active request(s) to finish...", active);
-                tokio::time::sleep(Duration::from_secs(5)).await;
-            }
-
-            // 4. Reset terminated flag, then cancel restart token to stop old accept loop
-            state.server_terminated.store(false, Ordering::Release);
-            if let Some(token) = state.server_restart_token.load_full() {
-                token.cancel();
-            }
-
-            // 5. Wait for old server to terminate (Java: up to 300s)
-            let mut wait_cycles = 0u32;
-            loop {
-                if state.server_terminated.load(Ordering::Acquire) {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                wait_cycles += 1;
-                if wait_cycles >= 60 {
-                    tracing::warn!(
-                        "Server did not terminate after 300s, forcing restart"
-                    );
-                    break;
-                }
-                if wait_cycles > 1 {
-                    tracing::info!(
-                        "Waiting for HTTPServer to fully terminate... (waited {} seconds)",
-                        wait_cycles * 5
-                    );
-                }
-            }
-
-            // 6. Wait 1s
-            tokio::time::sleep(Duration::from_secs(1)).await;
-
-            // 7. Restart server with new restart token
-            let new_restart = tokio_util::sync::CancellationToken::new();
-            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-            let server_state = state.clone();
-            let new_restart_clone = new_restart.clone();
-            let global_shutdown_clone = shutdown.clone();
-            tokio::spawn(async move {
-                if let Err(e) = start_server(
-                    server_state,
-                    global_shutdown_clone,
-                    new_restart_clone,
-                    Some(ready_tx),
-                )
-                .await
-                {
-                    tracing::error!("Server restart error: {}", e);
-                }
-            });
-            state
-                .server_restart_token
-                .store(Some(Arc::new(new_restart)));
-
-            // 8. Wait for new server to bind
-            match ready_rx.await {
-                Ok(Ok(port)) => {
-                    tracing::info!(
-                        "Server restarted successfully on port {}", port
-                    );
-                }
-                Ok(Err(e)) => {
-                    tracing::error!("Server restart failed to bind: {}", e);
-                    shutdown.cancel();
-                    break;
-                }
-                Err(_) => {
-                    tracing::error!(
-                        "Server restart failed unexpectedly (oneshot dropped)"
-                    );
-                    shutdown.cancel();
-                    break;
-                }
-            }
-
-            // 9. Re-allow connections
-            state.allow_normal_connections.store(true, Ordering::SeqCst);
-
-            // 10. Resume traffic
-            match rpc_client.still_alive(true).await {
-                Ok(resp) if resp.status == rpc::ResponseStatus::Ok => {
-                    tracing::info!("Resume notification successful");
-                }
-                Ok(resp) => {
-                    let code = resp.fail_code.unwrap_or_default();
-                    // Java: TERM_BAD_NETWORK → dieWithError (terminate client)
-                    if code.starts_with("TERM_BAD_NETWORK") {
-                        tracing::error!(
-                            "Client is shutting down since the network is misconfigured; \
-                             correct firewall/forwarding settings then restart the client."
-                        );
-                        shutdown.cancel();
-                        break;
-                    } else {
-                        tracing::warn!("Failed stillAlive test: ({}) - will retry later", code);
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("Still-alive request failed: {}", e);
-                }
-            }
-
-            state.do_cert_refresh.store(false, Ordering::Release);
-            tracing::info!("Certificate refresh completed successfully");
+    for close_wait_cycles in 1..25 {
+        let active = state.active_connections.load(Ordering::Relaxed);
+        if active == 0 {
+            break;
         }
-    });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        if close_wait_cycles % 5 == 0 {
+            let remaining = 25 - close_wait_cycles;
+            tracing::info!(
+                "Waiting for {} request(s) to finish; will wait for another {} seconds",
+                active,
+                remaining
+            );
+        }
+    }
+
+    let mut wait_cycles = 0u32;
+    loop {
+        if state.server_terminated.load(Ordering::Acquire) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        wait_cycles += 1;
+        if wait_cycles >= 60 {
+            tracing::warn!("Server did not terminate after 300s");
+            break;
+        }
+        if wait_cycles > 1 {
+            tracing::info!(
+                "Waiting for HTTPServer to fully terminate... (waited {} seconds)",
+                wait_cycles * 5
+            );
+        }
+    }
 }
 
 /// Spawn periodic flood control pruning (60s interval).
-pub fn spawn_flood_control_pruner(
-    state: AppState,
-    shutdown: tokio_util::sync::CancellationToken,
-) {
-    tokio::spawn(crate::utils::tick_every(shutdown, Duration::from_secs(60), move || {
-        let state = state.clone();
-        async move { prune_flood_control(&state).await }
-    }));
-}
-
-/// Spawn periodic time check + cert expiry check (5min interval).
-/// If time drift >24h or cert expires within 24h, triggers global shutdown.
-pub fn spawn_time_cert_check(
-    config: Arc<ArcSwap<Config>>,
-    state: AppState,
-    shutdown: tokio_util::sync::CancellationToken,
-) {
-    let global_shutdown = shutdown.clone();
-    tokio::spawn(crate::utils::tick_every(shutdown, Duration::from_secs(300), move || {
-        let config = config.clone();
-        let state = state.clone();
-        let shutdown_signal = global_shutdown.clone();
-        async move {
-            if config.load().server_time_delta.abs() > 86400 {
-                tracing::warn!("System time off by >24h. Correct your system clock.");
-            }
-            if let Some(expiry) = *state.cert_expiry.lock().await {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs() as i64;
-                if expiry - now < 86400 {
-                    tracing::error!(
-                        "Either the system clock is significantly wrong, or something has \
-                         gone wrong with certificate renewal. Check your system clock and \
-                         internet connection, then restart the client manually."
-                    );
-                    shutdown_signal.cancel();
-                }
-            }
-        }
-    }));
+pub fn spawn_flood_control_pruner(state: AppState, shutdown: tokio_util::sync::CancellationToken) {
+    tokio::spawn(crate::utils::tick_every(
+        shutdown,
+        Duration::from_secs(60),
+        move || {
+            let state = state.clone();
+            async move { prune_flood_control(&state).await }
+        },
+    ));
 }
 
 /// Prune stale flood control entries. Called periodically from main loop.
@@ -898,19 +760,18 @@ pub async fn nuke_old_connections(_state: &AppState) {
     // We rely on Hyper's built-in timeouts instead of Java's manual nuke.
 }
 
-/// Start the TLS HTTP server. Sends readiness via `ready_tx` after successful bind.
-/// Listens for both `shutdown` (global/Ctrl+C) and `restart` (cert refresh).
-pub async fn start_server(
+/// Run one TLS HTTP server generation. Sends readiness via `ready_tx` after successful bind.
+/// The generation stops only when its server shutdown token is cancelled.
+async fn run_server(
     state: AppState,
-    shutdown: tokio_util::sync::CancellationToken,
-    restart: tokio_util::sync::CancellationToken,
+    server_shutdown: tokio_util::sync::CancellationToken,
     ready_tx: Option<tokio::sync::oneshot::Sender<std::result::Result<u16, String>>>,
 ) -> Result<()> {
     let config = state.config.load_full();
 
     // Build TLS acceptor (downloads cert if needed)
     // Java: always re-downloads the certificate on startup.
-    let (tls_acceptor, cert_expiry) = match build_tls_acceptor(&config, true).await {
+    let (tls_acceptor, cert_expiry) = match tls::build_tls_acceptor(&config, true).await {
         Ok((a, expiry)) => (a, expiry),
         Err(e) => {
             if let Some(tx) = ready_tx {
@@ -923,9 +784,9 @@ pub async fn start_server(
     // Create bandwidth monitor if throttling is enabled and not disabled.
     // Explicitly clear on server restart so cert refresh doesn't leak old monitor.
     if config.throttle_bytes > 0 && !config.disable_bwm {
-        state.bandwidth_monitor.store(Some(Arc::new(
-            BandwidthMonitor::new(config.throttle_bytes)
-        )));
+        state
+            .bandwidth_monitor
+            .store(Some(Arc::new(BandwidthMonitor::new(config.throttle_bytes))));
     } else {
         state.bandwidth_monitor.store(None);
     }
@@ -954,8 +815,7 @@ pub async fn start_server(
 
     loop {
         tokio::select! {
-            _ = shutdown.cancelled() => break,
-            _ = restart.cancelled() => break,
+            _ = server_shutdown.cancelled() => break,
             result = listener.accept() => {
                 let (stream, remote_addr) = match result {
                     Ok(c) => c,

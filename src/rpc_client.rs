@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::error::{HathError, Result};
-use crate::rpc::{self, ServerResponse, ResponseStatus, Action};
+use crate::rpc::{self, Action, ResponseStatus, ServerResponse};
 use crate::stats::Stats;
 use arc_swap::ArcSwap;
 use reqwest::Client;
@@ -38,7 +38,11 @@ impl RpcClient {
             .read_timeout(Duration::from_secs(30))
             .build()
             .map_err(|e| HathError::Network(e.to_string()))?;
-        Ok(Self { http, config, state: Mutex::new(RpcState::default()) })
+        Ok(Self {
+            http,
+            config,
+            state: Mutex::new(RpcState::default()),
+        })
     }
 
     /// Execute an RPC call and return the parsed response.
@@ -54,7 +58,9 @@ impl RpcClient {
             {
                 let mut state = self.state.lock().unwrap();
                 if let Some(ref current) = state.rpc_current {
-                    let still_valid = cfg.rpc_servers.iter()
+                    let still_valid = cfg
+                        .rpc_servers
+                        .iter()
                         .any(|s| s.to_string().to_lowercase() == *current);
                     if !still_valid {
                         state.rpc_current = None;
@@ -65,9 +71,12 @@ impl RpcClient {
             let host = url.host_str().unwrap_or("unknown").to_string();
 
             // Java: http.keepAlive=false → Connection: close on every request
-            let resp = self.http.get(url.clone())
+            let resp = self
+                .http
+                .get(url.clone())
                 .header("Connection", "close")
-                .send().await;
+                .send()
+                .await;
             let body = match resp {
                 Ok(r) => r.text().await,
                 Err(e) => Err(e),
@@ -89,7 +98,11 @@ impl RpcClient {
                 && act.supports_key_expired_retry()
             {
                 key_expired_retries += 1;
-                tracing::info!("KEY_EXPIRED received, refreshing server stat and retrying ({}/{})...", key_expired_retries, 2);
+                tracing::info!(
+                    "KEY_EXPIRED received, refreshing server stat and retrying ({}/{})...",
+                    key_expired_retries,
+                    2
+                );
                 match self.call_stat_inner().await {
                     Ok(stat_resp) if stat_resp.status == ResponseStatus::Ok => {
                         crate::config::Config::apply_server_response(&self.config, &stat_resp);
@@ -119,9 +132,12 @@ impl RpcClient {
         let cfg = self.config.load();
         let url = rpc::make_rpc_url(Action::ServerStat, "", &cfg, &self.state.lock().unwrap())?;
         let host = url.host_str().unwrap_or("unknown").to_string();
-        let resp = self.http.get(url.clone())
+        let resp = self
+            .http
+            .get(url.clone())
             .header("Connection", "close")
-            .send().await;
+            .send()
+            .await;
         let body = match resp {
             Ok(r) => r.text().await,
             Err(e) => Err(e),
@@ -179,7 +195,8 @@ impl RpcClient {
 
     /// Get blacklisted files since `deltatime` seconds ago.
     pub async fn get_blacklist(&self, deltatime: u64) -> Result<ServerResponse> {
-        self.call(Action::GetBlacklist, &deltatime.to_string()).await
+        self.call(Action::GetBlacklist, &deltatime.to_string())
+            .await
     }
 
     /// Notify server of overload.
@@ -188,7 +205,12 @@ impl RpcClient {
     }
 
     /// Fetch download URLs for a static range file.
-    pub async fn static_range_fetch(&self, fileindex: &str, xres: &str, fileid: &str) -> Result<ServerResponse> {
+    pub async fn static_range_fetch(
+        &self,
+        fileindex: &str,
+        xres: &str,
+        fileid: &str,
+    ) -> Result<ServerResponse> {
         let add = format!("{};{};{}", fileindex, xres, fileid);
         self.call(Action::StaticRangeFetch, &add).await
     }
@@ -200,34 +222,38 @@ pub fn spawn_still_alive_heartbeat(
     stats: Arc<Stats>,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
-    tokio::spawn(crate::utils::tick_every(shutdown.clone(), Duration::from_secs(110), move || {
-        let rpc_client = rpc_client.clone();
-        let stats = stats.clone();
-        let shutdown = shutdown.clone();
-        async move {
-            match rpc_client.still_alive(false).await {
-                Ok(resp) if resp.status == ResponseStatus::Ok => {
-                    stats.record_server_contact();
-                }
-                Ok(resp) => {
-                    let code = resp.fail_code.unwrap_or_default();
-                    // Java: TERM_BAD_NETWORK → dieWithError (terminate client)
-                    if code.starts_with("TERM_BAD_NETWORK") {
-                        tracing::error!(
-                            "Client is shutting down since the network is misconfigured; \
+    tokio::spawn(crate::utils::tick_every(
+        shutdown.clone(),
+        Duration::from_secs(110),
+        move || {
+            let rpc_client = rpc_client.clone();
+            let stats = stats.clone();
+            let shutdown = shutdown.clone();
+            async move {
+                match rpc_client.still_alive(false).await {
+                    Ok(resp) if resp.status == ResponseStatus::Ok => {
+                        stats.record_server_contact();
+                    }
+                    Ok(resp) => {
+                        let code = resp.fail_code.unwrap_or_default();
+                        // Java: TERM_BAD_NETWORK → dieWithError (terminate client)
+                        if code.starts_with("TERM_BAD_NETWORK") {
+                            tracing::error!(
+                                "Client is shutting down since the network is misconfigured; \
                              correct firewall/forwarding settings then restart the client."
-                        );
-                        shutdown.cancel();
-                    } else {
-                        tracing::warn!("Failed stillAlive test: ({}) - will retry later", code);
+                            );
+                            shutdown.cancel();
+                        } else {
+                            tracing::warn!("Failed stillAlive test: ({}) - will retry later", code);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Still-alive request failed: {}", e);
                     }
                 }
-                Err(e) => {
-                    tracing::warn!("Still-alive request failed: {}", e);
-                }
             }
-        }
-    }));
+        },
+    ));
 }
 
 /// Spawn periodic RPC server failure clearer (4h interval).
@@ -235,12 +261,16 @@ pub fn spawn_rpc_failure_clearer(
     rpc_client: Arc<RpcClient>,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
-    tokio::spawn(crate::utils::tick_every(shutdown, Duration::from_secs(14400), move || {
-        let rpc_client = rpc_client.clone();
-        async move {
-            let mut state = rpc_client.state.lock().unwrap();
-            state.rpc_last_failed = None;
-            state.rpc_current = None;
-        }
-    }));
+    tokio::spawn(crate::utils::tick_every(
+        shutdown,
+        Duration::from_secs(14400),
+        move || {
+            let rpc_client = rpc_client.clone();
+            async move {
+                let mut state = rpc_client.state.lock().unwrap();
+                state.rpc_last_failed = None;
+                state.rpc_current = None;
+            }
+        },
+    ));
 }

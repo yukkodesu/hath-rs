@@ -1,5 +1,5 @@
-use std::fmt;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 /// SHA-1 hash as a 40-char lowercase hex string.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -19,9 +19,15 @@ impl Sha1Hash {
         StaticRange(self.0[..4].to_string())
     }
 
-    pub fn l1_dir(&self) -> &str { &self.0[..2] }
-    pub fn l2_dir(&self) -> &str { &self.0[2..4] }
-    pub fn as_str(&self) -> &str { &self.0 }
+    pub fn l1_dir(&self) -> &str {
+        &self.0[..2]
+    }
+    pub fn l2_dir(&self) -> &str {
+        &self.0[2..4]
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 impl fmt::Display for Sha1Hash {
@@ -33,17 +39,25 @@ impl fmt::Display for Sha1Hash {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct StaticRange(String);
 impl StaticRange {
-    pub fn as_str(&self) -> &str { &self.0 }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FileId(String);
 impl FileId {
-    pub fn new(s: impl Into<String>) -> Self { Self(s.into()) }
-    pub fn as_str(&self) -> &str { &self.0 }
+    pub fn new(s: impl Into<String>) -> Self {
+        Self(s.into())
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 impl fmt::Display for FileId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { self.0.fmt(f) }
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -60,8 +74,12 @@ impl ClientKey {
             None
         }
     }
-    pub fn as_str(&self) -> &str { &self.0 }
-    pub fn as_bytes(&self) -> &[u8] { self.0.as_bytes() }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
 }
 
 /// File type with lowercase Display for use in file IDs.
