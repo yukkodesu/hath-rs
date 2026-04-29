@@ -13,7 +13,6 @@ use crate::cache::CacheHandler;
 use crate::config::Config;
 use crate::error::{HathError, Result};
 use crate::proxy_downloader::ProxyFileDownloader;
-use crate::rpc;
 use crate::rpc_client::RpcClient;
 use crate::stats::Stats;
 use crate::utils;
@@ -94,7 +93,7 @@ impl FloodControlEntry {
 
     pub fn is_stale(&self, now: Instant) -> bool {
         now.checked_duration_since(self.last_connect)
-            .map_or(false, |d| d > Duration::from_secs(60))
+            .is_some_and(|d| d > Duration::from_secs(60))
     }
 
     /// Returns true if the connection should be allowed.
@@ -295,14 +294,17 @@ impl Service<Request<Incoming>> for HathService {
                                                 } else {
                                                     let total_size = proxy.total_size as usize;
                                                     let response = response::proxy_response(
-                                                        mime,
-                                                        total_size,
-                                                        proxy.temp_file,
-                                                        proxy.write_offset,
-                                                        proxy.notify,
-                                                        proxy.body_done_notify,
-                                                        proxy.download_done,
-                                                        bwm_for_request,
+                                                        response::ProxyResponseParts {
+                                                            content_type: mime,
+                                                            total_size,
+                                                            temp_file: proxy.temp_file,
+                                                            write_offset: proxy.write_offset,
+                                                            notify: proxy.notify,
+                                                            body_done_notify: proxy
+                                                                .body_done_notify,
+                                                            download_done: proxy.download_done,
+                                                            bwm: bwm_for_request,
+                                                        },
                                                     );
                                                     if response.is_ok() {
                                                         tracing::info!(
@@ -691,6 +693,7 @@ pub fn start_server(
 /// RPC lifecycle actions such as client_stop/client_suspend are intentionally
 /// handled by callers. This helper only quiesces the local HTTP server.
 pub async fn stop_server(state: &AppState) {
+    tracing::info!("Stopping server");
     state
         .allow_normal_connections
         .store(false, Ordering::SeqCst);

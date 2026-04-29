@@ -443,12 +443,10 @@ pub fn build_proxy_client(config: &Config) -> Result<Arc<Client>> {
         &config.image_proxy_type,
         &config.image_proxy_host,
         config.image_proxy_port,
-    ) {
-        if let Ok(proxy_url) = build_proxy_url(proxy_type, proxy_host, proxy_port)
-            && let Ok(proxy) = reqwest::Proxy::all(proxy_url.as_str())
-        {
-            builder = builder.proxy(proxy);
-        }
+    ) && let Ok(proxy_url) = build_proxy_url(proxy_type, proxy_host, proxy_port)
+        && let Ok(proxy) = reqwest::Proxy::all(proxy_url.as_str())
+    {
+        builder = builder.proxy(proxy);
     }
     builder
         .build()

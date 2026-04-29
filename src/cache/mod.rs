@@ -192,16 +192,12 @@ impl CacheHandler {
                     state.static_range_ages,
                 )
             } else {
-                // Java: delete old persistent data BEFORE rescan to prevent
-                // stale files from misleading the next startup after a crash.
-                Self::delete_persistent_data(&cfg);
                 Self::startup_cache_cleanup(&cfg)?;
                 let (lru, count, size, ages) = Self::full_rescan(&cfg, &stats, cfg.verify_cache)?;
                 cache_loaded = true;
                 (lru, count, size, ages)
             }
         } else {
-            Self::delete_persistent_data(&cfg);
             Self::startup_cache_cleanup(&cfg)?;
             let (lru, count, size, ages) = Self::full_rescan(&cfg, &stats, cfg.verify_cache)?;
             cache_loaded = true;
@@ -378,10 +374,6 @@ impl CacheHandler {
                 }
             }
         }
-
-        // Safety: delete info file early. If the deserializer hangs or the process
-        // crashes, the next boot won't find pcache_info and will force a full rescan.
-        utils::remove_file(&info_path);
 
         if info_checksum != 31 {
             tracing::info!("CacheHandler: Persistent fields were missing, forcing rescan");
