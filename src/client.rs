@@ -11,6 +11,7 @@ use clap::Parser;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::time::Duration;
 use tokio::sync::{Mutex, Notify};
 
 /// Main client entry point. Follows Java HentaiAtHomeClient.run() lifecycle.
@@ -232,6 +233,7 @@ pub async fn run() -> Result<()> {
             tracing::warn!("Failed to notify server about shutdown: {}", e);
         }
     }
+    tokio::time::sleep(Duration::from_secs(5)).await;
     server::stop_server(&app_state).await;
     cache.save_persistent_data();
     {

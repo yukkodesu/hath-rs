@@ -1,12 +1,17 @@
 use crate::config::Config;
 use crate::error::{HathError, Result};
 use crate::rpc::{self, Action};
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
+use crate::rpc_client::RpcClient;
+use crate::server::{AppState, start_server, stop_server, tls};
+use arc_swap::ArcSwap;
 use openssl::asn1::Asn1Time;
 use openssl::pkcs12::Pkcs12;
 use openssl::provider::Provider;
 use openssl::ssl::{SslContext, SslMethod};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const SECS_PER_DAY: i64 = 86400;
 const CERT_RENEWAL_WINDOW_SECS: i64 = SECS_PER_DAY;
@@ -112,4 +117,143 @@ pub(super) async fn build_tls_acceptor(
         }
     }
     Ok((ctx_builder.build(), cert_expiry_unix))
+}
+
+/// Spawn the certificate refresh watcher.
+/// Watches for refresh_certs RPC commands and performs a full server restart
+/// (suspend → reject new connections → shutdown old listener → drain → restart → resume).
+pub fn spawn_cert_refresh_watcher(
+    state: AppState,
+    rpc_client: Arc<RpcClient>,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = state.cert_refresh_notify.notified() => {},
+                _ = shutdown.cancelled() => break,
+            }
+            if !state.do_cert_refresh.load(Ordering::Acquire) {
+                continue;
+            }
+            tracing::info!("Starting certificate refresh (full server restart)...");
+
+            // 1. Suspend traffic
+            match rpc_client.client_suspend().await {
+                Ok(resp) if resp.status == rpc::ResponseStatus::Ok => {
+                    tracing::info!("Suspend notification successful");
+                }
+                _ => {
+                    tracing::warn!(
+                        "Failed to contact server to suspend client traffic; will retry"
+                    );
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    state.cert_refresh_notify.notify_one();
+                    continue;
+                }
+            }
+
+            // Java waits 5s before httpServerShutdown(true), and that helper
+            // waits another 5s before closing the listener.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+
+            // 2-5. Reject non-RPC traffic, stop the listener, drain active
+            // requests, and wait for the old server generation to terminate.
+            stop_server(&state).await;
+
+            // 6. Wait 1s
+            tokio::time::sleep(Duration::from_secs(1)).await;
+
+            if shutdown.is_cancelled() {
+                break;
+            }
+
+            // 7. Start a fresh server generation with a new shutdown token.
+            let (ready_rx, new_shutdown) = start_server(state.clone());
+            state
+                .server_shutdown_token
+                .store(Some(Arc::new(new_shutdown)));
+
+            // 8. Wait for new server to bind
+            match ready_rx.await {
+                Ok(Ok(port)) => {
+                    tracing::info!("Server restarted successfully on port {}", port);
+                }
+                Ok(Err(e)) => {
+                    tracing::error!("Server restart failed to bind: {}", e);
+                    shutdown.cancel();
+                    break;
+                }
+                Err(_) => {
+                    tracing::error!("Server restart failed unexpectedly (oneshot dropped)");
+                    shutdown.cancel();
+                    break;
+                }
+            }
+
+            // 9. Re-allow connections
+            state.allow_normal_connections.store(true, Ordering::SeqCst);
+
+            // 10. Resume traffic
+            match rpc_client.still_alive(true).await {
+                Ok(resp) if resp.status == rpc::ResponseStatus::Ok => {
+                    tracing::info!("Resume notification successful");
+                }
+                Ok(resp) => {
+                    let code = resp.fail_code.unwrap_or_default();
+                    // Java: TERM_BAD_NETWORK → dieWithError (terminate client)
+                    if code.starts_with("TERM_BAD_NETWORK") {
+                        tracing::error!(
+                            "Client is shutting down since the network is misconfigured; \
+                             correct firewall/forwarding settings then restart the client."
+                        );
+                        shutdown.cancel();
+                        break;
+                    } else {
+                        tracing::warn!("Failed stillAlive test: ({}) - will retry later", code);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Still-alive request failed: {}", e);
+                }
+            }
+
+            state.do_cert_refresh.store(false, Ordering::Release);
+            tracing::info!("Certificate refresh completed successfully");
+        }
+    });
+}
+
+/// Spawn periodic time check + cert expiry check (5min interval).
+/// If time drift >24h or cert expires within 24h, triggers global shutdown.
+pub fn spawn_time_cert_check(
+    config: Arc<ArcSwap<Config>>,
+    state: AppState,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
+    let global_shutdown = shutdown.clone();
+    tokio::spawn(crate::utils::tick_every(
+        shutdown,
+        Duration::from_secs(300),
+        move || {
+            let config = config.clone();
+            let state = state.clone();
+            let shutdown_signal = global_shutdown.clone();
+            async move {
+                if config.load().server_time_delta.abs() > 86400 {
+                    tracing::warn!("System time off by >24h. Correct your system clock.");
+                }
+                if let Some(expiry) = *state.cert_expiry.lock().await {
+                    if tls::is_cert_expired(expiry) {
+                        tracing::error!(
+                            "Either the system clock is significantly wrong, or something has \
+                         gone wrong with certificate renewal. Check your system clock and \
+                         internet connection, then restart the client manually."
+                        );
+                        shutdown_signal.cancel();
+                    }
+                }
+            }
+        },
+    ));
 }
