@@ -9,14 +9,20 @@ pub struct Scheduler {
 
 impl Scheduler {
     pub fn new() -> Self {
-        Self { intervals: HashMap::new() }
+        Self {
+            intervals: HashMap::new(),
+        }
     }
 
     pub fn periodic(&mut self, every: Duration) -> &mut Interval {
-        self.intervals.entry(every).or_insert_with(|| tokio::time::interval(every))
+        self.intervals
+            .entry(every)
+            .or_insert_with(|| tokio::time::interval(every))
     }
 }
 
 impl Default for Scheduler {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }

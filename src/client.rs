@@ -88,7 +88,11 @@ pub async fn run() -> Result<()> {
 
     // 7. Init cache
     let stats = Arc::new(Stats::new());
-    let cache = Arc::new(CacheHandler::new(config.clone(), stats.clone(), shutdown.clone())?);
+    let cache = Arc::new(CacheHandler::new(
+        config.clone(),
+        stats.clone(),
+        shutdown.clone(),
+    )?);
 
     // 8. Build AppState and spawn HTTP server
     let allow_connections = Arc::new(AtomicBool::new(false));
@@ -205,7 +209,11 @@ pub async fn run() -> Result<()> {
         cache::spawn_pruner(cache.clone(), config.clone(), shutdown.clone());
         cache::spawn_periodic_stats(cache.clone(), stats.clone(), shutdown.clone());
         server::spawn_flood_control_pruner(app_state.clone(), shutdown.clone());
-        rpc_client::spawn_still_alive_heartbeat(rpc_client.clone(), stats.clone(), shutdown.clone());
+        rpc_client::spawn_still_alive_heartbeat(
+            rpc_client.clone(),
+            stats.clone(),
+            shutdown.clone(),
+        );
         server::spawn_time_cert_check(config.clone(), app_state.clone(), shutdown.clone());
         rpc_client::spawn_rpc_failure_clearer(rpc_client.clone(), shutdown.clone());
         cache::spawn_blacklist_fetcher(rpc_client.clone(), cache.clone(), shutdown.clone());
@@ -240,11 +248,10 @@ pub async fn run() -> Result<()> {
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{signal, SignalKind};
-        let mut sigterm = signal(SignalKind::terminate())
-            .expect("failed to register SIGTERM handler");
-        let mut sigquit = signal(SignalKind::quit())
-            .expect("failed to register SIGQUIT handler");
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut sigterm =
+            signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
+        let mut sigquit = signal(SignalKind::quit()).expect("failed to register SIGQUIT handler");
         tokio::select! {
             _ = tokio::signal::ctrl_c() => tracing::info!("SIGINT received, shutting down gracefully..."),
             _ = sigterm.recv() => tracing::info!("SIGTERM received, shutting down gracefully..."),

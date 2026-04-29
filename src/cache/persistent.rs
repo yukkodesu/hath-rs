@@ -23,5 +23,7 @@ impl PersistentCacheState {
 }
 
 impl Default for PersistentCacheState {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }

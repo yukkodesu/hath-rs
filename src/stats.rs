@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicI64, Ordering};
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
 
 const HISTORY_LEN: usize = 361;
@@ -63,14 +63,16 @@ impl Stats {
             .store(chrono::Utc::now().timestamp(), Ordering::SeqCst);
     }
 
-    pub fn record_file_sent(&self)       { self.files_sent.fetch_add(1, Ordering::Relaxed); }
-    pub fn record_file_rcvd(&self)       { self.files_rcvd.fetch_add(1, Ordering::Relaxed); }
+    pub fn record_file_sent(&self) {
+        self.files_sent.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn record_file_rcvd(&self) {
+        self.files_rcvd.fetch_add(1, Ordering::Relaxed);
+    }
 
     pub fn record_bytes_sent(&self, bytes: u64) {
         self.bytes_sent.fetch_add(bytes, Ordering::Relaxed);
-        if self.client_running.load(Ordering::Relaxed)
-            && self.gui_enabled.load(Ordering::Relaxed)
-        {
+        if self.client_running.load(Ordering::Relaxed) && self.gui_enabled.load(Ordering::Relaxed) {
             if let Ok(mut hist) = self.bytes_sent_history.write() {
                 hist[0] = hist[0].wrapping_add(bytes as u64);
             }
@@ -81,9 +83,15 @@ impl Stats {
         self.bytes_rcvd.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    pub fn set_open_connections(&self, count: u32) { self.open_connections.store(count, Ordering::Relaxed); }
-    pub fn set_cache_count(&self, count: u32)      { self.cache_count.store(count, Ordering::Relaxed); }
-    pub fn set_cache_size(&self, size: u64)         { self.cache_size.store(size, Ordering::Relaxed); }
+    pub fn set_open_connections(&self, count: u32) {
+        self.open_connections.store(count, Ordering::Relaxed);
+    }
+    pub fn set_cache_count(&self, count: u32) {
+        self.cache_count.store(count, Ordering::Relaxed);
+    }
+    pub fn set_cache_size(&self, size: u64) {
+        self.cache_size.store(size, Ordering::Relaxed);
+    }
 
     pub fn shift_bytes_sent_history(&self) {
         if !self.gui_enabled.load(Ordering::Relaxed) {
@@ -114,7 +122,9 @@ impl Stats {
 }
 
 impl Default for Stats {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]

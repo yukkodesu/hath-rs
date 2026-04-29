@@ -1,42 +1,42 @@
-mod tls;
 mod access_log;
 mod body;
 mod request;
 mod response;
+mod tls;
 
-use crate::bandwidth::BandwidthMonitor;
-use crate::config::Config;
-use crate::error::{HathError, Result};
-use crate::stats::Stats;
-use crate::cache::CacheHandler;
-use crate::rpc_client::RpcClient;
-use crate::rpc;
-use crate::utils;
-use crate::proxy_downloader::ProxyFileDownloader;
 use self::access_log::AccessLogService;
 use self::body::StreamingBody;
 use self::request::RequestType;
+use crate::bandwidth::BandwidthMonitor;
+use crate::cache::CacheHandler;
+use crate::config::Config;
+use crate::error::{HathError, Result};
+use crate::proxy_downloader::ProxyFileDownloader;
+use crate::rpc;
+use crate::rpc_client::RpcClient;
+use crate::stats::Stats;
+use crate::utils;
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use hyper::body::Incoming;
+use hyper::header;
 use hyper::server::conn::http1;
 use hyper::service::Service;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
-use hyper::header;
 use openssl::ssl::SslContext;
+use regex::Regex;
 use reqwest::Url;
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, Notify};
-use regex::Regex;
-use std::sync::LazyLock;
 
 /// Shared state accessible from all request handlers.
 #[derive(Clone)]
@@ -99,10 +99,14 @@ impl FloodControlEntry {
     /// Returns true if the connection should be allowed.
     pub fn hit(&mut self) -> bool {
         let now = Instant::now();
-        let elapsed_ms = now.checked_duration_since(self.last_connect)
+        let elapsed_ms = now
+            .checked_duration_since(self.last_connect)
             .unwrap_or_default()
             .as_millis() as u32;
-        self.connect_count = self.connect_count.saturating_sub(elapsed_ms / 1000).saturating_add(1);
+        self.connect_count = self
+            .connect_count
+            .saturating_sub(elapsed_ms / 1000)
+            .saturating_add(1);
         self.last_connect = now;
 
         if self.connect_count > 10 {
@@ -141,7 +145,8 @@ pub struct HathService {
 impl Service<Request<Incoming>> for HathService {
     type Response = Response<StreamingBody>;
     type Error = hyper::Error;
-    type Future = Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Self::Error>> + Send>>;
+    type Future =
+        Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Self::Error>> + Send>>;
 
     fn call(&self, req: Request<Incoming>) -> Self::Future {
         let state = self.state.clone();
@@ -156,9 +161,11 @@ impl Service<Request<Incoming>> for HathService {
 
             // Determine if this is a local/RPC connection (skip bandwidth throttling)
             let host_addr = client_ip.to_string().to_lowercase();
-            let is_local = LOCAL_NETWORK_RE.is_match(&host_addr)
-                || config.client_host == host_addr;
-            let is_rpc = config.rpc_servers.iter().any(|s| s.to_string().to_lowercase() == host_addr);
+            let is_local = LOCAL_NETWORK_RE.is_match(&host_addr) || config.client_host == host_addr;
+            let is_rpc = config
+                .rpc_servers
+                .iter()
+                .any(|s| s.to_string().to_lowercase() == host_addr);
 
             // Determine bandwidth monitor for this request.
             // Java: Only local connections skip throttling.
@@ -171,7 +178,10 @@ impl Service<Request<Incoming>> for HathService {
 
             let request_type = request::parse_request(
                 req.method().as_str(),
-                req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/"),
+                req.uri()
+                    .path_and_query()
+                    .map(|p| p.as_str())
+                    .unwrap_or("/"),
                 client_ip,
                 &config,
             );
@@ -180,13 +190,23 @@ impl Service<Request<Incoming>> for HathService {
             let bwm_for_header = bwm_for_request.clone();
 
             let mut resp = match request_type {
-                RequestType::FileServe { fileid, hv_file, additional, keystamp_valid, head_only } => {
+                RequestType::FileServe {
+                    fileid,
+                    hv_file,
+                    additional,
+                    keystamp_valid,
+                    head_only,
+                } => {
                     // Java validates fileindex/xres BEFORE cache hit check
                     // (line 194 in HTTPResponse.processRequest). Even a cached
                     // file with missing/invalid arguments returns 404.
-                    let fileindex_valid = additional.fileindex.as_deref()
+                    let fileindex_valid = additional
+                        .fileindex
+                        .as_deref()
                         .is_some_and(|v| v.parse::<u32>().is_ok());
-                    let xres_valid = additional.xres.as_deref()
+                    let xres_valid = additional
+                        .xres
+                        .as_deref()
                         .is_some_and(|v| v == "org" || v.parse::<u32>().is_ok());
 
                     if !keystamp_valid {
@@ -199,7 +219,8 @@ impl Service<Request<Incoming>> for HathService {
                         let xres = additional.xres.as_deref().unwrap();
                         let cache_path = hv.cache_path(&config.cache_dir);
                         let cache_hit = cache_path.exists()
-                            && cache_path.metadata()
+                            && cache_path
+                                .metadata()
                                 .map(|m| m.len() == hv.size as u64)
                                 .unwrap_or(false);
                         if cache_hit {
@@ -218,14 +239,23 @@ impl Service<Request<Incoming>> for HathService {
                                     && !config.disable_file_verification
                                     && !state.cache.is_file_verification_on_cooldown();
                                 response::file_response(
-                                    hv, &config.cache_dir, bwm_for_request,
-                                    verify, Some(state.cache.clone()),
+                                    hv,
+                                    &config.cache_dir,
+                                    bwm_for_request,
+                                    verify,
+                                    Some(state.cache.clone()),
                                 )
                             }
                         } else {
-                            match state.rpc_client.static_range_fetch(fileindex, xres, &fileid).await {
+                            match state
+                                .rpc_client
+                                .static_range_fetch(fileindex, xres, &fileid)
+                                .await
+                            {
                                 Ok(sr) if sr.status == crate::rpc::ResponseStatus::Ok => {
-                                    let sources: Vec<Url> = sr.lines.iter()
+                                    let sources: Vec<Url> = sr
+                                        .lines
+                                        .iter()
                                         .filter(|s| !s.is_empty())
                                         .filter_map(|s| Url::parse(s).ok())
                                         .collect();
@@ -236,7 +266,15 @@ impl Service<Request<Incoming>> for HathService {
                                         // initialize() for both GET and HEAD. The init result
                                         // (connecting to source, checking Content-Length/size)
                                         // determines the status code. HEAD then skips body.
-                                        match ProxyFileDownloader::new(&fileid, &sources, &config, Some(state.cache.clone()), &state.proxy_client).await {
+                                        match ProxyFileDownloader::new(
+                                            &fileid,
+                                            &sources,
+                                            &config,
+                                            Some(state.cache.clone()),
+                                            &state.proxy_client,
+                                        )
+                                        .await
+                                        {
                                             Ok(proxy) => {
                                                 let mime = hv.mime_type();
                                                 state.stats.record_file_sent();
@@ -249,7 +287,10 @@ impl Service<Request<Incoming>> for HathService {
                                                     // that the body side is done so it can finalize
                                                     // immediately instead of waiting 300s.
                                                     proxy.body_done_notify.notify_one();
-                                                    response::head_response(mime, proxy.total_size as usize)
+                                                    response::head_response(
+                                                        mime,
+                                                        proxy.total_size as usize,
+                                                    )
                                                 } else {
                                                     let total_size = proxy.total_size as usize;
                                                     let response = response::proxy_response(
@@ -274,8 +315,16 @@ impl Service<Request<Incoming>> for HathService {
                                                 }
                                             }
                                             Err(e) => {
-                                                tracing::warn!("Proxy download failed for {}: {}", fileid, e);
-                                                if let crate::error::HathError::ProxyDownloader { status, message } = e {
+                                                tracing::warn!(
+                                                    "Proxy download failed for {}: {}",
+                                                    fileid,
+                                                    e
+                                                );
+                                                if let crate::error::HathError::ProxyDownloader {
+                                                    status,
+                                                    message,
+                                                } = e
+                                                {
                                                     response::text_response(
                                                         hyper::StatusCode::from_u16(status).unwrap_or(hyper::StatusCode::INTERNAL_SERVER_ERROR),
                                                         &message,
@@ -296,21 +345,34 @@ impl Service<Request<Incoming>> for HathService {
                         }
                     }
                 }
-                RequestType::ServerCommand { command, additional, valid } => {
+                RequestType::ServerCommand {
+                    command,
+                    additional,
+                    valid,
+                } => {
                     if valid {
                         handle_server_command(&command, &additional, &state, bwm_for_request).await
                     } else {
                         response::forbidden_response()
                     }
                 }
-                RequestType::SpeedTest { testsize, valid, forbidden, head_only, .. } => {
+                RequestType::SpeedTest {
+                    testsize,
+                    valid,
+                    forbidden,
+                    head_only,
+                    ..
+                } => {
                     if valid {
                         if !head_only && !is_local && !is_rpc {
                             state.stats.record_bytes_sent(testsize as u64);
                         }
                         if head_only {
                             // Java: speedtest inherits CONTENT_TYPE_DEFAULT = text/html
-                            response::head_response("text/html; charset=iso-8859-1", testsize as usize)
+                            response::head_response(
+                                "text/html; charset=iso-8859-1",
+                                testsize as usize,
+                            )
                         } else {
                             response::speedtest_response(testsize as usize, bwm_for_request)
                         }
@@ -322,7 +384,9 @@ impl Service<Request<Incoming>> for HathService {
                         response::bad_request_response()
                     }
                 }
-                RequestType::Favicon => response::redirect_response("https://e-hentai.org/favicon.ico"),
+                RequestType::Favicon => {
+                    response::redirect_response("https://e-hentai.org/favicon.ico")
+                }
                 RequestType::Robots => response::robots_response(),
                 RequestType::BadRequest => response::bad_request_response(),
                 RequestType::MethodNotAllowed => response::method_not_allowed_response(),
@@ -335,10 +399,14 @@ impl Service<Request<Incoming>> for HathService {
             if let Ok(ref mut r) = resp {
                 r.headers_mut().insert(
                     header::SERVER,
-                    header::HeaderValue::from_static("Genetic Lifeform and Distributed Open Server 1.6.5")
+                    header::HeaderValue::from_static(
+                        "Genetic Lifeform and Distributed Open Server 1.6.5",
+                    ),
                 );
                 // Add Date header
-                let date = chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+                let date = chrono::Utc::now()
+                    .format("%a, %d %b %Y %H:%M:%S GMT")
+                    .to_string();
                 if let Ok(v) = header::HeaderValue::from_str(&date) {
                     r.headers_mut().insert(header::DATE, v);
                 }
@@ -348,16 +416,19 @@ impl Service<Request<Incoming>> for HathService {
             // Java: bwm.waitForQuota(myThread, headerBytes.length) where headerBytes
             // is the full serialized HTTP response header.
             if let Some(ref bwm) = bwm_for_header
-                && let Ok(ref r) = resp {
-                    let reason_len = r.status().canonical_reason().map_or(0, |s| s.len());
-                    // Status line: "HTTP/1.1 XXX reason\r\n"
-                    let status_line_len = 13 + reason_len; // "HTTP/1.1 " + "XXX " + reason + "\r\n"
-                    let headers_len: usize = r.headers().iter()
-                        .map(|(k, v)| k.as_str().len() + 2 + v.as_bytes().len() + 2) // "Key: Value\r\n"
-                        .sum();
-                    let total_header_bytes = status_line_len + headers_len + 2; // + trailing \r\n
-                    bwm.wait_for_quota(total_header_bytes).await;
-                }
+                && let Ok(ref r) = resp
+            {
+                let reason_len = r.status().canonical_reason().map_or(0, |s| s.len());
+                // Status line: "HTTP/1.1 XXX reason\r\n"
+                let status_line_len = 13 + reason_len; // "HTTP/1.1 " + "XXX " + reason + "\r\n"
+                let headers_len: usize = r
+                    .headers()
+                    .iter()
+                    .map(|(k, v)| k.as_str().len() + 2 + v.as_bytes().len() + 2) // "Key: Value\r\n"
+                    .sum();
+                let total_header_bytes = status_line_len + headers_len + 2; // + trailing \r\n
+                bwm.wait_for_quota(total_header_bytes).await;
+            }
 
             match resp {
                 Ok(r) => Ok(r),
@@ -365,7 +436,10 @@ impl Service<Request<Incoming>> for HathService {
                     tracing::error!("Error building response: {}", e);
                     Ok(Response::builder()
                         .status(500)
-                        .body(StreamingBody::new(bytes::Bytes::from_static(b"Internal Server Error"), None))
+                        .body(StreamingBody::new(
+                            bytes::Bytes::from_static(b"Internal Server Error"),
+                            None,
+                        ))
                         .unwrap())
                 }
             }
@@ -408,9 +482,10 @@ async fn handle_server_command(
     bwm: Option<Arc<BandwidthMonitor>>,
 ) -> crate::error::Result<Response<StreamingBody>> {
     match command.to_lowercase().as_str() {
-        "still_alive" => {
-            response::text_response(hyper::StatusCode::OK, "I feel FANTASTIC and I'm still alive")
-        }
+        "still_alive" => response::text_response(
+            hyper::StatusCode::OK,
+            "I feel FANTASTIC and I'm still alive",
+        ),
         "threaded_proxy_test" => {
             // Java: Integer.parseInt on missing/illegal params throws NFE,
             // caught by processRemoteAPICommand → returns "INVALID_COMMAND".
@@ -425,19 +500,33 @@ async fn handle_server_command(
 
             tracing::debug!(
                 "Running speedtest against hostname={} protocol={} port={} testsize={} testcount={} testtime={} testkey={}",
-                hostname, protocol, port, testsize, testcount, testtime, testkey
+                hostname,
+                protocol,
+                port,
+                testsize,
+                testcount,
+                testtime,
+                testkey
             );
 
             let result = run_threaded_proxy_test(
                 hostname, protocol, port, testsize, testcount, testtime, testkey,
-            ).await;
+            )
+            .await;
 
             tracing::debug!(
                 "Ran speedtest against hostname={} testsize={} testcount={}, reporting successfulTests={} totalTimeMillis={}",
-                hostname, testsize, testcount, result.0, result.1
+                hostname,
+                testsize,
+                testcount,
+                result.0,
+                result.1
             );
 
-            response::text_response(hyper::StatusCode::OK, &format!("OK:{}-{}", result.0, result.1))
+            response::text_response(
+                hyper::StatusCode::OK,
+                &format!("OK:{}-{}", result.0, result.1),
+            )
         }
         "speed_test" => {
             // Java: additional is parsed as key=value pairs via Tools.parseAdditional();
@@ -453,9 +542,9 @@ async fn handle_server_command(
                     // Recreate bandwidth monitor if throttle_bytes changed
                     let cfg = state.config.load_full();
                     if cfg.throttle_bytes > 0 && !cfg.disable_bwm {
-                        state.bandwidth_monitor.store(Some(Arc::new(
-                            BandwidthMonitor::new(cfg.throttle_bytes)
-                        )));
+                        state
+                            .bandwidth_monitor
+                            .store(Some(Arc::new(BandwidthMonitor::new(cfg.throttle_bytes))));
                     } else {
                         state.bandwidth_monitor.store(None);
                     }
@@ -464,9 +553,7 @@ async fn handle_server_command(
                 _ => response::text_response(hyper::StatusCode::OK, ""),
             }
         }
-        "start_downloader" => {
-            response::text_response(hyper::StatusCode::OK, "")
-        }
+        "start_downloader" => response::text_response(hyper::StatusCode::OK, ""),
         "refresh_certs" => {
             // Java: client.setCertRefresh() — just set the flag, main loop does
             // the actual work (suspend → shutdown → restart → resume).
@@ -518,16 +605,16 @@ async fn run_threaded_proxy_test(
             let start = Instant::now();
             // Java: FileDownloader(source, 10000, 60000, true) — 10s connect, 60s total.
             // testtime only affects the /t URL and key, not the timeout.
-            let result = timeout(
-                Duration::from_secs(60),
-                async {
-                    let resp = client.get(url).send().await.map_err(|_| ())?;
-                    let len = resp.content_length().unwrap_or(0);
-                    if len < testsize { return Err(()); }
-                    resp.bytes().await.map_err(|_| ())?;
-                    Ok(())
-                },
-            ).await;
+            let result = timeout(Duration::from_secs(60), async {
+                let resp = client.get(url).send().await.map_err(|_| ())?;
+                let len = resp.content_length().unwrap_or(0);
+                if len < testsize {
+                    return Err(());
+                }
+                resp.bytes().await.map_err(|_| ())?;
+                Ok(())
+            })
+            .await;
 
             match result {
                 Ok(Ok(())) => Some(start.elapsed().as_millis() as u64),
@@ -604,7 +691,9 @@ pub fn start_server(
 /// handled by callers. This helper only quiesces the local HTTP server.
 pub async fn stop_server(state: &AppState) {
     tokio::time::sleep(Duration::from_secs(5)).await;
-    state.allow_normal_connections.store(false, Ordering::SeqCst);
+    state
+        .allow_normal_connections
+        .store(false, Ordering::SeqCst);
 
     if let Some(token) = state.server_shutdown_token.load_full() {
         token.cancel();
@@ -704,9 +793,7 @@ pub fn spawn_cert_refresh_watcher(
             // 8. Wait for new server to bind
             match ready_rx.await {
                 Ok(Ok(port)) => {
-                    tracing::info!(
-                        "Server restarted successfully on port {}", port
-                    );
+                    tracing::info!("Server restarted successfully on port {}", port);
                 }
                 Ok(Err(e)) => {
                     tracing::error!("Server restart failed to bind: {}", e);
@@ -714,9 +801,7 @@ pub fn spawn_cert_refresh_watcher(
                     break;
                 }
                 Err(_) => {
-                    tracing::error!(
-                        "Server restart failed unexpectedly (oneshot dropped)"
-                    );
+                    tracing::error!("Server restart failed unexpectedly (oneshot dropped)");
                     shutdown.cancel();
                     break;
                 }
@@ -756,14 +841,15 @@ pub fn spawn_cert_refresh_watcher(
 }
 
 /// Spawn periodic flood control pruning (60s interval).
-pub fn spawn_flood_control_pruner(
-    state: AppState,
-    shutdown: tokio_util::sync::CancellationToken,
-) {
-    tokio::spawn(crate::utils::tick_every(shutdown, Duration::from_secs(60), move || {
-        let state = state.clone();
-        async move { prune_flood_control(&state).await }
-    }));
+pub fn spawn_flood_control_pruner(state: AppState, shutdown: tokio_util::sync::CancellationToken) {
+    tokio::spawn(crate::utils::tick_every(
+        shutdown,
+        Duration::from_secs(60),
+        move || {
+            let state = state.clone();
+            async move { prune_flood_control(&state).await }
+        },
+    ));
 }
 
 /// Spawn periodic time check + cert expiry check (5min interval).
@@ -774,26 +860,30 @@ pub fn spawn_time_cert_check(
     shutdown: tokio_util::sync::CancellationToken,
 ) {
     let global_shutdown = shutdown.clone();
-    tokio::spawn(crate::utils::tick_every(shutdown, Duration::from_secs(300), move || {
-        let config = config.clone();
-        let state = state.clone();
-        let shutdown_signal = global_shutdown.clone();
-        async move {
-            if config.load().server_time_delta.abs() > 86400 {
-                tracing::warn!("System time off by >24h. Correct your system clock.");
-            }
-            if let Some(expiry) = *state.cert_expiry.lock().await {
-                if tls::is_cert_expired(expiry) {
-                    tracing::error!(
-                        "Either the system clock is significantly wrong, or something has \
+    tokio::spawn(crate::utils::tick_every(
+        shutdown,
+        Duration::from_secs(300),
+        move || {
+            let config = config.clone();
+            let state = state.clone();
+            let shutdown_signal = global_shutdown.clone();
+            async move {
+                if config.load().server_time_delta.abs() > 86400 {
+                    tracing::warn!("System time off by >24h. Correct your system clock.");
+                }
+                if let Some(expiry) = *state.cert_expiry.lock().await {
+                    if tls::is_cert_expired(expiry) {
+                        tracing::error!(
+                            "Either the system clock is significantly wrong, or something has \
                          gone wrong with certificate renewal. Check your system clock and \
                          internet connection, then restart the client manually."
-                    );
-                    shutdown_signal.cancel();
+                        );
+                        shutdown_signal.cancel();
+                    }
                 }
             }
-        }
-    }));
+        },
+    ));
 }
 
 /// Prune stale flood control entries. Called periodically from main loop.
@@ -833,9 +923,9 @@ async fn run_server(
     // Create bandwidth monitor if throttling is enabled and not disabled.
     // Explicitly clear on server restart so cert refresh doesn't leak old monitor.
     if config.throttle_bytes > 0 && !config.disable_bwm {
-        state.bandwidth_monitor.store(Some(Arc::new(
-            BandwidthMonitor::new(config.throttle_bytes)
-        )));
+        state
+            .bandwidth_monitor
+            .store(Some(Arc::new(BandwidthMonitor::new(config.throttle_bytes))));
     } else {
         state.bandwidth_monitor.store(None);
     }

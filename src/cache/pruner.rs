@@ -23,8 +23,17 @@ pub struct CachePruner {
 }
 
 impl CachePruner {
-    pub fn new(cache: Arc<CacheHandler>, config: Arc<ArcSwap<Config>>, shutdown: CancellationToken) -> Self {
-        Self { cache, config, check_frequency: 60, shutdown }
+    pub fn new(
+        cache: Arc<CacheHandler>,
+        config: Arc<ArcSwap<Config>>,
+        shutdown: CancellationToken,
+    ) -> Self {
+        Self {
+            cache,
+            config,
+            check_frequency: 60,
+            shutdown,
+        }
     }
 
     pub async fn run(mut self) {
@@ -47,7 +56,9 @@ impl CachePruner {
                     self.cache.check_prune_action(&cfg)
                 } else if cache_check_ticks < self.check_frequency {
                     cache_check_ticks += 1;
-                    PruneAction::NoPrune { frequency: self.check_frequency }
+                    PruneAction::NoPrune {
+                        frequency: self.check_frequency,
+                    }
                 } else {
                     cache_check_ticks = 0;
                     self.cache.check_prune_action(&cfg)
@@ -114,10 +125,7 @@ impl CachePruner {
             file_count += 1;
 
             if last_modified < plan.cutoff {
-                let filename = file
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("");
+                let filename = file.file_name().and_then(|n| n.to_str()).unwrap_or("");
                 if let Some(hv) = HVFile::from_fileid(filename) {
                     if fs::remove_file(file).is_ok() {
                         files_deleted += 1;
@@ -135,9 +143,12 @@ impl CachePruner {
                 }
 
                 // Delay between deletions to reduce disk activity bursts.
-                tokio::time::sleep(Duration::from_millis(
-                    if plan.fast_delete { 100 } else { 1000 },
-                )).await;
+                tokio::time::sleep(Duration::from_millis(if plan.fast_delete {
+                    100
+                } else {
+                    1000
+                }))
+                .await;
             }
         }
 

@@ -42,16 +42,26 @@ impl BandwidthMonitor {
                     .unwrap_or_default()
                     .as_millis() as u64;
                 let epoch_seconds = now_millis / 1000;
-                let current_tick = ((now_millis - epoch_seconds * 1000) / self.millis_per_tick) as usize;
+                let current_tick =
+                    ((now_millis - epoch_seconds * 1000) / self.millis_per_tick) as usize;
 
                 let mut bytes_this_tick = 0u32;
                 let mut bytes_last_window = 0u32;
                 let mut bytes_last_second = 0u32;
 
                 for offset in 0..TIME_RESOLUTION {
-                    let tick_counter = current_tick as isize - TIME_RESOLUTION as isize + 1 + offset as isize;
-                    let tick_index = if tick_counter < 0 { (TIME_RESOLUTION as isize + tick_counter) as usize } else { tick_counter as usize };
-                    let valid_second = if tick_counter < 0 { epoch_seconds.wrapping_sub(1) } else { epoch_seconds };
+                    let tick_counter =
+                        current_tick as isize - TIME_RESOLUTION as isize + 1 + offset as isize;
+                    let tick_index = if tick_counter < 0 {
+                        (TIME_RESOLUTION as isize + tick_counter) as usize
+                    } else {
+                        tick_counter as usize
+                    };
+                    let valid_second = if tick_counter < 0 {
+                        epoch_seconds.wrapping_sub(1)
+                    } else {
+                        epoch_seconds
+                    };
 
                     if inner.tick_seconds[tick_index] == valid_second {
                         if tick_counter == current_tick as isize {
@@ -66,7 +76,8 @@ impl BandwidthMonitor {
                 }
 
                 let exceeded = bytes_this_tick as f64 > self.bytes_per_tick as f64 * 1.1
-                    || bytes_last_window as f64 > self.bytes_per_tick as f64 * WINDOW_LENGTH as f64 * 1.05
+                    || bytes_last_window as f64
+                        > self.bytes_per_tick as f64 * WINDOW_LENGTH as f64 * 1.05
                     || bytes_last_second > self.bytes_per_tick * TIME_RESOLUTION as u32;
 
                 if !exceeded {
@@ -74,14 +85,17 @@ impl BandwidthMonitor {
                         inner.tick_seconds[current_tick] = epoch_seconds;
                         inner.tick_bytes[current_tick] = 0;
                     }
-                    inner.tick_bytes[current_tick] = inner.tick_bytes[current_tick].wrapping_add(byte_count);
+                    inner.tick_bytes[current_tick] =
+                        inner.tick_bytes[current_tick].wrapping_add(byte_count);
                     true
                 } else {
                     false
                 }
             };
 
-            if release { break; }
+            if release {
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }

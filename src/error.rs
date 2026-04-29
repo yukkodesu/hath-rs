@@ -58,5 +58,4 @@ impl From<openssl::ssl::Error> for HathError {
     }
 }
 
-
 pub type Result<T> = std::result::Result<T, HathError>;

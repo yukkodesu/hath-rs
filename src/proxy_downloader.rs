@@ -79,7 +79,9 @@ impl ProxyFileDownloader {
                         if attempt < 2 {
                             tracing::debug!(
                                 "Proxy download attempt {} failed for {}: {}, retrying...",
-                                attempt + 1, source, e
+                                attempt + 1,
+                                source,
+                                e
                             );
                         }
                         last_err = Some(e);
@@ -134,8 +136,7 @@ impl ProxyFileDownloader {
             .ok_or_else(|| HathError::ProxyDownloader {
                 status: 502,
                 message: "missing Content-Length".into(),
-            })?
-            as u64;
+            })? as u64;
 
         // Java: check max_allowed_filesize before size match
         if content_length > config.max_allowed_filesize {
@@ -344,9 +345,7 @@ impl ProxyFileDownloader {
                 Ok(Some(data)) => data,
                 Ok(None) => {
                     if downloaded == expected_size {
-                        return DownloadAttemptResult::Success(utils::hex_encode(
-                            &sha1.finalize(),
-                        ));
+                        return DownloadAttemptResult::Success(utils::hex_encode(&sha1.finalize()));
                     }
                     tracing::warn!(
                         "Proxy download: premature EOF for {} ({} of {} bytes)",
@@ -440,16 +439,19 @@ pub fn build_proxy_client(config: &Config) -> Result<Arc<Client>> {
         .user_agent(format!("Hentai@Home {}", crate::rpc::CLIENT_VERSION))
         .connect_timeout(std::time::Duration::from_secs(5))
         .read_timeout(std::time::Duration::from_secs(30));
-    if let (Some(proxy_type), Some(proxy_host), Some(proxy_port)) =
-        (&config.image_proxy_type, &config.image_proxy_host, config.image_proxy_port)
-    {
+    if let (Some(proxy_type), Some(proxy_host), Some(proxy_port)) = (
+        &config.image_proxy_type,
+        &config.image_proxy_host,
+        config.image_proxy_port,
+    ) {
         if let Ok(proxy_url) = build_proxy_url(proxy_type, proxy_host, proxy_port)
             && let Ok(proxy) = reqwest::Proxy::all(proxy_url.as_str())
         {
             builder = builder.proxy(proxy);
         }
     }
-    builder.build()
+    builder
+        .build()
         .map(Arc::new)
         .map_err(|e| HathError::Network(e.to_string()))
 }
@@ -458,7 +460,12 @@ pub fn build_proxy_url(proxy_type: &str, proxy_host: &str, proxy_port: u16) -> R
     let mut url = match proxy_type {
         "socks" => Url::parse("socks://hath.invalid/"),
         "http" => Url::parse("http://hath.invalid/"),
-        _ => return Err(HathError::Config(format!("invalid proxy type: {}", proxy_type))),
+        _ => {
+            return Err(HathError::Config(format!(
+                "invalid proxy type: {}",
+                proxy_type
+            )));
+        }
     }
     .map_err(|e| HathError::Config(format!("invalid proxy URL base: {}", e)))?;
     if let Ok(ip) = proxy_host.parse::<IpAddr>() {

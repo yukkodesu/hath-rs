@@ -115,9 +115,12 @@ impl Config {
     /// Priority: CLI args > env vars > client_login file.
     pub fn load(args: CliArgs) -> Result<Self> {
         // Resolve credentials: CLI/env > client_login file
-        let (client_id, client_key) = if let (Some(id), Some(ref key_str)) = (args.client_id, args.client_key) {
-            let key = ClientKey::new(key_str)
-                .ok_or_else(|| HathError::Config("client key must be exactly 20 alphanumeric characters".into()))?;
+        let (client_id, client_key) = if let (Some(id), Some(ref key_str)) =
+            (args.client_id, args.client_key)
+        {
+            let key = ClientKey::new(key_str).ok_or_else(|| {
+                HathError::Config("client key must be exactly 20 alphanumeric characters".into())
+            })?;
             (ClientId(id), key)
         } else {
             // Fallback: try client_login file in data dir
@@ -126,10 +129,12 @@ impl Config {
                 let content = std::fs::read_to_string(&login_file)
                     .map_err(|e| HathError::Config(format!("cannot read client_login: {}", e)))?;
                 if let Some((id_str, key_str)) = content.trim().split_once('-') {
-                    let id: u32 = id_str.parse()
-                        .map_err(|_| HathError::Config("invalid client ID in client_login".into()))?;
-                    let key = ClientKey::new(key_str.trim())
-                        .ok_or_else(|| HathError::Config("invalid client key in client_login".into()))?;
+                    let id: u32 = id_str.parse().map_err(|_| {
+                        HathError::Config("invalid client ID in client_login".into())
+                    })?;
+                    let key = ClientKey::new(key_str.trim()).ok_or_else(|| {
+                        HathError::Config("invalid client key in client_login".into())
+                    })?;
                     (ClientId(id), key)
                 } else {
                     return Err(HathError::Config("malformed client_login file".into()));
@@ -200,12 +205,13 @@ impl Config {
     pub fn get_rpc_host(&self, state: &crate::rpc_client::RpcState) -> String {
         let host = if let Some(ref host) = state.rpc_current {
             if let Some(ref failed) = state.rpc_last_failed
-                && *host == *failed {
-                    tracing::debug!("{} was marked as last failed (from cache)", failed);
-                    None
-                } else {
-                    Some(host.clone())
-                }
+                && *host == *failed
+            {
+                tracing::debug!("{} was marked as last failed (from cache)", failed);
+                None
+            } else {
+                Some(host.clone())
+            }
         } else {
             None
         };
@@ -222,13 +228,16 @@ impl Config {
             let dir: isize = if rng.next_u32() & 1 == 0 { -1 } else { 1 };
             let len = self.rpc_servers.len() as isize;
             loop {
-                let candidate = self.rpc_servers[((len + idx) % len) as usize].to_string().to_lowercase();
+                let candidate = self.rpc_servers[((len + idx) % len) as usize]
+                    .to_string()
+                    .to_lowercase();
                 if let Some(ref failed) = state.rpc_last_failed
-                    && candidate == *failed {
-                        tracing::debug!("{} was marked as last failed", failed);
-                        idx += dir;
-                        continue;
-                    }
+                    && candidate == *failed
+                {
+                    tracing::debug!("{} was marked as last failed", failed);
+                    idx += dir;
+                    continue;
+                }
                 tracing::debug!("Selected rpcServerCurrent={}", candidate);
                 break candidate;
             }
@@ -247,18 +256,23 @@ impl Config {
         match setting.as_str() {
             "min_client_build" => {
                 if let Ok(build) = value.parse::<i32>()
-                    && build > crate::rpc::CLIENT_BUILD {
-                        tracing::error!(
-                            "Your client is too old to connect to the Hentai@Home Network. \
+                    && build > crate::rpc::CLIENT_BUILD
+                {
+                    tracing::error!(
+                        "Your client is too old to connect to the Hentai@Home Network. \
                              Required build: {}, our build: {}. Please download a newer version.",
-                            build, crate::rpc::CLIENT_BUILD
-                        );
-                        std::process::exit(1);
-                    }
+                        build,
+                        crate::rpc::CLIENT_BUILD
+                    );
+                    std::process::exit(1);
+                }
             }
             "cur_client_build" => {
                 if let Ok(build) = value.parse::<i32>()
-                    && build > 178 { self.warn_new_client = true; }
+                    && build > 178
+                {
+                    self.warn_new_client = true;
+                }
             }
             "server_time" => {
                 if let Ok(st) = value.parse::<i64>() {
@@ -267,7 +281,8 @@ impl Config {
             }
             "rpc_server_port" => self.rpc_port = value.parse().unwrap_or(80),
             "rpc_server_ip" => {
-                self.rpc_servers = value.split(';')
+                self.rpc_servers = value
+                    .split(';')
                     .filter_map(|s| s.trim().parse::<IpAddr>().ok())
                     .map(crate::utils::normalize_ip)
                     .collect();
@@ -279,15 +294,22 @@ impl Config {
             "host" => {
                 // Normalize IPv4-mapped IPv6 (::ffff:x.x.x.x) to plain IPv4
                 // so per-connection comparisons don't need String::replace.
-                self.client_host = value.parse::<IpAddr>()
+                self.client_host = value
+                    .parse::<IpAddr>()
                     .map(|ip| crate::utils::normalize_ip(ip).to_string())
                     .unwrap_or_else(|_| value.to_string());
             }
-            "port" => { if self.client_port == 0 { self.client_port = value.parse().unwrap_or(0); } }
+            "port" => {
+                if self.client_port == 0 {
+                    self.client_port = value.parse().unwrap_or(0);
+                }
+            }
             "throttle_bytes" => self.throttle_bytes = value.parse().unwrap_or(0),
             "disklimit_bytes" => {
                 let new_limit: u64 = value.parse().unwrap_or(0);
-                if new_limit >= self.disklimit_bytes { self.disklimit_bytes = new_limit; }
+                if new_limit >= self.disklimit_bytes {
+                    self.disklimit_bytes = new_limit;
+                }
             }
             "diskremaining_bytes" => self.diskremaining_bytes = value.parse().unwrap_or(0),
             "filesystem_blocksize" => {
@@ -295,10 +317,16 @@ impl Config {
                 self.filesystem_blocksize = bs.clamp(1, 65536);
             }
             "rescan_cache" => self.rescan_cache = value == "true",
-            "verify_cache" => { self.verify_cache = value == "true"; self.rescan_cache = value == "true"; }
+            "verify_cache" => {
+                self.verify_cache = value == "true";
+                self.rescan_cache = value == "true";
+            }
             "use_less_memory" => self.use_less_memory = value == "true",
             "disable_logging" => self.disable_logging = value == "true",
-            "disable_bwm" => { self.disable_bwm = value == "true"; self.disable_download_bwm = value == "true"; }
+            "disable_bwm" => {
+                self.disable_bwm = value == "true";
+                self.disable_download_bwm = value == "true";
+            }
             "disable_download_bwm" => self.disable_download_bwm = value == "true",
             "disable_file_verification" => self.disable_file_verification = value == "true",
             "disable_ip_origin_check" => self.disable_ip_origin_check = value == "true",
@@ -306,15 +334,21 @@ impl Config {
             "skip_free_space_check" => self.skip_free_space_check = value == "true",
             "flush_logs" => self.flush_logs = value == "true",
             "max_connections" => self.override_conns = value.parse().unwrap_or(0),
-            "max_allowed_filesize" => self.max_allowed_filesize = value.parse().unwrap_or(1073741824),
+            "max_allowed_filesize" => {
+                self.max_allowed_filesize = value.parse().unwrap_or(1073741824)
+            }
             "max_filename_length" => self.max_filename_length = value.parse().unwrap_or(125),
             "static_ranges" => {
                 self.static_ranges.clear();
                 for s in value.split(';') {
-                    if s.len() == 4 { self.static_ranges.insert(s.to_string(), 1); }
+                    if s.len() == 4 {
+                        self.static_ranges.insert(s.to_string(), 1);
+                    }
                 }
             }
-            "static_range_count" => self.static_range_count = value.parse().unwrap_or(self.static_range_count),
+            "static_range_count" => {
+                self.static_range_count = value.parse().unwrap_or(self.static_range_count)
+            }
             "cache_dir" => self.cache_dir = PathBuf::from(value),
             "temp_dir" => self.temp_dir = PathBuf::from(value),
             "data_dir" => self.data_dir = PathBuf::from(value),
@@ -337,7 +371,10 @@ impl Config {
     }
 
     /// Apply settings from a `ServerResponse` into an `ArcSwap<Config>` via rcu.
-    pub fn apply_server_response(config: &arc_swap::ArcSwap<Config>, resp: &crate::rpc::ServerResponse) {
+    pub fn apply_server_response(
+        config: &arc_swap::ArcSwap<Config>,
+        resp: &crate::rpc::ServerResponse,
+    ) {
         config.rcu(|current| {
             let mut new = (**current).clone();
             new.apply_server_settings(&resp.lines);
@@ -347,10 +384,14 @@ impl Config {
 
     pub fn load_client_login(&self) -> Result<Option<(ClientId, ClientKey)>> {
         let login_file = self.data_dir.join("client_login");
-        if !login_file.exists() { return Ok(None); }
+        if !login_file.exists() {
+            return Ok(None);
+        }
         let content = crate::utils::read_string_file(&login_file)?;
         if let Some((id_str, key_str)) = content.trim().split_once('-') {
-            let id: u32 = id_str.parse().map_err(|_| HathError::Config("invalid client ID".into()))?;
+            let id: u32 = id_str
+                .parse()
+                .map_err(|_| HathError::Config("invalid client ID".into()))?;
             let key = ClientKey::new(key_str.trim())
                 .ok_or_else(|| HathError::Config("invalid client key format".into()))?;
             Ok(Some((ClientId(id), key)))
@@ -369,7 +410,13 @@ impl Config {
     }
 
     pub fn initialize_directories(&self) -> Result<()> {
-        for dir in [&self.data_dir, &self.log_dir, &self.cache_dir, &self.temp_dir, &self.download_dir] {
+        for dir in [
+            &self.data_dir,
+            &self.log_dir,
+            &self.cache_dir,
+            &self.temp_dir,
+            &self.download_dir,
+        ] {
             crate::utils::ensure_dir(dir)?;
         }
         Ok(())
@@ -383,8 +430,13 @@ mod tests {
 
     fn test_cli() -> CliArgs {
         CliArgs::try_parse_from([
-            "hath-rs", "--client-id", "12345", "--client-key", "abcde12345abcde12345",
-        ]).unwrap()
+            "hath-rs",
+            "--client-id",
+            "12345",
+            "--client-key",
+            "abcde12345abcde12345",
+        ])
+        .unwrap()
     }
 
     #[test]
@@ -422,6 +474,9 @@ mod tests {
         // ::ffff:192.0.2.1 is IPv4-mapped IPv6 — normalize_ip strips the prefix
         config.apply_setting("rpc_server_ip", "::ffff:192.0.2.1");
 
-        assert_eq!(config.get_rpc_host(&crate::rpc_client::RpcState::default()), "192.0.2.1");
+        assert_eq!(
+            config.get_rpc_host(&crate::rpc_client::RpcState::default()),
+            "192.0.2.1"
+        );
     }
 }
