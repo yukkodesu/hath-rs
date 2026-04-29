@@ -233,7 +233,7 @@ pub async fn run() -> Result<()> {
     {
         tracing::warn!("Failed to notify server about shutdown: {}", e);
     }
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
     server::stop_server(&app_state).await;
     cache.save_persistent_data();
     {
