@@ -1,7 +1,7 @@
 use crate::bandwidth::BandwidthMonitor;
-use crate::body::StreamingBody;
 use crate::error::{HathError, Result};
 use crate::hvfile::HVFile;
+use super::body::StreamingBody;
 use bytes::Bytes;
 use hyper::{Response, StatusCode, header};
 use std::path::{Path, PathBuf};
@@ -12,6 +12,7 @@ use tokio::sync::Notify;
 /// Build a Hyper Response with proper headers.
 /// Java: Cache-Control + Content-Length only added when contentLength > 0.
 /// Server and Date headers are set at the Hyper service layer.
+#[allow(dead_code)]
 pub fn ok_response(body: Bytes, content_type: &str) -> Result<Response<StreamingBody>> {
     let len = body.len();
     let mut builder = Response::builder()

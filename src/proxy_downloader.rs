@@ -17,8 +17,7 @@ use tokio::sync::Notify;
 /// while simultaneously serving data to the requesting HTTPSession.
 ///
 /// After construction, the download runs in a background tokio task.
-/// The caller can create a [`crate::body::StreamingBody`] via
-/// [`StreamingBody::new_proxy`] to stream data to the client as it arrives.
+/// The server response body streams data to the client as it arrives.
 #[allow(dead_code)]
 pub struct ProxyFileDownloader {
     pub content_length: usize,

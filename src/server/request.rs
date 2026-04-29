@@ -20,8 +20,6 @@ pub enum RequestType {
     },
     SpeedTest {
         testsize: u32,
-        testtime: i64,
-        testkey: String,
         valid: bool,
         /// Distinguishes 403 (invalid key) from 400 (malformed URL) when valid=false.
         forbidden: bool,
@@ -103,14 +101,14 @@ fn parse_server_command(url_parts: &[&str], client_ip: IpAddr, config: &Config) 
 fn parse_speed_test(url_parts: &[&str], config: &Config, head_only: bool) -> RequestType {
     if url_parts.len() < 5 {
         // Java: responseStatusCode = 400 when urlparts.length < 5
-        return RequestType::SpeedTest { testsize: 0, testtime: 0, testkey: String::new(), valid: false, forbidden: false, head_only };
+        return RequestType::SpeedTest { testsize: 0, valid: false, forbidden: false, head_only };
     }
     let testsize: u32 = url_parts[2].parse().unwrap_or(0);
     let testtime: i64 = url_parts[3].parse().unwrap_or(0);
     let testkey = url_parts[4].to_string();
     let valid = validate_speedtest(testsize, testtime, &testkey, config);
     // Java: responseStatusCode = 403 for expired or invalid key
-    RequestType::SpeedTest { testsize, testtime, testkey, valid, forbidden: !valid, head_only }
+    RequestType::SpeedTest { testsize, valid, forbidden: !valid, head_only }
 }
 
 /// Validate keystamp for /h/ requests.

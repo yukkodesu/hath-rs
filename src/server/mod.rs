@@ -1,15 +1,21 @@
+mod tls;
+mod access_log;
+mod body;
+mod request;
+mod response;
+
 use crate::bandwidth::BandwidthMonitor;
 use crate::config::Config;
 use crate::error::{HathError, Result};
-use crate::request::{self, RequestType};
-use crate::response;
 use crate::stats::Stats;
 use crate::cache::CacheHandler;
-use crate::access_log::AccessLogService;
 use crate::rpc_client::RpcClient;
-use crate::rpc::{self, Action};
+use crate::rpc;
 use crate::utils;
 use crate::proxy_downloader::ProxyFileDownloader;
+use self::access_log::AccessLogService;
+use self::body::StreamingBody;
+use self::request::RequestType;
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use hyper::body::Incoming;
@@ -17,12 +23,8 @@ use hyper::server::conn::http1;
 use hyper::service::Service;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
-use crate::body::StreamingBody;
 use hyper::header;
-use openssl::asn1::Asn1Time;
-use openssl::pkcs12::Pkcs12;
-use openssl::provider::Provider;
-use openssl::ssl::{SslAcceptor, SslContext, SslMethod, SslMode, SslOptions};
+use openssl::ssl::SslContext;
 use reqwest::Url;
 use std::collections::HashMap;
 use std::future::Future;
@@ -30,7 +32,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, Notify};
 use regex::Regex;
@@ -576,97 +578,6 @@ fn build_threaded_proxy_test_url(
     Ok(url)
 }
 
-/// Build an OpenSSL SslContext from the PKCS12 certificate.
-/// Uses OpenSSL for both PKCS12 parsing and TLS context building.
-/// If `force_download` is true, always re-download the cert from the RPC server.
-/// Returns (context, cert_expiry_unix_seconds).
-async fn build_tls_acceptor(config: &Config, force_download: bool) -> Result<(SslContext, i64)> {
-    let cert_path = config.data_dir.join("hathcert.p12");
-
-    if force_download || !cert_path.exists() {
-        let cert_url = rpc::make_rpc_url(Action::GetCertificate, "", config, &crate::rpc_client::RpcState::default())?;
-        let downloader = crate::downloader::FileDownloader::new(
-            cert_url, 10000, 300000,
-            crate::downloader::DownloadMode::File(cert_path.clone()),
-            false,
-        );
-        downloader.download().await?;
-    }
-
-    let cert_data = std::fs::read(&cert_path)?;
-    let pkcs12 = Pkcs12::from_der(&cert_data)?;
-    // OpenSSL 3.x disables legacy algorithms (including RC2-40-CBC used by
-    // the H@H server's PKCS12 certificate bags) unless the legacy provider is
-    // explicitly loaded. retain_fallbacks=true keeps the default provider active.
-    let _legacy = Provider::try_load(None, "legacy", true)?;
-    let pkcs12 = pkcs12.parse2(config.client_key.as_str())?;
-
-    let cert = pkcs12.cert.as_ref()
-        .ok_or_else(|| HathError::Tls("no certificate in PKCS12".into()))?;
-    let key = pkcs12.pkey.as_ref()
-        .ok_or_else(|| HathError::Tls("no private key in PKCS12".into()))?;
-
-    // Java: isCertExpired() — cert must not expire within the next 24 hours
-    let one_day_from_now = Asn1Time::days_from_now(1)?;
-    let not_after = cert.not_after();
-    if not_after.compare(&one_day_from_now)? == std::cmp::Ordering::Less {
-        tracing::error!(
-            "The retrieved certificate is expired, or the system time is off by more than a day. \
-             Correct the system time and try again."
-        );
-        return Err(HathError::CertExpired);
-    }
-
-    // Compute cert expiry as a Unix timestamp for periodic checks.
-    // ASN1_TIME_diff(from, to) returns to-from, so now.diff(not_after) gives
-    // the remaining seconds until expiry (positive while cert is still valid).
-    let now_asn1 = Asn1Time::days_from_now(0)?;
-    let diff = now_asn1.diff(not_after)?;
-    let now_unix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
-    let cert_expiry_unix = now_unix + diff.days as i64 * 86400 + diff.secs as i64;
-
-    // Build OpenSSL SslContext for server-side TLS.
-    // Use SslAcceptor as base to get proper server defaults (AUTO_RETRY, bug
-    // workarounds via SslOptions::ALL, DH params, etc.) that a raw
-    // SslContext::builder does not set. This matches how Java's SSLContext
-    // initialises its server socket with JVM-managed defaults.
-    let mut ctx_builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls_server())
-        .map_err(|e| HathError::Tls(format!("Failed to create SslAcceptorBuilder: {}", e)))?;
-
-    // Match Java: setEnabledProtocols("TLSv1.3", "TLSv1.2")
-    ctx_builder
-        .set_min_proto_version(Some(openssl::ssl::SslVersion::TLS1_2))
-        .map_err(|e| HathError::Tls(format!("Failed to set min protocol: {}", e)))?;
-
-    // Ensure AUTO_RETRY and write-buffer modes are set (included in mozilla_intermediate_v5
-    // via the internal ctx() helper, but set explicitly for clarity).
-    ctx_builder.set_mode(
-        SslMode::AUTO_RETRY | SslMode::ACCEPT_MOVING_WRITE_BUFFER | SslMode::ENABLE_PARTIAL_WRITE,
-    );
-
-    // Additional compatibility options on top of SslOptions::ALL already set by the builder.
-    ctx_builder.set_options(SslOptions::NO_SSLV2 | SslOptions::NO_SSLV3);
-
-    ctx_builder
-        .set_certificate(cert)
-        .map_err(|e| HathError::Tls(format!("Failed to set certificate: {}", e)))?;
-    ctx_builder
-        .set_private_key(key)
-        .map_err(|e| HathError::Tls(format!("Failed to set private key: {}", e)))?;
-    ctx_builder
-        .check_private_key()
-        .map_err(|e| HathError::Tls(format!("Certificate/key mismatch: {}", e)))?;
-    if let Some(chain) = pkcs12.ca {
-        for ca in chain {
-            ctx_builder
-                .add_extra_chain_cert(ca)
-                .map_err(|e| HathError::Tls(format!("Failed to add chain cert: {}", e)))?;
-        }
-    }
-    let ctx = ctx_builder.build().into_context();
-    Ok((ctx, cert_expiry_unix))
-}
-
 /// Spawn the HTTP server. Returns a oneshot receiver that fires when
 /// the server binds, and the restart token (to store in AppState).
 pub fn spawn_server(
@@ -690,7 +601,7 @@ pub fn spawn_server(
 
 /// Spawn the certificate refresh watcher.
 /// Watches for refresh_certs RPC commands and performs a full server restart
-/// (suspend → reject new connections → drain → shutdown old listener → restart → resume).
+/// (suspend → reject new connections → shutdown old listener → drain → restart → resume).
 pub fn spawn_cert_refresh_watcher(
     state: AppState,
     rpc_client: Arc<RpcClient>,
@@ -722,21 +633,27 @@ pub fn spawn_cert_refresh_watcher(
                 }
             }
 
-            // 2. Stop accepting new connections
+            // Java waits 5s before httpServerShutdown(true), and that helper
+            // waits another 5s before closing the listener.
+            tokio::time::sleep(Duration::from_secs(10)).await;
+
+            // 2. Reject non-RPC traffic while the old listener is stopping.
             state.allow_normal_connections.store(false, Ordering::SeqCst);
 
-            // 3. Wait for in-flight requests to drain (Java: up to ~25s)
+            // 3. Stop the old accept loop before draining. Java closes the
+            // listener first, then waits for existing sessions to finish; this
+            // avoids doing fresh TLS handshakes during the refresh window.
+            state.server_terminated.store(false, Ordering::Release);
+            if let Some(token) = state.server_restart_token.load_full() {
+                token.cancel();
+            }
+
+            // 4. Wait for in-flight requests to drain (Java: up to ~25s)
             for _ in 0..5 {
                 let active = state.active_connections.load(Ordering::Relaxed);
                 if active == 0 { break; }
                 tracing::info!("Waiting for {} active request(s) to finish...", active);
                 tokio::time::sleep(Duration::from_secs(5)).await;
-            }
-
-            // 4. Reset terminated flag, then cancel restart token to stop old accept loop
-            state.server_terminated.store(false, Ordering::Release);
-            if let Some(token) = state.server_restart_token.load_full() {
-                token.cancel();
             }
 
             // 5. Wait for old server to terminate (Java: up to 300s)
@@ -868,11 +785,7 @@ pub fn spawn_time_cert_check(
                 tracing::warn!("System time off by >24h. Correct your system clock.");
             }
             if let Some(expiry) = *state.cert_expiry.lock().await {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs() as i64;
-                if expiry - now < 86400 {
+                if tls::is_cert_expired(expiry) {
                     tracing::error!(
                         "Either the system clock is significantly wrong, or something has \
                          gone wrong with certificate renewal. Check your system clock and \
@@ -910,7 +823,7 @@ pub async fn start_server(
 
     // Build TLS acceptor (downloads cert if needed)
     // Java: always re-downloads the certificate on startup.
-    let (tls_acceptor, cert_expiry) = match build_tls_acceptor(&config, true).await {
+    let (tls_acceptor, cert_expiry) = match tls::build_tls_acceptor(&config, true).await {
         Ok((a, expiry)) => (a, expiry),
         Err(e) => {
             if let Some(tx) = ready_tx {
