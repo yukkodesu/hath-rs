@@ -1,16 +1,11 @@
 use crate::config::Config;
 use crate::error::{HathError, Result};
 use crate::rpc::{self, Action};
-use crate::utils;
 
 use openssl::asn1::Asn1Time;
-use openssl::hash::MessageDigest;
-use openssl::nid::Nid;
 use openssl::pkcs12::Pkcs12;
 use openssl::provider::Provider;
 use openssl::ssl::{SslContext, SslMethod};
-use openssl::x509::{X509NameRef, X509Ref};
-use std::fmt::Write;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const SECS_PER_DAY: i64 = 86400;
