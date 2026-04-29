@@ -70,7 +70,7 @@ pub struct AppState {
     pub cert_refresh_notify: Arc<Notify>,
     /// Shutdown token for the currently-running server accept loop.
     /// Swapped during cert refresh to terminate the old listener and start a new one.
-    pub server_restart_token: Arc<ArcSwapOption<tokio_util::sync::CancellationToken>>,
+    pub server_shutdown_token: Arc<ArcSwapOption<tokio_util::sync::CancellationToken>>,
     /// Set to true by start_server() after the accept loop exits.
     /// The cert refresh watcher polls this to wait for the old server to terminate.
     pub server_terminated: Arc<AtomicBool>,
@@ -578,25 +578,72 @@ fn build_threaded_proxy_test_url(
     Ok(url)
 }
 
-/// Spawn the HTTP server. Returns a oneshot receiver that fires when
-/// the server binds, and the restart token (to store in AppState).
-pub fn spawn_server(
+/// Start one HTTP server generation. Returns a oneshot receiver that fires when
+/// the server binds, and the generation shutdown token (to store in AppState).
+pub fn start_server(
     state: AppState,
-    shutdown: tokio_util::sync::CancellationToken,
 ) -> (
     tokio::sync::oneshot::Receiver<std::result::Result<u16, String>>,
     tokio_util::sync::CancellationToken,
 ) {
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-    let restart_token = tokio_util::sync::CancellationToken::new();
-    let restart_clone = restart_token.clone();
-    let shutdown_clone = shutdown.clone();
+    let server_shutdown_token = tokio_util::sync::CancellationToken::new();
+    let server_shutdown = server_shutdown_token.clone();
+    state.server_terminated.store(false, Ordering::Release);
     tokio::spawn(async move {
-        if let Err(e) = start_server(state, shutdown_clone, restart_clone, Some(ready_tx)).await {
+        if let Err(e) = run_server(state, server_shutdown, Some(ready_tx)).await {
             tracing::error!("Server error: {}", e);
         }
     });
-    (ready_rx, restart_token)
+    (ready_rx, server_shutdown_token)
+}
+
+/// Stop the current HTTP server generation and drain in-flight requests.
+///
+/// RPC lifecycle actions such as client_stop/client_suspend are intentionally
+/// handled by callers. This helper only quiesces the local HTTP server.
+pub async fn stop_server(state: &AppState) {
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    state.allow_normal_connections.store(false, Ordering::SeqCst);
+
+    if let Some(token) = state.server_shutdown_token.load_full() {
+        token.cancel();
+    }
+
+    for close_wait_cycles in 1..25 {
+        let active = state.active_connections.load(Ordering::Relaxed);
+        if active == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        if close_wait_cycles % 5 == 0 {
+            let remaining = 25 - close_wait_cycles;
+            tracing::info!(
+                "Waiting for {} request(s) to finish; will wait for another {} seconds",
+                active,
+                remaining
+            );
+        }
+    }
+
+    let mut wait_cycles = 0u32;
+    loop {
+        if state.server_terminated.load(Ordering::Acquire) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        wait_cycles += 1;
+        if wait_cycles >= 60 {
+            tracing::warn!("Server did not terminate after 300s");
+            break;
+        }
+        if wait_cycles > 1 {
+            tracing::info!(
+                "Waiting for HTTPServer to fully terminate... (waited {} seconds)",
+                wait_cycles * 5
+            );
+        }
+    }
 }
 
 /// Spawn the certificate refresh watcher.
@@ -637,71 +684,22 @@ pub fn spawn_cert_refresh_watcher(
             // waits another 5s before closing the listener.
             tokio::time::sleep(Duration::from_secs(10)).await;
 
-            // 2. Reject non-RPC traffic while the old listener is stopping.
-            state.allow_normal_connections.store(false, Ordering::SeqCst);
-
-            // 3. Stop the old accept loop before draining. Java closes the
-            // listener first, then waits for existing sessions to finish; this
-            // avoids doing fresh TLS handshakes during the refresh window.
-            state.server_terminated.store(false, Ordering::Release);
-            if let Some(token) = state.server_restart_token.load_full() {
-                token.cancel();
-            }
-
-            // 4. Wait for in-flight requests to drain (Java: up to ~25s)
-            for _ in 0..5 {
-                let active = state.active_connections.load(Ordering::Relaxed);
-                if active == 0 { break; }
-                tracing::info!("Waiting for {} active request(s) to finish...", active);
-                tokio::time::sleep(Duration::from_secs(5)).await;
-            }
-
-            // 5. Wait for old server to terminate (Java: up to 300s)
-            let mut wait_cycles = 0u32;
-            loop {
-                if state.server_terminated.load(Ordering::Acquire) {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                wait_cycles += 1;
-                if wait_cycles >= 60 {
-                    tracing::warn!(
-                        "Server did not terminate after 300s, forcing restart"
-                    );
-                    break;
-                }
-                if wait_cycles > 1 {
-                    tracing::info!(
-                        "Waiting for HTTPServer to fully terminate... (waited {} seconds)",
-                        wait_cycles * 5
-                    );
-                }
-            }
+            // 2-5. Reject non-RPC traffic, stop the listener, drain active
+            // requests, and wait for the old server generation to terminate.
+            stop_server(&state).await;
 
             // 6. Wait 1s
             tokio::time::sleep(Duration::from_secs(1)).await;
 
-            // 7. Restart server with new restart token
-            let new_restart = tokio_util::sync::CancellationToken::new();
-            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-            let server_state = state.clone();
-            let new_restart_clone = new_restart.clone();
-            let global_shutdown_clone = shutdown.clone();
-            tokio::spawn(async move {
-                if let Err(e) = start_server(
-                    server_state,
-                    global_shutdown_clone,
-                    new_restart_clone,
-                    Some(ready_tx),
-                )
-                .await
-                {
-                    tracing::error!("Server restart error: {}", e);
-                }
-            });
+            if shutdown.is_cancelled() {
+                break;
+            }
+
+            // 7. Start a fresh server generation with a new shutdown token.
+            let (ready_rx, new_shutdown) = start_server(state.clone());
             state
-                .server_restart_token
-                .store(Some(Arc::new(new_restart)));
+                .server_shutdown_token
+                .store(Some(Arc::new(new_shutdown)));
 
             // 8. Wait for new server to bind
             match ready_rx.await {
@@ -811,12 +809,11 @@ pub async fn nuke_old_connections(_state: &AppState) {
     // We rely on Hyper's built-in timeouts instead of Java's manual nuke.
 }
 
-/// Start the TLS HTTP server. Sends readiness via `ready_tx` after successful bind.
-/// Listens for both `shutdown` (global/Ctrl+C) and `restart` (cert refresh).
-pub async fn start_server(
+/// Run one TLS HTTP server generation. Sends readiness via `ready_tx` after successful bind.
+/// The generation stops only when its server shutdown token is cancelled.
+async fn run_server(
     state: AppState,
-    shutdown: tokio_util::sync::CancellationToken,
-    restart: tokio_util::sync::CancellationToken,
+    server_shutdown: tokio_util::sync::CancellationToken,
     ready_tx: Option<tokio::sync::oneshot::Sender<std::result::Result<u16, String>>>,
 ) -> Result<()> {
     let config = state.config.load_full();
@@ -867,8 +864,7 @@ pub async fn start_server(
 
     loop {
         tokio::select! {
-            _ = shutdown.cancelled() => break,
-            _ = restart.cancelled() => break,
+            _ = server_shutdown.cancelled() => break,
             result = listener.accept() => {
                 let (stream, remote_addr) = match result {
                     Ok(c) => c,

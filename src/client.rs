@@ -115,15 +115,15 @@ pub async fn run() -> Result<()> {
         last_overload_notification: Arc::new(Mutex::new(None)),
         do_cert_refresh: Arc::new(AtomicBool::new(false)),
         cert_refresh_notify: Arc::new(Notify::new()),
-        server_restart_token: Arc::new(ArcSwapOption::const_empty()),
+        server_shutdown_token: Arc::new(ArcSwapOption::const_empty()),
         server_terminated: Arc::new(AtomicBool::new(false)),
         proxy_client,
     };
 
-    let (ready_rx, restart_token) = server::spawn_server(app_state.clone(), shutdown.clone());
+    let (ready_rx, server_shutdown_token) = server::start_server(app_state.clone());
     app_state
-        .server_restart_token
-        .store(Some(Arc::new(restart_token)));
+        .server_shutdown_token
+        .store(Some(Arc::new(server_shutdown_token)));
 
     // Wait for server to bind before notifying the RPC server
     match ready_rx.await {
@@ -215,15 +215,16 @@ pub async fn run() -> Result<()> {
     // Wait for shutdown signal
     shutdown.cancelled().await;
 
-    // Graceful shutdown (Java order: client_stop → drain connections → save data).
+    // Graceful shutdown (Java order: client_stop → stop listener → drain → save data).
     // Java: reportShutdown is only set after successful notifyStart().
     // Unlike allow_connections, it's never toggled during cert refresh.
     tracing::info!("Shutting down...");
-    // Waiting connections to drain
-    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
     if report_shutdown.load(Ordering::Relaxed) {
-        rpc_client.client_stop().await.ok();
+        if let Err(e) = rpc_client.client_stop().await {
+            tracing::warn!("Failed to notify server about shutdown: {}", e);
+        }
     }
+    server::stop_server(&app_state).await;
     cache.save_persistent_data();
     {
         let cfg = config.load();
