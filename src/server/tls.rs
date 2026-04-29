@@ -27,57 +27,6 @@ pub(super) fn is_cert_expired(cert_expiry_unix: i64) -> bool {
     cert_expiry_unix < unix_time_secs().saturating_add(CERT_RENEWAL_WINDOW_SECS)
 }
 
-fn x509_name_to_string(name: &X509NameRef) -> String {
-    let mut out = String::with_capacity(128);
-    for entry in name.entries() {
-        if !out.is_empty() {
-            out.push_str(", ");
-        }
-        let key = entry.object().nid().short_name().unwrap_or("UNKNOWN");
-        match entry.data().as_utf8() {
-            Ok(value) => {
-                let _ = write!(out, "{}={}", key, value);
-            }
-            Err(_) => {
-                let _ = write!(out, "{}=<non-utf8>", key);
-            }
-        }
-    }
-    out
-}
-
-fn has_hath_network_common_name(name: &X509NameRef) -> bool {
-    name.entries_by_nid(Nid::COMMONNAME).any(|entry| {
-        let data = entry.data();
-        let raw = data.as_slice();
-        if raw.eq_ignore_ascii_case(b"hath.network") {
-            return true;
-        }
-        if raw.is_ascii() {
-            return false;
-        }
-        data.as_utf8()
-            .is_ok_and(|value| (&*value).eq_ignore_ascii_case("hath.network"))
-    })
-}
-
-fn cert_identity_summary(cert: &X509Ref) -> Result<(String, String, String)> {
-    let subject = x509_name_to_string(cert.subject_name());
-    let issuer = x509_name_to_string(cert.issuer_name());
-    let fingerprint = utils::hex_encode(cert.digest(MessageDigest::sha256())?.as_ref());
-    Ok((subject, issuer, fingerprint))
-}
-
-fn ensure_hath_certificate_identity(cert: &X509Ref) -> Result<(String, String, String)> {
-    if !has_hath_network_common_name(cert.subject_name()) {
-        return Err(HathError::Tls(format!(
-            "unexpected certificate subject: {}; expected CN=hath.network",
-            x509_name_to_string(cert.subject_name())
-        )));
-    }
-    cert_identity_summary(cert)
-}
-
 /// Build an OpenSSL SslContext from the PKCS12 certificate.
 /// Uses OpenSSL for both PKCS12 parsing and TLS context building.
 /// If `force_download` is true, always re-download the cert from the RPC server.
@@ -121,7 +70,6 @@ pub(super) async fn build_tls_acceptor(
         .pkey
         .as_ref()
         .ok_or_else(|| HathError::Tls("no private key in PKCS12".into()))?;
-    let (subject, issuer, fingerprint) = ensure_hath_certificate_identity(cert)?;
 
     let not_after = cert.not_after();
 
@@ -141,14 +89,6 @@ pub(super) async fn build_tls_acceptor(
         );
         return Err(HathError::CertExpired);
     }
-    tracing::info!(
-        "Initialized TLS certificate subject={} issuer={} not_after={} sha256={}",
-        subject,
-        issuer,
-        not_after,
-        fingerprint
-    );
-
     // Java builds SSLContext.getInstance("TLS"), leaves cipher suites and other
     // TLS parameters at provider defaults, then enables TLSv1.3/TLSv1.2 (or
     // TLSv1.2 when TLSv1.3 is unavailable). Mirror that by only rejecting
