@@ -693,6 +693,7 @@ pub fn start_server(
 /// RPC lifecycle actions such as client_stop/client_suspend are intentionally
 /// handled by callers. This helper only quiesces the local HTTP server.
 pub async fn stop_server(state: &AppState) {
+    tracing::info!("Stopping server");
     state
         .allow_normal_connections
         .store(false, Ordering::SeqCst);
