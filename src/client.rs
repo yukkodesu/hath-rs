@@ -36,12 +36,15 @@ pub async fn run() -> Result<()> {
 
     let shutdown = tokio_util::sync::CancellationToken::new();
 
-    // Handle Ctrl+C / SIGTERM for graceful shutdown (Java: ShutdownHook)
+    // Handle shutdown signals for graceful exit (Java: ShutdownHook).
+    // On Unix: SIGINT (Ctrl+C), SIGTERM (docker stop / systemctl stop), SIGQUIT.
+    // On Windows: ctrl_c() covers Ctrl+C, Ctrl+Break, and console close events.
+    // SIGTERM must be caught on Unix — docker stop sends SIGTERM, and without a
+    // handler the process is SIGKILL'd before persistent cache data can be saved.
     {
         let s = shutdown.clone();
         tokio::spawn(async move {
-            tokio::signal::ctrl_c().await.ok();
-            tracing::info!("Interrupt received, shutting down gracefully...");
+            shutdown_signal().await;
             s.cancel();
         });
     }
@@ -228,4 +231,28 @@ pub async fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Wait for any shutdown signal.
+/// Unix: SIGINT, SIGTERM, or SIGQUIT.
+/// Windows: Ctrl+C, Ctrl+Break, or console close (all via ctrl_c()).
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = signal(SignalKind::terminate())
+            .expect("failed to register SIGTERM handler");
+        let mut sigquit = signal(SignalKind::quit())
+            .expect("failed to register SIGQUIT handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => tracing::info!("SIGINT received, shutting down gracefully..."),
+            _ = sigterm.recv() => tracing::info!("SIGTERM received, shutting down gracefully..."),
+            _ = sigquit.recv() => tracing::info!("SIGQUIT received, shutting down gracefully..."),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await.ok();
+        tracing::info!("Interrupt received, shutting down gracefully...");
+    }
 }
