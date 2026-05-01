@@ -212,15 +212,18 @@ impl<B: BodyCompletionStatus> AccessLogBody<B> {
 
     fn log_completion(&mut self, completion: AccessLogCompletion) {
         if let Some(info) = self.info.take() {
-            tracing::info!(
-                "{}",
-                access_log_completion_line(
-                    &info,
-                    self.content_length,
-                    self.start.elapsed(),
-                    completion
-                )
+            let line = access_log_completion_line(
+                &info,
+                self.content_length,
+                self.start.elapsed(),
+                completion,
             );
+            match completion {
+                AccessLogCompletion::Incomplete { .. } => tracing::warn!("{}", line),
+                AccessLogCompletion::Finished | AccessLogCompletion::Aborted { .. } => {
+                    tracing::info!("{}", line);
+                }
+            }
         }
     }
 }
