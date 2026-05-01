@@ -95,6 +95,14 @@ impl ProxyFileDownloader {
                     }
                 };
 
+                if resp.status() != reqwest::StatusCode::OK {
+                    last_err = Some(HathError::ProxyDownloader {
+                        status: 502,
+                        message: format!("upstream returned {}", resp.status()),
+                    });
+                    continue;
+                }
+
                 let content_length = match resp.content_length() {
                     Some(n) => n,
                     None => {
