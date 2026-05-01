@@ -11,6 +11,18 @@ use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{oneshot, watch};
 
+/// Why a proxy download failed, carried by `DownloadState::Failed`.
+/// Kept in this module so it can evolve independently of `BodyIncompleteReason`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DownloadFailReason {
+    PrematureEof,
+    NetworkError,
+    Timeout,
+    DiskWriteError,
+    Sha1Mismatch,
+    FinalizeFailed,
+}
+
 /// State published by download_task to StreamingBody via watch channel.
 #[derive(Clone, Debug)]
 pub enum DownloadState {
@@ -18,8 +30,8 @@ pub enum DownloadState {
     InProgress(u64),
     /// Download complete: SHA1 verified, file renamed to cache.
     Done,
-    /// Download failed: network error, disk error, SHA1 mismatch, or rename failure.
-    Failed,
+    /// Download failed with a specific reason.
+    Failed(DownloadFailReason),
 }
 
 /// Streaming proxy download: downloads from an upstream image server into a
@@ -179,10 +191,7 @@ impl ProxyFileDownloader {
         }))
     }
 
-    /// Download `resp` into `temp_file`, publishing progress via `watch_tx`.
-    /// On success + SHA1 match: rename temp_file → cache and send Done.
-    /// On any failure: delete temp_file and send Failed.
-    /// Never observes body state — runs to completion regardless of body drop.
+    #[allow(clippy::too_many_arguments)]
     async fn download_task(
         mut resp: reqwest::Response,
         watch_tx: watch::Sender<DownloadState>,
@@ -203,7 +212,7 @@ impl ProxyFileDownloader {
             Err(e) => {
                 tracing::warn!("Proxy download: cannot open temp file for {}: {}", fileid, e);
                 utils::remove_file(&temp_file);
-                let _ = watch_tx.send(DownloadState::Failed);
+                let _ = watch_tx.send(DownloadState::Failed(DownloadFailReason::DiskWriteError));
                 return;
             }
         };
@@ -212,6 +221,7 @@ impl ProxyFileDownloader {
         let mut downloaded = 0u64;
         let download_start = std::time::Instant::now();
         let mut success = false;
+        let mut fail_reason = DownloadFailReason::NetworkError;
 
         loop {
             let chunk = match resp.chunk().await {
@@ -220,6 +230,7 @@ impl ProxyFileDownloader {
                     if downloaded == expected_size {
                         success = true;
                     } else {
+                        fail_reason = DownloadFailReason::PrematureEof;
                         tracing::warn!(
                             "Proxy download: premature EOF for {} ({} of {} bytes)",
                             fileid,
@@ -230,6 +241,7 @@ impl ProxyFileDownloader {
                     break;
                 }
                 Err(e) => {
+                    fail_reason = DownloadFailReason::NetworkError;
                     tracing::warn!(
                         "Proxy download: error for {} ({} of {} bytes): {}",
                         fileid,
@@ -242,6 +254,7 @@ impl ProxyFileDownloader {
             };
 
             if download_start.elapsed() > std::time::Duration::from_secs(300) {
+                fail_reason = DownloadFailReason::Timeout;
                 tracing::warn!("Proxy download: total time limit exceeded for {}", fileid);
                 break;
             }
@@ -249,6 +262,7 @@ impl ProxyFileDownloader {
             sha1::Digest::update(&mut sha1, &chunk);
 
             if let Err(e) = file.write_all(&chunk).await {
+                fail_reason = DownloadFailReason::DiskWriteError;
                 tracing::warn!("Proxy download: disk write error for {}: {}", fileid, e);
                 break;
             }
@@ -276,6 +290,7 @@ impl ProxyFileDownloader {
                                 fileid,
                                 e
                             );
+                            fail_reason = DownloadFailReason::FinalizeFailed;
                         }
                         Ok(()) => match tokio::fs::rename(&temp_file, &cache_path).await {
                             Ok(()) => {
@@ -296,6 +311,7 @@ impl ProxyFileDownloader {
                                     fileid,
                                     e
                                 );
+                                fail_reason = DownloadFailReason::FinalizeFailed;
                             }
                         },
                     }
@@ -307,11 +323,12 @@ impl ProxyFileDownloader {
                     expected_hash,
                     digest
                 );
+                fail_reason = DownloadFailReason::Sha1Mismatch;
             }
         }
 
         utils::remove_file(&temp_file);
-        let _ = watch_tx.send(DownloadState::Failed);
+        let _ = watch_tx.send(DownloadState::Failed(fail_reason));
     }
 
     fn create_temp_file(hv_file: &HVFile, config: &Config) -> Result<PathBuf> {

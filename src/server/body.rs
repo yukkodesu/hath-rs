@@ -21,7 +21,7 @@ use std::task::{Context, Poll};
 use tokio::sync::{oneshot, watch};
 
 use crate::bandwidth::BandwidthMonitor;
-use crate::proxy_downloader::DownloadState;
+use crate::proxy_downloader::{DownloadFailReason, DownloadState};
 use crate::stats::Stats;
 
 /// Java Settings.TCP_PACKET_SIZE = 1460
@@ -127,6 +127,17 @@ pub trait BodyCompletionStatus {
     fn completion_status(&self) -> BodyCompletionSnapshot;
 }
 
+pub struct FileBodyParams {
+    pub file: std::fs::File,
+    pub path: PathBuf,
+    pub total_size: usize,
+    pub expected_hash: String,
+    pub verify: bool,
+    pub cache_handler: Option<Arc<crate::cache::CacheHandler>>,
+    pub bwm: Option<Arc<BandwidthMonitor>>,
+    pub stats: Option<Arc<Stats>>,
+}
+
 impl StreamingBody {
     /// Create a new static body from pre-loaded data (zero-copy for `Bytes::from_static`).
     pub fn new(data: Bytes, bwm: Option<Arc<BandwidthMonitor>>) -> Self {
@@ -139,32 +150,23 @@ impl StreamingBody {
     }
 
     /// Create a file-streaming body from an already-open file handle.
-    pub fn new_file(
-        file: std::fs::File,
-        path: PathBuf,
-        total_size: usize,
-        expected_hash: String,
-        verify: bool,
-        cache_handler: Option<Arc<crate::cache::CacheHandler>>,
-        bwm: Option<Arc<BandwidthMonitor>>,
-        stats: Option<Arc<Stats>>,
-    ) -> Self {
+    pub fn new_file(p: FileBodyParams) -> Self {
         Self {
             source: DataSource::File {
-                file,
+                file: p.file,
                 file_buf: BytesMut::with_capacity(FILE_BUFFER_SIZE),
                 sha1: sha1::Sha1::new(),
-                expected_hash,
-                to_delete: if verify { Some(path) } else { None },
-                cache_handler,
+                expected_hash: p.expected_hash,
+                to_delete: if p.verify { Some(p.path) } else { None },
+                cache_handler: p.cache_handler,
             },
             offset: 0,
-            total_size,
-            bwm,
+            total_size: p.total_size,
+            bwm: p.bwm,
             throttle_fut: None,
             throttled: false,
             completion: BodyCompletion::Running,
-            stats,
+            stats: p.stats,
         }
     }
 
@@ -395,7 +397,7 @@ impl Body for StreamingBody {
                 enum ProxyGate {
                     Ready,
                     WaitAndContinue,
-                    TerminalFailure,
+                    TerminalFailure(BodyIncompleteReason),
                 }
 
                 let gate = if let DataSource::Proxy {
@@ -405,12 +407,19 @@ impl Body for StreamingBody {
                 } = &mut self.source
                 {
                     // Sample the latest watch state without holding the borrow.
-                    let (write_offset, terminal) = {
+                    let (write_offset, fail_incomplete) = {
                         let state = watch_rx.borrow_and_update();
                         match *state {
-                            DownloadState::InProgress(n) => (n, false),
-                            DownloadState::Done => (current_total as u64, true),
-                            DownloadState::Failed => (0, true),
+                            DownloadState::InProgress(n) => (n, None),
+                            DownloadState::Done => (current_total as u64, None),
+                            DownloadState::Failed(reason) => {
+                                let incomplete = match reason {
+                                    DownloadFailReason::Timeout => BodyIncompleteReason::ProxyTimeout,
+                                    DownloadFailReason::NetworkError => BodyIncompleteReason::ProxyReadError,
+                                    _ => BodyIncompleteReason::ProxyEndedEarly,
+                                };
+                                (0, Some(incomplete))
+                            }
                         }
                     };
 
@@ -419,8 +428,8 @@ impl Body for StreamingBody {
                     if have_enough {
                         *wait_fut = None;
                         ProxyGate::Ready
-                    } else if terminal {
-                        ProxyGate::TerminalFailure
+                    } else if let Some(incomplete) = fail_incomplete {
+                        ProxyGate::TerminalFailure(incomplete)
                     } else {
                         // Not enough data yet — wait for watch to fire.
                         if wait_fut.is_none() {
@@ -449,17 +458,18 @@ impl Body for StreamingBody {
                 match gate {
                     ProxyGate::Ready => {}
                     ProxyGate::WaitAndContinue => continue,
-                    ProxyGate::TerminalFailure => {
+                    ProxyGate::TerminalFailure(incomplete) => {
                         // Log with temp_file path for context.
                         if let DataSource::Proxy { temp_file, .. } = &self.source {
                             tracing::warn!(
-                                "Proxy body: download ended early for {} (offset={} total={})",
+                                "Proxy body: download failed ({}) for {} (offset={} total={})",
+                                incomplete.as_str(),
                                 temp_file.display(),
                                 current_offset,
                                 current_total,
                             );
                         }
-                        self.finish_with(Some(BodyIncompleteReason::ProxyEndedEarly));
+                        self.finish_with(Some(incomplete));
                         return Poll::Ready(None);
                     }
                 }
@@ -591,16 +601,16 @@ mod tests {
         std::fs::write(&path, b"complete body").unwrap();
         let file = std::fs::File::open(&path).unwrap();
 
-        let mut body = StreamingBody::new_file(
+        let mut body = StreamingBody::new_file(FileBodyParams {
             file,
-            path.clone(),
-            "complete body".len(),
-            "0000000000000000000000000000000000000000".to_string(),
-            true,
-            None,
-            None,
-            None,
-        );
+            path: path.clone(),
+            total_size: "complete body".len(),
+            expected_hash: "0000000000000000000000000000000000000000".to_string(),
+            verify: true,
+            cache_handler: None,
+            bwm: None,
+            stats: None,
+        });
         body.offset = 4;
         body.finish();
 
@@ -619,16 +629,16 @@ mod tests {
         std::fs::write(&path, b"short").unwrap();
         let file = std::fs::File::open(&path).unwrap();
 
-        let mut body = StreamingBody::new_file(
+        let mut body = StreamingBody::new_file(FileBodyParams {
             file,
             path,
-            10,
-            "0000000000000000000000000000000000000000".to_string(),
-            false,
-            None,
-            None,
-            None,
-        );
+            total_size: 10,
+            expected_hash: "0000000000000000000000000000000000000000".to_string(),
+            verify: false,
+            cache_handler: None,
+            bwm: None,
+            stats: None,
+        });
 
         let frame = body.frame().await.unwrap().unwrap();
         assert_eq!(&frame.into_data().ok().unwrap()[..], b"short");
@@ -692,12 +702,12 @@ mod tests {
 
         // Signal failure after a short delay.
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        let _ = tx.send(DownloadState::Failed);
+        let _ = tx.send(DownloadState::Failed(DownloadFailReason::NetworkError));
 
         let completion = handle.await.unwrap();
         assert_eq!(
             completion,
-            BodyCompletion::Incomplete(BodyIncompleteReason::ProxyEndedEarly)
+            BodyCompletion::Incomplete(BodyIncompleteReason::ProxyReadError)
         );
     }
 }

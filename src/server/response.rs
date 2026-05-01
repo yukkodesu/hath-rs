@@ -1,4 +1,4 @@
-use super::body::StreamingBody;
+use super::body::{FileBodyParams, StreamingBody};
 use crate::bandwidth::BandwidthMonitor;
 use crate::error::{HathError, Result};
 use crate::hvfile::HVFile;
@@ -212,15 +212,15 @@ pub fn file_response(
             .header(header::CACHE_CONTROL, "public, max-age=31536000")
             .header(header::CONTENT_LENGTH, expected_size);
     }
-    let body = StreamingBody::new_file(
+    let body = StreamingBody::new_file(FileBodyParams {
         file,
         path,
-        expected_size,
-        hv_file.hash.to_string(),
+        total_size: expected_size,
+        expected_hash: hv_file.hash.to_string(),
         verify,
         cache_handler,
         bwm,
         stats,
-    );
+    });
     builder.body(body).map_err(HathError::Http)
 }
