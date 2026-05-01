@@ -105,7 +105,7 @@ impl RpcClient {
                 );
                 match self.call_stat_inner().await {
                     Ok(stat_resp) if stat_resp.status == ResponseStatus::Ok => {
-                        crate::config::Config::apply_server_response(&self.config, &stat_resp);
+                        Config::apply_server_response(&self.config, &stat_resp);
                     }
                     Ok(stat_resp) => {
                         let fail_host = stat_resp.fail_host.unwrap_or_else(|| "unknown".into());

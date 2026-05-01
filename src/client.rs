@@ -23,7 +23,7 @@ pub async fn run() -> Result<()> {
     config.initialize_directories()?;
 
     // 2. Start logging
-    crate::logging::init_logging(&config.log_dir, !config.disable_logging)?;
+    let logging = crate::logging::init_logging(&config.log_dir, config.clone())?;
 
     tracing::info!(
         "Hentai@Home {} (Build {}) starting up",
