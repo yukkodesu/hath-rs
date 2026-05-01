@@ -307,9 +307,11 @@ impl Service<Request<Incoming>> for HathService {
                                                     state.stats.record_bytes_sent(hv.size as u64);
                                                 }
                                                 if head_only {
-                                                    // Drop watch_rx — download_task is unaffected
-                                                    // and will run to completion, caching the file.
+                                                    // Drop both channels — download_task treats
+                                                    // proxy_done_rx recv Err as "body done" and
+                                                    // proceeds to finalize (Java: HEAD still caches).
                                                     drop(proxy.watch_rx);
+                                                    drop(proxy.proxy_done_tx);
                                                     response::head_response(
                                                         mime,
                                                         proxy.content_length,
@@ -323,6 +325,9 @@ impl Service<Request<Incoming>> for HathService {
                                                                 fileid,
                                                                 e
                                                             );
+                                                            // Signal done so download_task is not
+                                                            // stuck waiting; it will delete temp file.
+                                                            drop(proxy.proxy_done_tx);
                                                             response::text_response(
                                                                 hyper::StatusCode::INTERNAL_SERVER_ERROR,
                                                                 "proxy temp file unavailable",
@@ -336,6 +341,7 @@ impl Service<Request<Incoming>> for HathService {
                                                                     temp_file: file,
                                                                     temp_file_path: proxy.temp_file,
                                                                     watch_rx: proxy.watch_rx,
+                                                                    proxy_done_tx: proxy.proxy_done_tx,
                                                                     bwm: bwm_for_request,
                                                                 },
                                                             );

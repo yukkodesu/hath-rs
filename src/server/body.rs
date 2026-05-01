@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 
 use crate::bandwidth::BandwidthMonitor;
 use crate::proxy_downloader::DownloadState;
@@ -49,6 +49,7 @@ enum DataSource {
     /// Proxy download: body reads from the temp file written by download_task.
     /// `watch_rx` provides write_offset and completion state.
     /// `wait_fut` is a pending `watch_rx.changed()` future when we need to wait for more data.
+    /// `proxy_done_tx` signals download_task when body is done — matches Java proxyThreadCompleted().
     Proxy {
         file: std::fs::File,
         file_buf: BytesMut,
@@ -56,6 +57,7 @@ enum DataSource {
         temp_file: PathBuf,
         watch_rx: watch::Receiver<DownloadState>,
         wait_fut: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
+        proxy_done_tx: Option<oneshot::Sender<()>>,
     },
 }
 
@@ -198,6 +200,7 @@ impl StreamingBody {
         file: std::fs::File,
         temp_file: PathBuf,
         watch_rx: watch::Receiver<DownloadState>,
+        proxy_done_tx: oneshot::Sender<()>,
         bwm: Option<Arc<BandwidthMonitor>>,
     ) -> Self {
         Self {
@@ -207,6 +210,7 @@ impl StreamingBody {
                 temp_file,
                 watch_rx,
                 wait_fut: None,
+                proxy_done_tx: Some(proxy_done_tx),
             },
             offset: 0,
             total_size,
@@ -262,7 +266,14 @@ impl StreamingBody {
                     }
                 }
             }
-            DataSource::Static { .. } | DataSource::Random { .. } | DataSource::Proxy { .. } => {}
+            DataSource::Static { .. } | DataSource::Random { .. } => {}
+            DataSource::Proxy { proxy_done_tx, .. } => {
+                // Signal download_task that the body is done — Java: proxyThreadCompleted().
+                // Takes the sender so this fires exactly once. Sender drop also signals (Err path).
+                if let Some(tx) = proxy_done_tx.take() {
+                    let _ = tx.send(());
+                }
+            }
         }
     }
 
@@ -629,8 +640,9 @@ mod tests {
         std::fs::write(&path, b"helloworld").unwrap();
         let file = std::fs::File::open(&path).unwrap();
         let (tx, rx) = watch::channel(DownloadState::InProgress(10));
+        let (done_tx, _done_rx) = oneshot::channel();
 
-        let mut body = StreamingBody::new_proxy(10, file, path.clone(), rx, None);
+        let mut body = StreamingBody::new_proxy(10, file, path.clone(), rx, done_tx, None);
         let collected = collect_body(&mut body).await;
         assert_eq!(collected, b"helloworld");
         assert_eq!(body.completion_status().completion, BodyCompletion::Complete);
@@ -645,8 +657,9 @@ mod tests {
         let file = std::fs::File::open(&path).unwrap();
         // Declare total_size=100 but file only has 7 bytes and download fails.
         let (tx, rx) = watch::channel(DownloadState::InProgress(7));
+        let (done_tx, _done_rx) = oneshot::channel();
 
-        let mut body = StreamingBody::new_proxy(100, file, path.clone(), rx, None);
+        let mut body = StreamingBody::new_proxy(100, file, path.clone(), rx, done_tx, None);
 
         // Advance: body will read 7 bytes then watch shows Failed.
         let handle = tokio::spawn(async move {

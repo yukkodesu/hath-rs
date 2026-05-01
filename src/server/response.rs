@@ -7,7 +7,7 @@ use bytes::Bytes;
 use hyper::{Response, StatusCode, header};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 
 /// Build a Hyper Response with proper headers.
 /// Java: Cache-Control + Content-Length only added when contentLength > 0.
@@ -144,6 +144,7 @@ pub struct ProxyResponseParts<'a> {
     pub temp_file: std::fs::File,
     pub temp_file_path: PathBuf,
     pub watch_rx: watch::Receiver<DownloadState>,
+    pub proxy_done_tx: oneshot::Sender<()>,
     pub bwm: Option<Arc<BandwidthMonitor>>,
 }
 
@@ -162,6 +163,7 @@ pub fn proxy_response(parts: ProxyResponseParts<'_>) -> Result<Response<Streamin
         parts.temp_file,
         parts.temp_file_path,
         parts.watch_rx,
+        parts.proxy_done_tx,
         parts.bwm,
     );
     builder.body(body).map_err(HathError::Http)

@@ -9,7 +9,7 @@ use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 
 /// State published by download_task to StreamingBody via watch channel.
 #[derive(Clone, Debug)]
@@ -34,6 +34,9 @@ pub struct ProxyFileDownloader {
     pub temp_file: PathBuf,
     /// Watch receiver for download progress. Move into StreamingBody (GET) or drop (HEAD).
     pub watch_rx: watch::Receiver<DownloadState>,
+    /// Send on this when the proxy body has finished transmitting (GET) or is not needed (HEAD).
+    /// download_task waits for this signal before rename/delete — matching Java proxyThreadCompleted().
+    pub proxy_done_tx: oneshot::Sender<()>,
 }
 
 impl ProxyFileDownloader {
@@ -129,6 +132,7 @@ impl ProxyFileDownloader {
                 // Good response — create watch channel and spawn download task.
                 let temp_file = Self::create_temp_file(&hv_file, config)?;
                 let (watch_tx, watch_rx) = watch::channel(DownloadState::InProgress(0));
+                let (proxy_done_tx, proxy_done_rx) = oneshot::channel();
 
                 let hash = hv_file.hash.clone();
                 let expected_size = hv_file.size as u64;
@@ -140,6 +144,7 @@ impl ProxyFileDownloader {
                     Self::download_task(
                         resp,
                         watch_tx,
+                        proxy_done_rx,
                         tf,
                         expected_size,
                         fileid_owned.as_str(),
@@ -155,6 +160,7 @@ impl ProxyFileDownloader {
                     content_type: hv_file.mime_type().to_string(),
                     temp_file,
                     watch_rx,
+                    proxy_done_tx,
                 });
             }
         }
@@ -172,6 +178,7 @@ impl ProxyFileDownloader {
     async fn download_task(
         mut resp: reqwest::Response,
         watch_tx: watch::Sender<DownloadState>,
+        proxy_done_rx: oneshot::Receiver<()>,
         temp_file: PathBuf,
         expected_size: u64,
         fileid: &str,
@@ -242,6 +249,12 @@ impl ProxyFileDownloader {
             // Ignore send error — body may have dropped watch_rx (e.g. HEAD request).
             let _ = watch_tx.send(DownloadState::InProgress(downloaded));
         }
+
+        // Wait for body to finish transmitting before finalizing the file.
+        // Matches Java: checkFinalizeDownloadedFile() requires both streamThreadComplete
+        // and proxyThreadComplete. Sender drop (client abort / HEAD) is also fine —
+        // recv() returns Err which we ignore.
+        let _ = proxy_done_rx.await;
 
         if success {
             let digest = utils::hex_encode(&sha1.finalize());
