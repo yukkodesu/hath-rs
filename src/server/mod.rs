@@ -307,27 +307,25 @@ impl Service<Request<Incoming>> for HathService {
                                                     state.stats.record_bytes_sent(hv.size as u64);
                                                 }
                                                 if head_only {
-                                                    // Java: requestCompleted() → proxyThreadCompleted()
-                                                    // fires even for HEAD. Signal the download task
-                                                    // that the body side is done so it can finalize
-                                                    // immediately instead of waiting 300s.
-                                                    proxy.body_done_notify.notify_one();
+                                                    // Java: HEAD still runs the download thread to
+                                                    // completion so the file gets cached. Drain rx
+                                                    // in the background so download_task finishes
+                                                    // normally and can rename tmp → cache.
+                                                    let mut rx = proxy.rx;
+                                                    tokio::spawn(async move {
+                                                        while rx.recv().await.is_some() {}
+                                                    });
                                                     response::head_response(
                                                         mime,
-                                                        proxy.total_size as usize,
+                                                        proxy.content_length,
                                                     )
                                                 } else {
-                                                    let total_size = proxy.total_size as usize;
+                                                    let total_size = proxy.content_length;
                                                     let response = response::proxy_response(
                                                         response::ProxyResponseParts {
                                                             content_type: mime,
                                                             total_size,
-                                                            temp_file: proxy.temp_file,
-                                                            write_offset: proxy.write_offset,
-                                                            notify: proxy.notify,
-                                                            body_done_notify: proxy
-                                                                .body_done_notify,
-                                                            download_done: proxy.download_done,
+                                                            rx: proxy.rx,
                                                             bwm: bwm_for_request,
                                                         },
                                                     );
