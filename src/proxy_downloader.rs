@@ -10,7 +10,7 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Notify;
 
 /// Streaming proxy download: downloads from an upstream image server
@@ -320,13 +320,19 @@ impl ProxyFileDownloader {
     ) -> DownloadAttemptResult {
         let mut file = match tokio::fs::OpenOptions::new()
             .write(true)
-            .truncate(true)
             .open(temp_file)
             .await
         {
             Ok(f) => f,
             Err(_) => return DownloadAttemptResult::Fatal,
         };
+        // Seek to start without truncating so the body reader's sequential
+        // file cursor (and any data it already sent) stays valid across retries.
+        // Java: ProxyFileDownloader reuses the same RandomAccessFile handle and
+        // resets writeoff/readoff to 0, overwriting bytes in place.
+        if file.seek(tokio::io::SeekFrom::Start(0)).await.is_err() {
+            return DownloadAttemptResult::Fatal;
+        }
 
         let mut resp = match resp_result {
             Ok(resp) => resp,

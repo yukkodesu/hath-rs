@@ -566,6 +566,13 @@ impl Body for StreamingBody {
                     let max_read = (write_offset.load(Ordering::SeqCst) as usize)
                         .min(total_size)
                         .saturating_sub(read_cursor);
+                    // max_read == 0 means write_offset rolled back (retry in
+                    // progress) or hasn't advanced past read_cursor yet.
+                    // Loop back so need_wait re-evaluates rather than treating
+                    // this as a genuine EOF.
+                    if max_read == 0 {
+                        continue;
+                    }
                     match Self::fill_file_buffer_limited(file, file_buf, actual_size, max_read) {
                         Ok(0) => ChunkResult::Done(BodyIncompleteReason::ProxyEndedEarly),
                         Ok(available) => {
