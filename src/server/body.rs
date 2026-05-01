@@ -7,7 +7,7 @@
 //! - `Static`: pre-loaded `Bytes` (for cached files, speedtest, text responses)
 //! - `Proxy`: streaming from a temp file written by a background proxy download task
 
-use bytes::{Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use http_body::{Body, Frame, SizeHint};
 use rand::{Rng, RngExt};
 use sha1::Digest;
@@ -40,9 +40,7 @@ enum DataSource {
     /// computes SHA1 incrementally, deletes corrupt file in cleanup().
     File {
         file: std::fs::File,
-        file_buf: Vec<u8>,
-        file_buf_pos: usize,
-        file_buf_len: usize,
+        file_buf: BytesMut,
         sha1: sha1::Sha1,
         expected_hash: String,
         /// Deleted after send if SHA1 mismatches.
@@ -122,9 +120,7 @@ impl StreamingBody {
         Self {
             source: DataSource::File {
                 file,
-                file_buf: vec![0; FILE_BUFFER_SIZE],
-                file_buf_pos: 0,
-                file_buf_len: 0,
+                file_buf: BytesMut::with_capacity(FILE_BUFFER_SIZE),
                 sha1: sha1::Sha1::new(),
                 expected_hash,
                 to_delete: if verify { Some(path) } else { None },
@@ -257,31 +253,35 @@ impl StreamingBody {
 
     fn fill_file_buffer(
         file: &mut std::fs::File,
-        file_buf: &mut [u8],
-        file_buf_pos: &mut usize,
-        file_buf_len: &mut usize,
+        file_buf: &mut BytesMut,
         need: usize,
     ) -> std::io::Result<usize> {
-        let remaining = file_buf_len.saturating_sub(*file_buf_pos);
-        if remaining >= need {
-            return Ok(remaining);
-        }
+        while file_buf.len() < need {
+            let read_target = FILE_BUFFER_SIZE
+                .saturating_sub(file_buf.len())
+                .max(need - file_buf.len());
+            file_buf.reserve(read_target);
 
-        if remaining > 0 && *file_buf_pos > 0 {
-            file_buf.copy_within(*file_buf_pos..*file_buf_len, 0);
-        }
-        *file_buf_pos = 0;
-        *file_buf_len = remaining;
+            let spare = file_buf.chunk_mut();
+            let to_read = read_target.min(spare.len());
+            if to_read == 0 {
+                break;
+            }
 
-        while *file_buf_len < need {
-            let n = file.read(&mut file_buf[*file_buf_len..])?;
+            // SAFETY: `chunk_mut` returns spare, uninitialized capacity owned by
+            // `file_buf`. `read` initializes exactly the returned byte count, and
+            // `advance_mut` exposes only those initialized bytes.
+            let dst = unsafe { std::slice::from_raw_parts_mut(spare.as_mut_ptr(), to_read) };
+            let n = file.read(dst)?;
             if n == 0 {
                 break;
             }
-            *file_buf_len += n;
+            unsafe {
+                file_buf.advance_mut(n);
+            }
         }
 
-        Ok(file_buf_len.saturating_sub(*file_buf_pos))
+        Ok(file_buf.len())
     }
 }
 
@@ -448,27 +448,17 @@ impl Body for StreamingBody {
                 DataSource::File {
                     file,
                     file_buf,
-                    file_buf_pos,
-                    file_buf_len,
                     sha1,
                     ..
                 } => {
                     let actual_size = end - offset;
-                    match Self::fill_file_buffer(
-                        file,
-                        file_buf,
-                        file_buf_pos,
-                        file_buf_len,
-                        actual_size,
-                    ) {
+                    match Self::fill_file_buffer(file, file_buf, actual_size) {
                         Ok(0) => ChunkResult::Done,
                         Ok(available) => {
                             let n = actual_size.min(available);
-                            let start = *file_buf_pos;
-                            let end = start + n;
-                            sha1::Digest::update(sha1, &file_buf[start..end]);
-                            *file_buf_pos = end;
-                            ChunkResult::Data(Bytes::copy_from_slice(&file_buf[start..end]))
+                            let chunk = file_buf.split_to(n).freeze();
+                            sha1::Digest::update(sha1, &chunk);
+                            ChunkResult::Data(chunk)
                         }
                         Err(e) => {
                             tracing::warn!("File body: read error at offset {}: {}", offset, e);
