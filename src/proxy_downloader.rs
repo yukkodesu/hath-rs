@@ -6,8 +6,9 @@ use crate::stats::Stats;
 use crate::utils;
 use reqwest::{Client, Url};
 use sha1::Digest;
+use std::io;
 use std::net::IpAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{oneshot, watch};
@@ -270,7 +271,7 @@ impl ProxyFileDownloader {
 
             sha1::Digest::update(&mut sha1, &chunk);
 
-            if let Err(e) = file.write_all(&chunk).await {
+            if let Err(e) = Self::write_chunk_visible(&mut file, &chunk).await {
                 fail_reason = DownloadFailReason::DiskWriteError;
                 tracing::warn!("Proxy download: disk write error for {}: {}", fileid, e);
                 break;
@@ -282,8 +283,20 @@ impl ProxyFileDownloader {
             let _ = watch_tx.send(DownloadState::InProgress(downloaded));
         }
 
+        if success && let Err(e) = file.flush().await {
+            success = false;
+            fail_reason = DownloadFailReason::DiskWriteError;
+            tracing::warn!("Proxy download: disk flush error for {}: {}", fileid, e);
+        }
+        drop(file);
+
         if success {
             stats.record_file_rcvd();
+        } else {
+            let _ = watch_tx.send(DownloadState::Failed(fail_reason));
+            let _ = proxy_done_rx.await;
+            utils::remove_file(&temp_file);
+            return;
         }
 
         // Wait for body to finish transmitting before finalizing the file.
@@ -306,7 +319,7 @@ impl ProxyFileDownloader {
                             );
                             fail_reason = DownloadFailReason::FinalizeFailed;
                         }
-                        Ok(()) => match tokio::fs::rename(&temp_file, &cache_path).await {
+                        Ok(()) => match Self::move_temp_to_cache(&temp_file, &cache_path).await {
                             Ok(()) => {
                                 tracing::info!(
                                     "Proxy download: cached {} ({} bytes)",
@@ -343,6 +356,40 @@ impl ProxyFileDownloader {
 
         utils::remove_file(&temp_file);
         let _ = watch_tx.send(DownloadState::Failed(fail_reason));
+    }
+
+    async fn write_chunk_visible(file: &mut tokio::fs::File, chunk: &[u8]) -> io::Result<()> {
+        file.write_all(chunk).await?;
+        // Tokio file writes complete on a blocking worker after write() returns.
+        // The watch offset must only advance once a separate reader can see the bytes.
+        file.flush().await
+    }
+
+    async fn move_temp_to_cache(temp_file: &Path, cache_path: &Path) -> io::Result<()> {
+        match tokio::fs::rename(temp_file, cache_path).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                tracing::debug!(
+                    "Proxy download: rename failed from {} to {} ({}); falling back to copy",
+                    temp_file.display(),
+                    cache_path.display(),
+                    e
+                );
+                Self::copy_temp_to_cache_and_delete(temp_file, cache_path).await
+            }
+        }
+    }
+
+    async fn copy_temp_to_cache_and_delete(temp_file: &Path, cache_path: &Path) -> io::Result<()> {
+        tokio::fs::copy(temp_file, cache_path).await?;
+        if let Err(e) = tokio::fs::remove_file(temp_file).await {
+            tracing::warn!(
+                "Proxy download: copied {} to cache but could not delete temp file: {}",
+                temp_file.display(),
+                e
+            );
+        }
+        Ok(())
     }
 
     fn create_temp_file(hv_file: &HVFile, config: &Config) -> Result<PathBuf> {
@@ -409,11 +456,50 @@ pub fn build_proxy_url(proxy_type: &str, proxy_host: &str, proxy_port: u16) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
 
     #[test]
     fn test_build_proxy_url_handles_ipv6_host() {
         let url = build_proxy_url("socks", "::1", 1080).unwrap();
 
         assert_eq!(url.as_str(), "socks://[::1]:1080/");
+    }
+
+    #[tokio::test]
+    async fn write_chunk_visible_makes_bytes_readable_before_progress_publish() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy-write-visible");
+        let mut writer = tokio::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+            .await
+            .unwrap();
+
+        ProxyFileDownloader::write_chunk_visible(&mut writer, b"visible bytes")
+            .await
+            .unwrap();
+
+        let mut out = Vec::new();
+        std::fs::File::open(&path)
+            .unwrap()
+            .read_to_end(&mut out)
+            .unwrap();
+        assert_eq!(out, b"visible bytes");
+    }
+
+    #[tokio::test]
+    async fn copy_temp_to_cache_and_delete_removes_source_after_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let temp_path = dir.path().join("proxy-temp");
+        let cache_path = dir.path().join("cache-file");
+        std::fs::write(&temp_path, b"cache me").unwrap();
+
+        ProxyFileDownloader::copy_temp_to_cache_and_delete(&temp_path, &cache_path)
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read(&cache_path).unwrap(), b"cache me");
+        assert!(!temp_path.exists());
     }
 }
