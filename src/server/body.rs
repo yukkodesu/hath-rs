@@ -88,6 +88,48 @@ pub struct StreamingBody {
     throttled: bool,
     /// Pending wait-for-data future (proxy mode only).
     wait_fut: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
+    completion: BodyCompletion,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BodyCompletion {
+    Running,
+    Complete,
+    Incomplete(BodyIncompleteReason),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BodyIncompleteReason {
+    Unknown,
+    FileEndedEarly,
+    FileReadError,
+    ProxyEndedEarly,
+    ProxyTimeout,
+    ProxyReadError,
+}
+
+impl BodyIncompleteReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::FileEndedEarly => "file_ended_early",
+            Self::FileReadError => "file_read_error",
+            Self::ProxyEndedEarly => "proxy_ended_early",
+            Self::ProxyTimeout => "proxy_timeout",
+            Self::ProxyReadError => "proxy_read_error",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BodyCompletionSnapshot {
+    pub completion: BodyCompletion,
+    pub offset: usize,
+    pub total_size: usize,
+}
+
+pub trait BodyCompletionStatus {
+    fn completion_status(&self) -> BodyCompletionSnapshot;
 }
 
 impl StreamingBody {
@@ -133,6 +175,7 @@ impl StreamingBody {
             throttle_fut: None,
             throttled: false,
             wait_fut: None,
+            completion: BodyCompletion::Running,
         }
     }
 
@@ -149,6 +192,7 @@ impl StreamingBody {
             throttle_fut: None,
             throttled: false,
             wait_fut: None,
+            completion: BodyCompletion::Running,
         }
     }
 
@@ -162,6 +206,7 @@ impl StreamingBody {
             throttle_fut: None,
             throttled: false,
             wait_fut: None,
+            completion: BodyCompletion::Running,
         }
     }
 
@@ -204,6 +249,7 @@ impl StreamingBody {
             throttle_fut: None,
             throttled: false,
             wait_fut: None,
+            completion: BodyCompletion::Running,
         })
     }
 }
@@ -212,7 +258,18 @@ impl StreamingBody {
     /// Signal the download task that the body has finished reading.
     /// For File mode, verify SHA1 and delete corrupt file (Java: cleanup()).
     fn finish(&mut self) {
+        self.finish_with(None);
+    }
+
+    fn finish_with(&mut self, reason: Option<BodyIncompleteReason>) {
         let completed = self.offset >= self.total_size;
+        if self.completion == BodyCompletion::Running {
+            self.completion = if completed {
+                BodyCompletion::Complete
+            } else {
+                BodyCompletion::Incomplete(reason.unwrap_or(BodyIncompleteReason::Unknown))
+            };
+        }
         match &mut self.source {
             DataSource::File {
                 sha1,
@@ -299,6 +356,16 @@ impl StreamingBody {
     }
 }
 
+impl BodyCompletionStatus for StreamingBody {
+    fn completion_status(&self) -> BodyCompletionSnapshot {
+        BodyCompletionSnapshot {
+            completion: self.completion,
+            offset: self.offset,
+            total_size: self.total_size,
+        }
+    }
+}
+
 impl Drop for StreamingBody {
     fn drop(&mut self) {
         self.finish();
@@ -377,22 +444,22 @@ impl Body for StreamingBody {
                                 "ProxyStreamingBody: download done, terminating at offset {}",
                                 self.offset
                             );
-                            true
+                            Some(BodyIncompleteReason::ProxyEndedEarly)
                         } else if start_time.elapsed() > Duration::from_secs(300) {
                             tracing::warn!(
                                 "ProxyStreamingBody: timeout waiting for data at offset {}",
                                 self.offset
                             );
-                            true
+                            Some(BodyIncompleteReason::ProxyTimeout)
                         } else {
-                            false
+                            None
                         }
                     }
-                    _ => false,
+                    _ => None,
                 };
 
-                if early_exit {
-                    self.finish();
+                if let Some(reason) = early_exit {
+                    self.finish_with(Some(reason));
                     return Poll::Ready(None);
                 }
 
@@ -449,7 +516,7 @@ impl Body for StreamingBody {
             // while self.source is mutably borrowed by the match arm.
             enum ChunkResult {
                 Data(Bytes),
-                Done,
+                Done(BodyIncompleteReason),
             }
 
             let result = match &mut self.source {
@@ -474,7 +541,7 @@ impl Body for StreamingBody {
                 } => {
                     let actual_size = end - offset;
                     match Self::fill_file_buffer(file, file_buf, actual_size) {
-                        Ok(0) => ChunkResult::Done,
+                        Ok(0) => ChunkResult::Done(BodyIncompleteReason::FileEndedEarly),
                         Ok(available) => {
                             let n = actual_size.min(available);
                             let chunk = file_buf.split_to(n).freeze();
@@ -483,7 +550,7 @@ impl Body for StreamingBody {
                         }
                         Err(e) => {
                             tracing::warn!("File body: read error at offset {}: {}", offset, e);
-                            ChunkResult::Done
+                            ChunkResult::Done(BodyIncompleteReason::FileReadError)
                         }
                     }
                 }
@@ -500,7 +567,7 @@ impl Body for StreamingBody {
                         .min(total_size)
                         .saturating_sub(read_cursor);
                     match Self::fill_file_buffer_limited(file, file_buf, actual_size, max_read) {
-                        Ok(0) => ChunkResult::Done,
+                        Ok(0) => ChunkResult::Done(BodyIncompleteReason::ProxyEndedEarly),
                         Ok(available) => {
                             let n = actual_size.min(available);
                             let chunk = file_buf.split_to(n).freeze();
@@ -508,11 +575,12 @@ impl Body for StreamingBody {
                         }
                         Err(e) => {
                             tracing::warn!(
-                                "ProxyStreamingBody: read error at offset {}: {}",
+                                "ProxyStreamingBody: read error for {} at offset {}: {}",
                                 temp_file.display(),
+                                offset,
                                 e
                             );
-                            ChunkResult::Done
+                            ChunkResult::Done(BodyIncompleteReason::ProxyReadError)
                         }
                     }
                 }
@@ -523,8 +591,8 @@ impl Body for StreamingBody {
                     self.offset += chunk.len();
                     return Poll::Ready(Some(Ok(Frame::data(chunk))));
                 }
-                ChunkResult::Done => {
-                    self.finish();
+                ChunkResult::Done(reason) => {
+                    self.finish_with(Some(reason));
                     return Poll::Ready(None);
                 }
             }
@@ -570,6 +638,32 @@ mod tests {
             }
             _ => panic!("expected file data source"),
         }
+    }
+
+    #[tokio::test]
+    async fn file_body_records_ended_early_when_file_is_shorter_than_declared() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("short-file");
+        std::fs::write(&path, b"short").unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+
+        let mut body = StreamingBody::new_file(
+            file,
+            path,
+            10,
+            "0000000000000000000000000000000000000000".to_string(),
+            false,
+            None,
+            None,
+        );
+
+        let frame = body.frame().await.unwrap().unwrap();
+        assert_eq!(&frame.into_data().ok().unwrap()[..], b"short");
+        assert!(body.frame().await.is_none());
+        assert_eq!(
+            body.completion_status().completion,
+            BodyCompletion::Incomplete(BodyIncompleteReason::FileEndedEarly)
+        );
     }
 
     #[tokio::test]

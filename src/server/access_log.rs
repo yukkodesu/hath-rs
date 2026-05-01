@@ -5,11 +5,14 @@ use hyper::header;
 use hyper::service::Service;
 use hyper::{Request, Response};
 use std::convert::Infallible;
+use std::fmt::Write;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
+
+use super::body::{BodyCompletion, BodyCompletionSnapshot, BodyCompletionStatus};
 
 pub fn access_log_prefix(conn_id: u32, client_ip: IpAddr) -> String {
     format!("{{{}{:<17} ", conn_id, format!("/{}}}", client_ip))
@@ -33,7 +36,56 @@ pub fn access_log_request_info(
     }
 }
 
-pub fn access_log_completion_line(info: &str, content_length: usize, elapsed: Duration) -> String {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessLogCompletion {
+    Finished,
+    Incomplete {
+        reason: &'static str,
+        offset: usize,
+        total_size: usize,
+    },
+    Aborted {
+        offset: usize,
+        total_size: usize,
+    },
+}
+
+impl AccessLogCompletion {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Finished => "Finished",
+            Self::Incomplete { .. } => "Incomplete",
+            Self::Aborted { .. } => "Aborted",
+        }
+    }
+
+    fn write_suffix(self, line: &mut String) {
+        match self {
+            Self::Finished => {}
+            Self::Incomplete {
+                reason,
+                offset,
+                total_size,
+            } => {
+                let _ = write!(
+                    line,
+                    " reason={} offset={} expected={}",
+                    reason, offset, total_size
+                );
+            }
+            Self::Aborted { offset, total_size } => {
+                let _ = write!(line, " offset={} expected={}", offset, total_size);
+            }
+        }
+    }
+}
+
+pub fn access_log_completion_line(
+    info: &str,
+    content_length: usize,
+    elapsed: Duration,
+    completion: AccessLogCompletion,
+) -> String {
     let seconds = elapsed.as_secs_f64();
     let elapsed_ms = elapsed.as_millis();
     let speed = if elapsed_ms >= 10 {
@@ -41,10 +93,31 @@ pub fn access_log_completion_line(info: &str, content_length: usize, elapsed: Du
     } else {
         String::new()
     };
-    format!(
-        "{}Finished processing request in {:.2} seconds{}",
-        info, seconds, speed
-    )
+    let mut line = format!(
+        "{}{} processing request in {:.2} seconds{}",
+        info,
+        completion.label(),
+        seconds,
+        speed
+    );
+    completion.write_suffix(&mut line);
+    line
+}
+
+fn access_log_completion_from_body(snapshot: BodyCompletionSnapshot) -> AccessLogCompletion {
+    match snapshot.completion {
+        BodyCompletion::Complete => AccessLogCompletion::Finished,
+        BodyCompletion::Incomplete(reason) => AccessLogCompletion::Incomplete {
+            reason: reason.as_str(),
+            offset: snapshot.offset,
+            total_size: snapshot.total_size,
+        },
+        BodyCompletion::Running => AccessLogCompletion::Incomplete {
+            reason: "body_returned_eof_without_completion",
+            offset: snapshot.offset,
+            total_size: snapshot.total_size,
+        },
+    }
 }
 
 pub struct AccessLogService<S> {
@@ -67,7 +140,7 @@ impl<S, B> Service<Request<Incoming>> for AccessLogService<S>
 where
     S: Service<Request<Incoming>, Response = Response<B>, Error = hyper::Error>,
     S::Future: Send + 'static,
-    B: Body<Data = Bytes, Error = Infallible> + Unpin,
+    B: Body<Data = Bytes, Error = Infallible> + Unpin + BodyCompletionStatus,
 {
     type Response = Response<AccessLogBody<B>>;
     type Error = hyper::Error;
@@ -111,14 +184,14 @@ where
     }
 }
 
-pub struct AccessLogBody<B> {
+pub struct AccessLogBody<B: BodyCompletionStatus> {
     inner: B,
     info: Option<String>,
     content_length: usize,
     start: Instant,
 }
 
-impl<B> AccessLogBody<B> {
+impl<B: BodyCompletionStatus> AccessLogBody<B> {
     pub fn new(inner: B, info: String, content_length: usize, start: Instant) -> Self {
         Self {
             inner,
@@ -137,25 +210,36 @@ impl<B> AccessLogBody<B> {
         }
     }
 
-    fn log_completion(&mut self) {
+    fn log_completion(&mut self, completion: AccessLogCompletion) {
         if let Some(info) = self.info.take() {
             tracing::info!(
                 "{}",
-                access_log_completion_line(&info, self.content_length, self.start.elapsed())
+                access_log_completion_line(
+                    &info,
+                    self.content_length,
+                    self.start.elapsed(),
+                    completion
+                )
             );
         }
     }
 }
 
-impl<B> Drop for AccessLogBody<B> {
+impl<B: BodyCompletionStatus> Drop for AccessLogBody<B> {
     fn drop(&mut self) {
-        self.log_completion();
+        if self.info.is_some() {
+            let snapshot = self.inner.completion_status();
+            self.log_completion(AccessLogCompletion::Aborted {
+                offset: snapshot.offset,
+                total_size: snapshot.total_size,
+            });
+        }
     }
 }
 
 impl<B> Body for AccessLogBody<B>
 where
-    B: Body<Data = Bytes, Error = Infallible> + Unpin,
+    B: Body<Data = Bytes, Error = Infallible> + Unpin + BodyCompletionStatus,
 {
     type Data = Bytes;
     type Error = Infallible;
@@ -166,7 +250,8 @@ where
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         match Pin::new(&mut self.inner).poll_frame(cx) {
             Poll::Ready(None) => {
-                self.log_completion();
+                let snapshot = self.inner.completion_status();
+                self.log_completion(access_log_completion_from_body(snapshot));
                 Poll::Ready(None)
             }
             other => other,
@@ -192,8 +277,38 @@ mod tests {
             "{12/222.135.74.27}   Code=200 Bytes=145678   GET /h/file HTTP/1.1"
         );
         assert_eq!(
-            access_log_completion_line(&info, 145678, Duration::from_millis(750)),
+            access_log_completion_line(
+                &info,
+                145678,
+                Duration::from_millis(750),
+                AccessLogCompletion::Finished,
+            ),
             "{12/222.135.74.27}   Code=200 Bytes=145678   Finished processing request in 0.75 seconds (194.24 KB/s)"
+        );
+        assert_eq!(
+            access_log_completion_line(
+                &info,
+                145678,
+                Duration::from_millis(750),
+                AccessLogCompletion::Incomplete {
+                    reason: "proxy_timeout",
+                    offset: 4096,
+                    total_size: 145678,
+                },
+            ),
+            "{12/222.135.74.27}   Code=200 Bytes=145678   Incomplete processing request in 0.75 seconds (194.24 KB/s) reason=proxy_timeout offset=4096 expected=145678"
+        );
+        assert_eq!(
+            access_log_completion_line(
+                &info,
+                145678,
+                Duration::from_millis(750),
+                AccessLogCompletion::Aborted {
+                    offset: 4096,
+                    total_size: 145678,
+                },
+            ),
+            "{12/222.135.74.27}   Code=200 Bytes=145678   Aborted processing request in 0.75 seconds (194.24 KB/s) offset=4096 expected=145678"
         );
     }
 }
