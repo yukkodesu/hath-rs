@@ -302,6 +302,7 @@ impl Service<Request<Incoming>> for HathService {
                                             &sources,
                                             &config,
                                             Some(state.cache.clone()),
+                                            state.stats.clone(),
                                             &state.proxy_client,
                                         )
                                         .await
@@ -350,7 +351,8 @@ impl Service<Request<Incoming>> for HathService {
                                                                     temp_file: file,
                                                                     temp_file_path: proxy.temp_file,
                                                                     watch_rx: proxy.watch_rx,
-                                                                    proxy_done_tx: proxy.proxy_done_tx,
+                                                                    proxy_done_tx: proxy
+                                                                        .proxy_done_tx,
                                                                     stats: proxy_stats,
                                                                     bwm: bwm_for_request,
                                                                 },

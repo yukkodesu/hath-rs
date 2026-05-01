@@ -2,6 +2,7 @@ use crate::cache::CacheHandler;
 use crate::config::Config;
 use crate::error::{HathError, Result};
 use crate::hvfile::HVFile;
+use crate::stats::Stats;
 use crate::utils;
 use reqwest::{Client, Url};
 use sha1::Digest;
@@ -60,6 +61,7 @@ impl ProxyFileDownloader {
         sources: &[Url],
         config: &Config,
         cache_handler: Option<Arc<CacheHandler>>,
+        stats: Arc<Stats>,
         client: &Arc<Client>,
     ) -> Result<Self> {
         let hv_file = HVFile::from_fileid(fileid)
@@ -159,6 +161,7 @@ impl ProxyFileDownloader {
                 let fileid_owned = hv_file.fileid().clone();
                 let cache_dir = config.cache_dir.clone();
                 let tf = temp_file.clone();
+                let stats = stats.clone();
 
                 tokio::spawn(async move {
                     Self::download_task(
@@ -171,6 +174,7 @@ impl ProxyFileDownloader {
                         hash.as_str(),
                         &cache_dir,
                         cache_handler.as_deref(),
+                        stats.as_ref(),
                     )
                     .await;
                 });
@@ -202,6 +206,7 @@ impl ProxyFileDownloader {
         expected_hash: &str,
         cache_dir: &std::path::Path,
         cache_handler: Option<&CacheHandler>,
+        stats: &Stats,
     ) {
         let mut file = match tokio::fs::OpenOptions::new()
             .write(true)
@@ -210,7 +215,11 @@ impl ProxyFileDownloader {
         {
             Ok(f) => f,
             Err(e) => {
-                tracing::warn!("Proxy download: cannot open temp file for {}: {}", fileid, e);
+                tracing::warn!(
+                    "Proxy download: cannot open temp file for {}: {}",
+                    fileid,
+                    e
+                );
                 utils::remove_file(&temp_file);
                 let _ = watch_tx.send(DownloadState::Failed(DownloadFailReason::DiskWriteError));
                 return;
@@ -267,9 +276,14 @@ impl ProxyFileDownloader {
                 break;
             }
             downloaded += chunk.len() as u64;
+            stats.record_bytes_rcvd(chunk.len() as u64);
             // Publish progress; body uses this to know how many bytes are safe to read.
             // Ignore send error — body may have dropped watch_rx (e.g. HEAD request).
             let _ = watch_tx.send(DownloadState::InProgress(downloaded));
+        }
+
+        if success {
+            stats.record_file_rcvd();
         }
 
         // Wait for body to finish transmitting before finalizing the file.
