@@ -5,7 +5,7 @@
 //!
 //! Supports two data sources:
 //! - `Static`: pre-loaded `Bytes` (for cached files, speedtest, text responses)
-//! - `Proxy`: streaming from an mpsc channel written by a background download task
+//! - `Proxy`: reads from a temp file gated on a watch channel written by the download task
 
 use bytes::{BufMut, Bytes, BytesMut};
 use http_body::{Body, Frame, SizeHint};
@@ -18,9 +18,10 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use tokio::sync::mpsc;
+use tokio::sync::watch;
 
 use crate::bandwidth::BandwidthMonitor;
+use crate::proxy_downloader::DownloadState;
 
 /// Java Settings.TCP_PACKET_SIZE = 1460
 const TCP_PACKET_SIZE: usize = 1460;
@@ -45,13 +46,16 @@ enum DataSource {
         to_delete: Option<PathBuf>,
         cache_handler: Option<Arc<crate::cache::CacheHandler>>,
     },
-    /// Proxy download: chunks arrive via mpsc channel from the background
-    /// download task. `pending` holds leftover bytes when a channel chunk
-    /// is larger than TCP_PACKET_SIZE and must be sliced across frames.
+    /// Proxy download: body reads from the temp file written by download_task.
+    /// `watch_rx` provides write_offset and completion state.
+    /// `wait_fut` is a pending `watch_rx.changed()` future when we need to wait for more data.
     Proxy {
-        rx: mpsc::Receiver<Bytes>,
-        /// Bytes received from the channel but not yet yielded to Hyper.
-        pending: Option<Bytes>,
+        file: std::fs::File,
+        file_buf: BytesMut,
+        /// For log messages only.
+        temp_file: PathBuf,
+        watch_rx: watch::Receiver<DownloadState>,
+        wait_fut: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
     },
 }
 
@@ -185,17 +189,25 @@ impl StreamingBody {
         }
     }
 
-    /// Create a proxy-streaming body backed by an mpsc channel.
+    /// Create a proxy-streaming body backed by a temp file + watch channel.
     ///
-    /// The download task sends `Bytes` chunks through `rx`; this body
-    /// slices them into TCP_PACKET_SIZE frames (with optional BWM throttle).
+    /// `file` must be opened for reading at offset 0.
+    /// `watch_rx` delivers write progress from the background download task.
     pub fn new_proxy(
         total_size: usize,
-        rx: mpsc::Receiver<Bytes>,
+        file: std::fs::File,
+        temp_file: PathBuf,
+        watch_rx: watch::Receiver<DownloadState>,
         bwm: Option<Arc<BandwidthMonitor>>,
     ) -> Self {
         Self {
-            source: DataSource::Proxy { rx, pending: None },
+            source: DataSource::Proxy {
+                file,
+                file_buf: BytesMut::with_capacity(FILE_BUFFER_SIZE),
+                temp_file,
+                watch_rx,
+                wait_fut: None,
+            },
             offset: 0,
             total_size,
             bwm,
@@ -342,24 +354,83 @@ impl Body for StreamingBody {
                 return Poll::Ready(None);
             }
 
-            // Step 3: Proxy mode — poll channel for the next chunk.
-            if let DataSource::Proxy { rx, pending } = &mut self.source {
-                // If we have leftover bytes from a previous large chunk, serve
-                // the next TCP_PACKET_SIZE slice without hitting the channel.
-                if pending.is_none() {
-                    match rx.poll_recv(cx) {
-                        Poll::Pending => return Poll::Pending,
-                        Poll::Ready(None) => {
-                            // Channel closed: download task finished (or failed).
-                            self.finish_with(Some(BodyIncompleteReason::ProxyEndedEarly));
-                            return Poll::Ready(None);
+            // Step 3: Proxy mode — check if enough data has been written to disk.
+            if matches!(self.source, DataSource::Proxy { .. }) {
+                let current_offset = self.offset;
+                let current_total = self.total_size;
+                let need = TCP_PACKET_SIZE.min(current_total - current_offset);
+
+                enum ProxyGate {
+                    Ready,
+                    WaitAndContinue,
+                    TerminalFailure,
+                }
+
+                let gate = if let DataSource::Proxy {
+                    watch_rx,
+                    wait_fut,
+                    ..
+                } = &mut self.source
+                {
+                    // Sample the latest watch state without holding the borrow.
+                    let (write_offset, terminal) = {
+                        let state = watch_rx.borrow_and_update();
+                        match *state {
+                            DownloadState::InProgress(n) => (n, false),
+                            DownloadState::Done => (current_total as u64, true),
+                            DownloadState::Failed => (0, true),
                         }
-                        Poll::Ready(Some(chunk)) => {
-                            *pending = Some(chunk);
+                    };
+
+                    let have_enough = write_offset >= (current_offset + need) as u64;
+
+                    if have_enough {
+                        *wait_fut = None;
+                        ProxyGate::Ready
+                    } else if terminal {
+                        ProxyGate::TerminalFailure
+                    } else {
+                        // Not enough data yet — wait for watch to fire.
+                        if wait_fut.is_none() {
+                            // Clone the receiver so we can move it into the async block
+                            // without conflicting with the &mut self.source borrow.
+                            // watch::Receiver::clone() is cheap (Arc increment).
+                            let mut rx_clone = watch_rx.clone();
+                            *wait_fut = Some(Box::pin(async move {
+                                let _ = rx_clone.changed().await;
+                            }));
                         }
+                        if let Some(fut) = wait_fut {
+                            match fut.as_mut().poll(cx) {
+                                Poll::Pending => return Poll::Pending,
+                                Poll::Ready(()) => {
+                                    *wait_fut = None;
+                                }
+                            }
+                        }
+                        ProxyGate::WaitAndContinue
+                    }
+                } else {
+                    unreachable!()
+                };
+
+                match gate {
+                    ProxyGate::Ready => {}
+                    ProxyGate::WaitAndContinue => continue,
+                    ProxyGate::TerminalFailure => {
+                        // Log with temp_file path for context.
+                        if let DataSource::Proxy { temp_file, .. } = &self.source {
+                            tracing::warn!(
+                                "Proxy body: download ended early for {} (offset={} total={})",
+                                temp_file.display(),
+                                current_offset,
+                                current_total,
+                            );
+                        }
+                        self.finish_with(Some(BodyIncompleteReason::ProxyEndedEarly));
+                        return Poll::Ready(None);
                     }
                 }
-                // pending is now Some — fall through to throttle + slice below.
             }
 
             // Step 4: Throttle (applies to all sources including Proxy).
@@ -430,14 +501,27 @@ impl Body for StreamingBody {
                         }
                     }
                 }
-                DataSource::Proxy { pending, .. } => {
-                    let buf = pending.as_mut().expect("pending set in Step 3");
-                    let n = TCP_PACKET_SIZE.min(buf.len()).min(total_size - offset);
-                    let chunk = buf.split_to(n);
-                    if buf.is_empty() {
-                        *pending = None;
+                DataSource::Proxy { file, file_buf, .. } => {
+                    let chunk_size = TCP_PACKET_SIZE;
+                    let end = (offset + chunk_size).min(total_size);
+                    let actual_size = end - offset;
+                    // Step 3 guarantees write_offset >= offset + actual_size, so
+                    // fill_file_buffer will not block waiting for data.
+                    match Self::fill_file_buffer(file, file_buf, actual_size) {
+                        Ok(0) => ChunkResult::Done(BodyIncompleteReason::ProxyEndedEarly),
+                        Ok(available) => {
+                            let n = actual_size.min(available);
+                            ChunkResult::Data(file_buf.split_to(n).freeze())
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Proxy body: file read error at offset {}: {}",
+                                offset,
+                                e
+                            );
+                            ChunkResult::Done(BodyIncompleteReason::ProxyReadError)
+                        }
                     }
-                    ChunkResult::Data(chunk)
                 }
             };
 
@@ -539,33 +623,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn proxy_body_streams_chunks_via_channel() {
-        let (tx, rx) = mpsc::channel::<Bytes>(8);
-        let mut body = StreamingBody::new_proxy(9, rx, None);
+    async fn proxy_body_streams_full_file_via_watch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy-file");
+        std::fs::write(&path, b"helloworld").unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let (tx, rx) = watch::channel(DownloadState::InProgress(10));
 
-        tx.send(Bytes::from_static(b"hello")).await.unwrap();
-        tx.send(Bytes::from_static(b"world")).await.unwrap();
-        drop(tx);
-
+        let mut body = StreamingBody::new_proxy(10, file, path.clone(), rx, None);
         let collected = collect_body(&mut body).await;
-        assert_eq!(collected.len(), 9);
-        assert_eq!(
-            body.completion_status().completion,
-            BodyCompletion::Complete
-        );
+        assert_eq!(collected, b"helloworld");
+        assert_eq!(body.completion_status().completion, BodyCompletion::Complete);
+        drop(tx);
     }
 
     #[tokio::test]
-    async fn proxy_body_records_incomplete_when_channel_closes_early() {
-        let (tx, rx) = mpsc::channel::<Bytes>(8);
-        let mut body = StreamingBody::new_proxy(100, rx, None);
+    async fn proxy_body_records_incomplete_when_download_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy-partial");
+        std::fs::write(&path, b"partial").unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        // Declare total_size=100 but file only has 7 bytes and download fails.
+        let (tx, rx) = watch::channel(DownloadState::InProgress(7));
 
-        tx.send(Bytes::from_static(b"partial")).await.unwrap();
-        drop(tx); // close before all 100 bytes sent
+        let mut body = StreamingBody::new_proxy(100, file, path.clone(), rx, None);
 
-        collect_body(&mut body).await;
+        // Advance: body will read 7 bytes then watch shows Failed.
+        let handle = tokio::spawn(async move {
+            collect_body(&mut body).await;
+            body.completion_status().completion
+        });
+
+        // Signal failure after a short delay.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let _ = tx.send(DownloadState::Failed);
+
+        let completion = handle.await.unwrap();
         assert_eq!(
-            body.completion_status().completion,
+            completion,
             BodyCompletion::Incomplete(BodyIncompleteReason::ProxyEndedEarly)
         );
     }

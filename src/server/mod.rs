@@ -307,37 +307,49 @@ impl Service<Request<Incoming>> for HathService {
                                                     state.stats.record_bytes_sent(hv.size as u64);
                                                 }
                                                 if head_only {
-                                                    // Java: HEAD still runs the download thread to
-                                                    // completion so the file gets cached. Drain rx
-                                                    // in the background so download_task finishes
-                                                    // normally and can rename tmp → cache.
-                                                    let mut rx = proxy.rx;
-                                                    tokio::spawn(async move {
-                                                        while rx.recv().await.is_some() {}
-                                                    });
+                                                    // Drop watch_rx — download_task is unaffected
+                                                    // and will run to completion, caching the file.
+                                                    drop(proxy.watch_rx);
                                                     response::head_response(
                                                         mime,
                                                         proxy.content_length,
                                                     )
                                                 } else {
                                                     let total_size = proxy.content_length;
-                                                    let response = response::proxy_response(
-                                                        response::ProxyResponseParts {
-                                                            content_type: mime,
-                                                            total_size,
-                                                            rx: proxy.rx,
-                                                            bwm: bwm_for_request,
-                                                        },
-                                                    );
-                                                    if response.is_ok() {
-                                                        tracing::info!(
-                                                            "Proxy download: returning body for {} ({} bytes, {})",
-                                                            fileid,
-                                                            total_size,
-                                                            mime
-                                                        );
+                                                    match std::fs::File::open(&proxy.temp_file) {
+                                                        Err(e) => {
+                                                            tracing::warn!(
+                                                                "Proxy: cannot open temp file for {}: {}",
+                                                                fileid,
+                                                                e
+                                                            );
+                                                            response::text_response(
+                                                                hyper::StatusCode::INTERNAL_SERVER_ERROR,
+                                                                "proxy temp file unavailable",
+                                                            )
+                                                        }
+                                                        Ok(file) => {
+                                                            let response = response::proxy_response(
+                                                                response::ProxyResponseParts {
+                                                                    content_type: mime,
+                                                                    total_size,
+                                                                    temp_file: file,
+                                                                    temp_file_path: proxy.temp_file,
+                                                                    watch_rx: proxy.watch_rx,
+                                                                    bwm: bwm_for_request,
+                                                                },
+                                                            );
+                                                            if response.is_ok() {
+                                                                tracing::info!(
+                                                                    "Proxy download: returning body for {} ({} bytes, {})",
+                                                                    fileid,
+                                                                    total_size,
+                                                                    mime
+                                                                );
+                                                            }
+                                                            response
+                                                        }
                                                     }
-                                                    response
                                                 }
                                             }
                                             Err(e) => {

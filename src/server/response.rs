@@ -2,11 +2,12 @@ use super::body::StreamingBody;
 use crate::bandwidth::BandwidthMonitor;
 use crate::error::{HathError, Result};
 use crate::hvfile::HVFile;
+use crate::proxy_downloader::DownloadState;
 use bytes::Bytes;
 use hyper::{Response, StatusCode, header};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::watch;
 
 /// Build a Hyper Response with proper headers.
 /// Java: Cache-Control + Content-Length only added when contentLength > 0.
@@ -135,12 +136,14 @@ pub fn speedtest_response(
 }
 
 /// Build a response for a proxy file download in progress.
-/// The body streams data from the mpsc channel fed by the background download task.
+/// The body reads from temp_file, gated on watch_rx progress.
 /// Java: HTTPResponseProcessorProxy + ProxyFileDownloader.
 pub struct ProxyResponseParts<'a> {
     pub content_type: &'a str,
     pub total_size: usize,
-    pub rx: mpsc::Receiver<bytes::Bytes>,
+    pub temp_file: std::fs::File,
+    pub temp_file_path: PathBuf,
+    pub watch_rx: watch::Receiver<DownloadState>,
     pub bwm: Option<Arc<BandwidthMonitor>>,
 }
 
@@ -154,7 +157,13 @@ pub fn proxy_response(parts: ProxyResponseParts<'_>) -> Result<Response<Streamin
             .header(header::CACHE_CONTROL, "public, max-age=31536000")
             .header(header::CONTENT_LENGTH, parts.total_size);
     }
-    let body = StreamingBody::new_proxy(parts.total_size, parts.rx, parts.bwm);
+    let body = StreamingBody::new_proxy(
+        parts.total_size,
+        parts.temp_file,
+        parts.temp_file_path,
+        parts.watch_rx,
+        parts.bwm,
+    );
     builder.body(body).map_err(HathError::Http)
 }
 

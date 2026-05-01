@@ -3,26 +3,37 @@ use crate::config::Config;
 use crate::error::{HathError, Result};
 use crate::hvfile::HVFile;
 use crate::utils;
-use bytes::Bytes;
 use reqwest::{Client, Url};
 use sha1::Digest;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::mpsc;
+use tokio::sync::watch;
 
-/// Streaming proxy download: downloads from an upstream image server
-/// while simultaneously serving data to the requesting client.
+/// State published by download_task to StreamingBody via watch channel.
+#[derive(Clone, Debug)]
+pub enum DownloadState {
+    /// Download in progress; value is bytes written to temp file so far.
+    InProgress(u64),
+    /// Download complete: SHA1 verified, file renamed to cache.
+    Done,
+    /// Download failed: network error, disk error, SHA1 mismatch, or rename failure.
+    Failed,
+}
+
+/// Streaming proxy download: downloads from an upstream image server into a
+/// temp file while publishing progress via a watch channel.
 ///
 /// After construction the download runs in a background tokio task.
-/// Chunks are delivered through an mpsc channel; the body polls the
-/// receiver directly — no shared file, no AtomicU64, no Notify.
+/// The body reads from the temp file, gated on the watch-published write offset.
 pub struct ProxyFileDownloader {
     pub content_length: usize,
     pub content_type: String,
-    /// Receiving end of the download channel. Moved into StreamingBody.
-    pub rx: mpsc::Receiver<Bytes>,
+    /// Path to the temp file being written by download_task.
+    pub temp_file: PathBuf,
+    /// Watch receiver for download progress. Move into StreamingBody (GET) or drop (HEAD).
+    pub watch_rx: watch::Receiver<DownloadState>,
 }
 
 impl ProxyFileDownloader {
@@ -115,9 +126,9 @@ impl ProxyFileDownloader {
                     continue;
                 }
 
-                // Good response — create channel and spawn download task.
+                // Good response — create watch channel and spawn download task.
                 let temp_file = Self::create_temp_file(&hv_file, config)?;
-                let (tx, rx) = mpsc::channel::<Bytes>(8);
+                let (watch_tx, watch_rx) = watch::channel(DownloadState::InProgress(0));
 
                 let hash = hv_file.hash.clone();
                 let expected_size = hv_file.size as u64;
@@ -128,7 +139,7 @@ impl ProxyFileDownloader {
                 tokio::spawn(async move {
                     Self::download_task(
                         resp,
-                        tx,
+                        watch_tx,
                         tf,
                         expected_size,
                         fileid_owned.as_str(),
@@ -142,7 +153,8 @@ impl ProxyFileDownloader {
                 return Ok(Self {
                     content_length: hv_file.size as usize,
                     content_type: hv_file.mime_type().to_string(),
-                    rx,
+                    temp_file,
+                    watch_rx,
                 });
             }
         }
@@ -153,12 +165,13 @@ impl ProxyFileDownloader {
         }))
     }
 
-    /// Stream `resp` to `tx` (for the body) and to `temp_file` (for cache).
-    /// On success + SHA1 match: rename temp_file → cache and register.
-    /// On any failure or body drop (tx.send returns Err): delete temp_file.
+    /// Download `resp` into `temp_file`, publishing progress via `watch_tx`.
+    /// On success + SHA1 match: rename temp_file → cache and send Done.
+    /// On any failure: delete temp_file and send Failed.
+    /// Never observes body state — runs to completion regardless of body drop.
     async fn download_task(
         mut resp: reqwest::Response,
-        tx: mpsc::Sender<Bytes>,
+        watch_tx: watch::Sender<DownloadState>,
         temp_file: PathBuf,
         expected_size: u64,
         fileid: &str,
@@ -175,6 +188,7 @@ impl ProxyFileDownloader {
             Err(e) => {
                 tracing::warn!("Proxy download: cannot open temp file for {}: {}", fileid, e);
                 utils::remove_file(&temp_file);
+                let _ = watch_tx.send(DownloadState::Failed);
                 return;
             }
         };
@@ -219,33 +233,30 @@ impl ProxyFileDownloader {
 
             sha1::Digest::update(&mut sha1, &chunk);
 
-            // Write to temp file first, then send to body.
-            // If write fails, abort (don't send corrupt data).
-            if file.write_all(&chunk).await.is_err() {
-                tracing::warn!("Proxy download: disk write error for {}", fileid);
+            if let Err(e) = file.write_all(&chunk).await {
+                tracing::warn!("Proxy download: disk write error for {}: {}", fileid, e);
                 break;
             }
             downloaded += chunk.len() as u64;
-
-            // Send to body. chunk is already Bytes — move it directly (zero-copy).
-            // If body dropped rx, stop downloading.
-            if tx.send(chunk).await.is_err() {
-                tracing::debug!("Proxy download: body dropped, stopping for {}", fileid);
-                utils::remove_file(&temp_file);
-                return;
-            }
+            // Publish progress; body uses this to know how many bytes are safe to read.
+            // Ignore send error — body may have dropped watch_rx (e.g. HEAD request).
+            let _ = watch_tx.send(DownloadState::InProgress(downloaded));
         }
-
-        // tx drops here — body will see Ready(None) on next poll.
-        drop(tx);
 
         if success {
             let digest = utils::hex_encode(&sha1.finalize());
             if digest == expected_hash {
                 if let Some(hv) = HVFile::from_fileid(fileid) {
                     let cache_path = hv.cache_path(cache_dir);
-                    if let Ok(()) = utils::ensure_dir(cache_path.parent().unwrap()) {
-                        match tokio::fs::rename(&temp_file, &cache_path).await {
+                    match utils::ensure_dir(cache_path.parent().unwrap()) {
+                        Err(e) => {
+                            tracing::warn!(
+                                "Proxy download: cannot create cache dir for {}: {}",
+                                fileid,
+                                e
+                            );
+                        }
+                        Ok(()) => match tokio::fs::rename(&temp_file, &cache_path).await {
                             Ok(()) => {
                                 tracing::info!(
                                     "Proxy download: cached {} ({} bytes)",
@@ -255,7 +266,8 @@ impl ProxyFileDownloader {
                                 if let Some(cache) = cache_handler {
                                     cache.register_proxy_file(&hv);
                                 }
-                                return; // temp_file renamed, don't delete
+                                let _ = watch_tx.send(DownloadState::Done);
+                                return;
                             }
                             Err(e) => {
                                 tracing::warn!(
@@ -264,7 +276,7 @@ impl ProxyFileDownloader {
                                     e
                                 );
                             }
-                        }
+                        },
                     }
                 }
             } else {
@@ -278,6 +290,7 @@ impl ProxyFileDownloader {
         }
 
         utils::remove_file(&temp_file);
+        let _ = watch_tx.send(DownloadState::Failed);
     }
 
     fn create_temp_file(hv_file: &HVFile, config: &Config) -> Result<PathBuf> {
