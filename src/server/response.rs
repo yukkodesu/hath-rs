@@ -1,13 +1,14 @@
-use super::body::StreamingBody;
+use super::body::{FileBodyParams, StreamingBody};
 use crate::bandwidth::BandwidthMonitor;
 use crate::error::{HathError, Result};
 use crate::hvfile::HVFile;
 use crate::proxy_downloader::DownloadState;
+use crate::stats::Stats;
 use bytes::Bytes;
 use hyper::{Response, StatusCode, header};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 
 /// Build a Hyper Response with proper headers.
 /// Java: Cache-Control + Content-Length only added when contentLength > 0.
@@ -144,7 +145,9 @@ pub struct ProxyResponseParts<'a> {
     pub temp_file: std::fs::File,
     pub temp_file_path: PathBuf,
     pub watch_rx: watch::Receiver<DownloadState>,
+    pub proxy_done_tx: oneshot::Sender<()>,
     pub bwm: Option<Arc<BandwidthMonitor>>,
+    pub stats: Option<Arc<Stats>>,
 }
 
 pub fn proxy_response(parts: ProxyResponseParts<'_>) -> Result<Response<StreamingBody>> {
@@ -162,7 +165,9 @@ pub fn proxy_response(parts: ProxyResponseParts<'_>) -> Result<Response<Streamin
         parts.temp_file,
         parts.temp_file_path,
         parts.watch_rx,
+        parts.proxy_done_tx,
         parts.bwm,
+        parts.stats,
     );
     builder.body(body).map_err(HathError::Http)
 }
@@ -176,6 +181,7 @@ pub fn file_response(
     bwm: Option<Arc<BandwidthMonitor>>,
     verify: bool,
     cache_handler: Option<Arc<crate::cache::CacheHandler>>,
+    stats: Option<Arc<Stats>>,
 ) -> Result<Response<StreamingBody>> {
     let path = hv_file.cache_path(cache_dir);
     let expected_size = hv_file.size as usize;
@@ -206,14 +212,15 @@ pub fn file_response(
             .header(header::CACHE_CONTROL, "public, max-age=31536000")
             .header(header::CONTENT_LENGTH, expected_size);
     }
-    let body = StreamingBody::new_file(
+    let body = StreamingBody::new_file(FileBodyParams {
         file,
         path,
-        expected_size,
-        hv_file.hash.to_string(),
+        total_size: expected_size,
+        expected_hash: hv_file.hash.to_string(),
         verify,
         cache_handler,
         bwm,
-    );
+        stats,
+    });
     builder.body(body).map_err(HathError::Http)
 }
