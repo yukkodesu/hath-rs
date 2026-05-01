@@ -52,6 +52,7 @@ enum DataSource {
     Proxy {
         /// File handle opened once at construction; read sequentially.
         file: std::fs::File,
+        file_buf: BytesMut,
         /// Kept for error messages only.
         temp_file: PathBuf,
         write_offset: Arc<AtomicU64>,
@@ -189,6 +190,7 @@ impl StreamingBody {
         Ok(Self {
             source: DataSource::Proxy {
                 file,
+                file_buf: BytesMut::with_capacity(FILE_BUFFER_SIZE),
                 temp_file,
                 write_offset,
                 notify,
@@ -256,10 +258,21 @@ impl StreamingBody {
         file_buf: &mut BytesMut,
         need: usize,
     ) -> std::io::Result<usize> {
-        while file_buf.len() < need {
+        Self::fill_file_buffer_limited(file, file_buf, need, usize::MAX)
+    }
+
+    fn fill_file_buffer_limited(
+        file: &mut std::fs::File,
+        file_buf: &mut BytesMut,
+        need: usize,
+        max_read: usize,
+    ) -> std::io::Result<usize> {
+        let mut remaining_read = max_read;
+        while file_buf.len() < need && remaining_read > 0 {
             let read_target = FILE_BUFFER_SIZE
                 .saturating_sub(file_buf.len())
-                .max(need - file_buf.len());
+                .max(need - file_buf.len())
+                .min(remaining_read);
             file_buf.reserve(read_target);
 
             let spare = file_buf.chunk_mut();
@@ -276,6 +289,7 @@ impl StreamingBody {
             if n == 0 {
                 break;
             }
+            remaining_read = remaining_read.saturating_sub(n);
             unsafe {
                 file_buf.advance_mut(n);
             }
@@ -330,9 +344,15 @@ impl Body for StreamingBody {
             // Java: int nextReadThrehold = Math.min(getContentLength(), readoff + tcpBuffer.limit());
             //       while (nextReadThrehold > proxyDownloader.getCurrentWriteoff()) { sleep(10); }
             let need_wait = match &self.source {
-                DataSource::Proxy { write_offset, .. } => {
-                    let desired_end = (self.offset + TCP_PACKET_SIZE).min(self.total_size) as u64;
-                    write_offset.load(Ordering::SeqCst) < desired_end
+                DataSource::Proxy {
+                    file_buf,
+                    write_offset,
+                    ..
+                } => {
+                    let desired = TCP_PACKET_SIZE.min(self.total_size - self.offset);
+                    file_buf.len() < desired
+                        && write_offset.load(Ordering::SeqCst)
+                            < (self.offset + desired).min(self.total_size) as u64
                 }
                 DataSource::Static { .. } | DataSource::File { .. } | DataSource::Random { .. } => {
                     false
@@ -422,6 +442,7 @@ impl Body for StreamingBody {
             let end = (self.offset + chunk_size).min(self.total_size);
 
             let offset = self.offset;
+            let total_size = self.total_size;
 
             // Separate early-termination from chunk production so that
             // self.finish() — which borrows self.source — is never called
@@ -467,15 +488,23 @@ impl Body for StreamingBody {
                     }
                 }
                 DataSource::Proxy {
-                    file, temp_file, ..
+                    file,
+                    file_buf,
+                    temp_file,
+                    write_offset,
+                    ..
                 } => {
                     let actual_size = end - offset;
-                    let mut buf = BytesMut::zeroed(actual_size);
-                    match file.read(&mut buf[..actual_size]) {
+                    let read_cursor = offset + file_buf.len();
+                    let max_read = (write_offset.load(Ordering::SeqCst) as usize)
+                        .min(total_size)
+                        .saturating_sub(read_cursor);
+                    match Self::fill_file_buffer_limited(file, file_buf, actual_size, max_read) {
                         Ok(0) => ChunkResult::Done,
-                        Ok(n) => {
-                            buf.truncate(n);
-                            ChunkResult::Data(buf.freeze())
+                        Ok(available) => {
+                            let n = actual_size.min(available);
+                            let chunk = file_buf.split_to(n).freeze();
+                            ChunkResult::Data(chunk)
                         }
                         Err(e) => {
                             tracing::warn!(
