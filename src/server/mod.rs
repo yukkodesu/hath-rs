@@ -35,7 +35,7 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, Notify};
 
 /// Shared state accessible from all request handlers.
@@ -136,6 +136,31 @@ static LOCAL_NETWORK_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|169\.254\.|::1|0:0:0:0:0:0:0:1|fc|fd)")
         .expect("invalid regex")
 });
+
+fn configure_send_buffer(stream: &TcpStream, config: &Config) {
+    if config.throttle_bytes == 0 {
+        return;
+    }
+
+    let memory_cap = if config.use_less_memory {
+        131_072
+    } else {
+        524_288
+    };
+    let throttle_cap = (0.2 * config.throttle_bytes as f64).round() as usize;
+    let requested = memory_cap.min(throttle_cap);
+    if requested == 0 {
+        return;
+    }
+
+    if let Err(e) = socket2::SockRef::from(stream).set_send_buffer_size(requested) {
+        tracing::debug!(
+            "Failed to set TCP send buffer to {} bytes: {}",
+            requested,
+            e
+        );
+    }
+}
 
 pub struct HathService {
     pub state: AppState,
@@ -605,22 +630,38 @@ async fn run_threaded_proxy_test(
         let client = client.clone();
 
         handles.push(tokio::spawn(async move {
-            let start = Instant::now();
             // Java: FileDownloader(source, 10000, 60000, true) — 10s connect, 60s total.
             // testtime only affects the /t URL and key, not the timeout.
             let result = timeout(Duration::from_secs(60), async {
-                let resp = client.get(url).send().await.map_err(|_| ())?;
+                let mut resp = client.get(url).send().await.map_err(|_| ())?;
                 let len = resp.content_length().unwrap_or(0);
                 if len < testsize {
                     return Err(());
                 }
-                resp.bytes().await.map_err(|_| ())?;
-                Ok(())
+
+                let mut first_byte_at: Option<Instant> = None;
+                let mut received = 0u64;
+
+                while let Some(chunk) = resp.chunk().await.map_err(|_| ())? {
+                    if !chunk.is_empty() {
+                        first_byte_at.get_or_insert_with(Instant::now);
+                        received += chunk.len() as u64;
+                    }
+                }
+
+                if received != len {
+                    return Err(());
+                }
+
+                let Some(start) = first_byte_at else {
+                    return Err(());
+                };
+                Ok(start.elapsed().as_millis() as u64)
             })
             .await;
 
             match result {
-                Ok(Ok(())) => Some(start.elapsed().as_millis() as u64),
+                Ok(Ok(ms)) => Some(ms),
                 _ => None,
             }
         }));
@@ -869,8 +910,9 @@ async fn run_server(
 
                     // --- Post-handshake policy checks (Java: HTTPServer.run() order) ---
                     let cfg = conn_state.config.load();
-                    let is_local = LOCAL_NETWORK_RE.is_match(&host_addr)
-                        || cfg.client_host == host_addr;
+                    configure_send_buffer(tls_stream.get_ref(), &cfg);
+                    let is_local =
+                        LOCAL_NETWORK_RE.is_match(&host_addr) || cfg.client_host == host_addr;
                     // Java: isValidRPCServer returns true when disableIPOriginCheck is set
                     let is_rpc = cfg.disable_ip_origin_check
                         || cfg.rpc_servers.iter().any(|s| s.to_string().to_lowercase() == host_addr);

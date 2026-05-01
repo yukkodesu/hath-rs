@@ -9,7 +9,7 @@
 
 use bytes::{Bytes, BytesMut};
 use http_body::{Body, Frame, SizeHint};
-use rand::Rng;
+use rand::{Rng, RngExt};
 use sha1::Digest;
 use std::convert::Infallible;
 use std::future::Future;
@@ -26,18 +26,23 @@ use crate::bandwidth::BandwidthMonitor;
 
 /// Java Settings.TCP_PACKET_SIZE = 1460
 const TCP_PACKET_SIZE: usize = 1460;
+const FILE_BUFFER_SIZE: usize = 65_536;
+const SPEEDTEST_RANDOM_LENGTH: usize = 8_192;
 
 /// Where the body data comes from.
 enum DataSource {
     /// Pre-loaded data (for small text responses).
     Static { data: Bytes },
-    /// Generate random data on-the-fly per chunk (speedtest).
-    Random,
+    /// Generate speedtest chunks from a reusable random pool.
+    Random { random_bytes: Box<[u8]> },
     /// Streaming from a file with optional inline SHA1 verification.
     /// Java: HTTPResponseProcessorFile — reads chunks via FileChannel,
     /// computes SHA1 incrementally, deletes corrupt file in cleanup().
     File {
         file: std::fs::File,
+        file_buf: Vec<u8>,
+        file_buf_pos: usize,
+        file_buf_len: usize,
         sha1: sha1::Sha1,
         expected_hash: String,
         /// Deleted after send if SHA1 mismatches.
@@ -117,6 +122,9 @@ impl StreamingBody {
         Self {
             source: DataSource::File {
                 file,
+                file_buf: vec![0; FILE_BUFFER_SIZE],
+                file_buf_pos: 0,
+                file_buf_len: 0,
                 sha1: sha1::Sha1::new(),
                 expected_hash,
                 to_delete: if verify { Some(path) } else { None },
@@ -131,11 +139,13 @@ impl StreamingBody {
         }
     }
 
-    /// Create a body that generates random data per-chunk (zero pre-allocation).
+    /// Create a body that serves random-looking chunks from a reusable 8 KiB pool.
     /// Java: HTTPResponseProcessorSpeedtest.
     pub fn new_random(total_size: usize, bwm: Option<Arc<BandwidthMonitor>>) -> Self {
+        let mut random_bytes = vec![0; SPEEDTEST_RANDOM_LENGTH].into_boxed_slice();
+        rand::rng().fill_bytes(&mut random_bytes);
         Self {
-            source: DataSource::Random,
+            source: DataSource::Random { random_bytes },
             offset: 0,
             total_size,
             bwm,
@@ -241,8 +251,37 @@ impl StreamingBody {
             } => {
                 body_done_notify.notify_one();
             }
-            DataSource::Static { .. } | DataSource::Random => {}
+            DataSource::Static { .. } | DataSource::Random { .. } => {}
         }
+    }
+
+    fn fill_file_buffer(
+        file: &mut std::fs::File,
+        file_buf: &mut [u8],
+        file_buf_pos: &mut usize,
+        file_buf_len: &mut usize,
+        need: usize,
+    ) -> std::io::Result<usize> {
+        let remaining = file_buf_len.saturating_sub(*file_buf_pos);
+        if remaining >= need {
+            return Ok(remaining);
+        }
+
+        if remaining > 0 && *file_buf_pos > 0 {
+            file_buf.copy_within(*file_buf_pos..*file_buf_len, 0);
+        }
+        *file_buf_pos = 0;
+        *file_buf_len = remaining;
+
+        while *file_buf_len < need {
+            let n = file.read(&mut file_buf[*file_buf_len..])?;
+            if n == 0 {
+                break;
+            }
+            *file_buf_len += n;
+        }
+
+        Ok(file_buf_len.saturating_sub(*file_buf_pos))
     }
 }
 
@@ -295,7 +334,9 @@ impl Body for StreamingBody {
                     let desired_end = (self.offset + TCP_PACKET_SIZE).min(self.total_size) as u64;
                     write_offset.load(Ordering::SeqCst) < desired_end
                 }
-                DataSource::Static { .. } | DataSource::File { .. } | DataSource::Random => false,
+                DataSource::Static { .. } | DataSource::File { .. } | DataSource::Random { .. } => {
+                    false
+                }
             };
 
             // Clear stale wait_fut when data is now available.
@@ -392,21 +433,42 @@ impl Body for StreamingBody {
 
             let result = match &mut self.source {
                 DataSource::Static { data } => ChunkResult::Data(data.slice(offset..end)),
-                DataSource::Random => {
+                DataSource::Random { random_bytes } => {
                     let actual_size = end - offset;
-                    let mut buf = BytesMut::zeroed(actual_size);
-                    rand::rng().fill_bytes(&mut buf);
-                    ChunkResult::Data(buf.freeze())
+                    let max_start = random_bytes.len().saturating_sub(actual_size);
+                    let start = if max_start == 0 {
+                        0
+                    } else {
+                        (rand::rng().random::<u32>() as usize) % (max_start + 1)
+                    };
+                    ChunkResult::Data(Bytes::copy_from_slice(
+                        &random_bytes[start..start + actual_size],
+                    ))
                 }
-                DataSource::File { file, sha1, .. } => {
+                DataSource::File {
+                    file,
+                    file_buf,
+                    file_buf_pos,
+                    file_buf_len,
+                    sha1,
+                    ..
+                } => {
                     let actual_size = end - offset;
-                    let mut buf = BytesMut::zeroed(actual_size);
-                    match file.read(&mut buf[..actual_size]) {
+                    match Self::fill_file_buffer(
+                        file,
+                        file_buf,
+                        file_buf_pos,
+                        file_buf_len,
+                        actual_size,
+                    ) {
                         Ok(0) => ChunkResult::Done,
-                        Ok(n) => {
-                            sha1::Digest::update(sha1, &buf[..n]);
-                            buf.truncate(n);
-                            ChunkResult::Data(buf.freeze())
+                        Ok(available) => {
+                            let n = actual_size.min(available);
+                            let start = *file_buf_pos;
+                            let end = start + n;
+                            sha1::Digest::update(sha1, &file_buf[start..end]);
+                            *file_buf_pos = end;
+                            ChunkResult::Data(Bytes::copy_from_slice(&file_buf[start..end]))
                         }
                         Err(e) => {
                             tracing::warn!("File body: read error at offset {}: {}", offset, e);
