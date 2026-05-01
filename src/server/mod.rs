@@ -468,12 +468,11 @@ impl Service<Request<Incoming>> for HathService {
                 }
             }
 
-            // Header throttling: deduct actual serialized header bytes.
+            // Header accounting/throttling: use actual serialized header bytes.
             // Java: bwm.waitForQuota(myThread, headerBytes.length) where headerBytes
-            // is the full serialized HTTP response header.
-            if let Some(ref bwm) = bwm_for_header
-                && let Ok(ref r) = resp
-            {
+            // is the full serialized HTTP response header; Stats.bytesSent records
+            // the same header byte count for non-local clients.
+            if let Ok(ref r) = resp {
                 let reason_len = r.status().canonical_reason().map_or(0, |s| s.len());
                 // Status line: "HTTP/1.1 XXX reason\r\n"
                 let status_line_len = 13 + reason_len; // "HTTP/1.1 " + "XXX " + reason + "\r\n"
@@ -483,7 +482,12 @@ impl Service<Request<Incoming>> for HathService {
                     .map(|(k, v)| k.as_str().len() + 2 + v.as_bytes().len() + 2) // "Key: Value\r\n"
                     .sum();
                 let total_header_bytes = status_line_len + headers_len + 2; // + trailing \r\n
-                bwm.wait_for_quota(total_header_bytes).await;
+                if let Some(ref bwm) = bwm_for_header {
+                    bwm.wait_for_quota(total_header_bytes).await;
+                }
+                if !is_local {
+                    state.stats.record_bytes_sent(total_header_bytes as u64);
+                }
             }
 
             match resp {
