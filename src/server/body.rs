@@ -436,13 +436,17 @@ impl Body for StreamingBody {
                 let early_exit = match &self.source {
                     DataSource::Proxy {
                         download_done,
+                        write_offset: wo,
                         start_time,
                         ..
                     } => {
                         if download_done.load(Ordering::SeqCst) {
                             tracing::debug!(
-                                "ProxyStreamingBody: download done, terminating at offset {}",
-                                self.offset
+                                "ProxyStreamingBody: download done, terminating at offset={} \
+                                 write_offset={} total={}",
+                                self.offset,
+                                wo.load(Ordering::SeqCst),
+                                self.total_size,
                             );
                             Some(BodyIncompleteReason::ProxyEndedEarly)
                         } else if start_time.elapsed() > Duration::from_secs(300) {
@@ -566,15 +570,20 @@ impl Body for StreamingBody {
                     let max_read = (write_offset.load(Ordering::SeqCst) as usize)
                         .min(total_size)
                         .saturating_sub(read_cursor);
-                    // max_read == 0 means write_offset rolled back (retry in
-                    // progress) or hasn't advanced past read_cursor yet.
-                    // Loop back so need_wait re-evaluates rather than treating
-                    // this as a genuine EOF.
-                    if max_read == 0 {
-                        continue;
-                    }
                     match Self::fill_file_buffer_limited(file, file_buf, actual_size, max_read) {
-                        Ok(0) => ChunkResult::Done(BodyIncompleteReason::ProxyEndedEarly),
+                        Ok(0) => {
+                            tracing::debug!(
+                                "ProxyStreamingBody: fill returned Ok(0) for {} \
+                                 offset={} read_cursor={} max_read={} write_offset={} total={}",
+                                temp_file.display(),
+                                offset,
+                                read_cursor,
+                                max_read,
+                                write_offset.load(Ordering::SeqCst),
+                                total_size,
+                            );
+                            ChunkResult::Done(BodyIncompleteReason::ProxyEndedEarly)
+                        }
                         Ok(available) => {
                             let n = actual_size.min(available);
                             let chunk = file_buf.split_to(n).freeze();
