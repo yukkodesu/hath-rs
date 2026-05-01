@@ -232,10 +232,15 @@ impl<B: BodyCompletionStatus> Drop for AccessLogBody<B> {
     fn drop(&mut self) {
         if self.info.is_some() {
             let snapshot = self.inner.completion_status();
-            self.log_completion(AccessLogCompletion::Aborted {
-                offset: snapshot.offset,
-                total_size: snapshot.total_size,
-            });
+            let completion = if snapshot.offset >= snapshot.total_size {
+                AccessLogCompletion::Finished
+            } else {
+                AccessLogCompletion::Aborted {
+                    offset: snapshot.offset,
+                    total_size: snapshot.total_size,
+                }
+            };
+            self.log_completion(completion);
         }
     }
 }
