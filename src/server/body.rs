@@ -22,6 +22,7 @@ use tokio::sync::{oneshot, watch};
 
 use crate::bandwidth::BandwidthMonitor;
 use crate::proxy_downloader::DownloadState;
+use crate::stats::Stats;
 
 /// Java Settings.TCP_PACKET_SIZE = 1460
 const TCP_PACKET_SIZE: usize = 1460;
@@ -81,6 +82,8 @@ pub struct StreamingBody {
     /// Whether a throttle just completed (prevents double-throttle for same chunk).
     throttled: bool,
     completion: BodyCompletion,
+    /// When set, record stats on body completion. None for text/speedtest responses.
+    stats: Option<Arc<Stats>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,6 +147,7 @@ impl StreamingBody {
         verify: bool,
         cache_handler: Option<Arc<crate::cache::CacheHandler>>,
         bwm: Option<Arc<BandwidthMonitor>>,
+        stats: Option<Arc<Stats>>,
     ) -> Self {
         Self {
             source: DataSource::File {
@@ -160,6 +164,7 @@ impl StreamingBody {
             throttle_fut: None,
             throttled: false,
             completion: BodyCompletion::Running,
+            stats,
         }
     }
 
@@ -175,6 +180,7 @@ impl StreamingBody {
             throttle_fut: None,
             throttled: false,
             completion: BodyCompletion::Running,
+            stats: None,
         }
     }
 
@@ -188,6 +194,7 @@ impl StreamingBody {
             throttle_fut: None,
             throttled: false,
             completion: BodyCompletion::Running,
+            stats: None,
         }
     }
 
@@ -202,6 +209,7 @@ impl StreamingBody {
         watch_rx: watch::Receiver<DownloadState>,
         proxy_done_tx: oneshot::Sender<()>,
         bwm: Option<Arc<BandwidthMonitor>>,
+        stats: Option<Arc<Stats>>,
     ) -> Self {
         Self {
             source: DataSource::Proxy {
@@ -218,6 +226,7 @@ impl StreamingBody {
             throttle_fut: None,
             throttled: false,
             completion: BodyCompletion::Running,
+            stats,
         }
     }
 }
@@ -274,6 +283,18 @@ impl StreamingBody {
                     let _ = tx.send(());
                 }
             }
+        }
+
+        // Record stats after actual transmission, not at response construction time.
+        // Java: fileSent() in proxyThreadCompleted() (proxy) / initialize() (file, we align
+        // to complete); bytesSent() after each socket write — we use actual offset sent.
+        if completed && let Some(ref stats) = self.stats {
+            if matches!(self.source, DataSource::Proxy { .. }) {
+                // Java: Stats.fileSent() in proxyThreadCompleted()
+                stats.record_file_sent();
+            }
+            // bytesSent: actual bytes transmitted, not declared content-length
+            stats.record_bytes_sent(self.offset as u64);
         }
     }
 
@@ -578,6 +599,7 @@ mod tests {
             true,
             None,
             None,
+            None,
         );
         body.offset = 4;
         body.finish();
@@ -603,6 +625,7 @@ mod tests {
             10,
             "0000000000000000000000000000000000000000".to_string(),
             false,
+            None,
             None,
             None,
         );
@@ -642,7 +665,7 @@ mod tests {
         let (tx, rx) = watch::channel(DownloadState::InProgress(10));
         let (done_tx, _done_rx) = oneshot::channel();
 
-        let mut body = StreamingBody::new_proxy(10, file, path.clone(), rx, done_tx, None);
+        let mut body = StreamingBody::new_proxy(10, file, path.clone(), rx, done_tx, None, None);
         let collected = collect_body(&mut body).await;
         assert_eq!(collected, b"helloworld");
         assert_eq!(body.completion_status().completion, BodyCompletion::Complete);
@@ -659,7 +682,7 @@ mod tests {
         let (tx, rx) = watch::channel(DownloadState::InProgress(7));
         let (done_tx, _done_rx) = oneshot::channel();
 
-        let mut body = StreamingBody::new_proxy(100, file, path.clone(), rx, done_tx, None);
+        let mut body = StreamingBody::new_proxy(100, file, path.clone(), rx, done_tx, None, None);
 
         // Advance: body will read 7 bytes then watch shows Failed.
         let handle = tokio::spawn(async move {

@@ -253,22 +253,28 @@ impl Service<Request<Incoming>> for HathService {
                             // not set) and verification is not disabled/on cooldown,
                             // verify SHA1 inline and delete corrupt file in cleanup().
                             let recently_accessed = state.cache.mark_recently_accessed(hv, false);
+                            // Java: Stats.fileSent() in HTTPResponseProcessorFile.initialize()
+                            // (file opened successfully). bytesSent is recorded per actual
+                            // bytes transmitted in the body's finish_with().
                             state.stats.record_file_sent();
-                            if !is_local && !is_rpc {
-                                state.stats.record_bytes_sent(hv.size as u64);
-                            }
                             if head_only {
                                 response::head_response(hv.mime_type(), hv.size as usize)
                             } else {
                                 let verify = recently_accessed
                                     && !config.disable_file_verification
                                     && !state.cache.is_file_verification_on_cooldown();
+                                let stats = if !is_local && !is_rpc {
+                                    Some(state.stats.clone())
+                                } else {
+                                    None
+                                };
                                 response::file_response(
                                     hv,
                                     &config.cache_dir,
                                     bwm_for_request,
                                     verify,
                                     Some(state.cache.clone()),
+                                    stats,
                                 )
                             }
                         } else {
@@ -302,10 +308,8 @@ impl Service<Request<Incoming>> for HathService {
                                         {
                                             Ok(proxy) => {
                                                 let mime = hv.mime_type();
-                                                state.stats.record_file_sent();
-                                                if !is_local && !is_rpc {
-                                                    state.stats.record_bytes_sent(hv.size as u64);
-                                                }
+                                                // Stats for proxy are recorded in body's finish_with()
+                                                // after actual transmission — Java: proxyThreadCompleted().
                                                 if head_only {
                                                     // Drop both channels — download_task treats
                                                     // proxy_done_rx recv Err as "body done" and
@@ -318,6 +322,11 @@ impl Service<Request<Incoming>> for HathService {
                                                     )
                                                 } else {
                                                     let total_size = proxy.content_length;
+                                                    let proxy_stats = if !is_local && !is_rpc {
+                                                        Some(state.stats.clone())
+                                                    } else {
+                                                        None
+                                                    };
                                                     match std::fs::File::open(&proxy.temp_file) {
                                                         Err(e) => {
                                                             tracing::warn!(
@@ -342,6 +351,7 @@ impl Service<Request<Incoming>> for HathService {
                                                                     temp_file_path: proxy.temp_file,
                                                                     watch_rx: proxy.watch_rx,
                                                                     proxy_done_tx: proxy.proxy_done_tx,
+                                                                    stats: proxy_stats,
                                                                     bwm: bwm_for_request,
                                                                 },
                                                             );

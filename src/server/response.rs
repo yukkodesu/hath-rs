@@ -3,6 +3,7 @@ use crate::bandwidth::BandwidthMonitor;
 use crate::error::{HathError, Result};
 use crate::hvfile::HVFile;
 use crate::proxy_downloader::DownloadState;
+use crate::stats::Stats;
 use bytes::Bytes;
 use hyper::{Response, StatusCode, header};
 use std::path::{Path, PathBuf};
@@ -146,6 +147,7 @@ pub struct ProxyResponseParts<'a> {
     pub watch_rx: watch::Receiver<DownloadState>,
     pub proxy_done_tx: oneshot::Sender<()>,
     pub bwm: Option<Arc<BandwidthMonitor>>,
+    pub stats: Option<Arc<Stats>>,
 }
 
 pub fn proxy_response(parts: ProxyResponseParts<'_>) -> Result<Response<StreamingBody>> {
@@ -165,6 +167,7 @@ pub fn proxy_response(parts: ProxyResponseParts<'_>) -> Result<Response<Streamin
         parts.watch_rx,
         parts.proxy_done_tx,
         parts.bwm,
+        parts.stats,
     );
     builder.body(body).map_err(HathError::Http)
 }
@@ -178,6 +181,7 @@ pub fn file_response(
     bwm: Option<Arc<BandwidthMonitor>>,
     verify: bool,
     cache_handler: Option<Arc<crate::cache::CacheHandler>>,
+    stats: Option<Arc<Stats>>,
 ) -> Result<Response<StreamingBody>> {
     let path = hv_file.cache_path(cache_dir);
     let expected_size = hv_file.size as usize;
@@ -216,6 +220,7 @@ pub fn file_response(
         verify,
         cache_handler,
         bwm,
+        stats,
     );
     builder.body(body).map_err(HathError::Http)
 }
