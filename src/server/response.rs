@@ -2,12 +2,12 @@ use super::body::StreamingBody;
 use crate::bandwidth::BandwidthMonitor;
 use crate::error::{HathError, Result};
 use crate::hvfile::HVFile;
+use crate::proxy_downloader::DownloadState;
 use bytes::Bytes;
 use hyper::{Response, StatusCode, header};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64};
-use tokio::sync::Notify;
+use tokio::sync::watch;
 
 /// Build a Hyper Response with proper headers.
 /// Java: Cache-Control + Content-Length only added when contentLength > 0.
@@ -136,16 +136,14 @@ pub fn speedtest_response(
 }
 
 /// Build a response for a proxy file download in progress.
-/// The body will stream data from the temp file as the background download
-/// task writes to it. Java: HTTPResponseProcessorProxy + ProxyFileDownloader.
+/// The body reads from temp_file, gated on watch_rx progress.
+/// Java: HTTPResponseProcessorProxy + ProxyFileDownloader.
 pub struct ProxyResponseParts<'a> {
     pub content_type: &'a str,
     pub total_size: usize,
-    pub temp_file: PathBuf,
-    pub write_offset: Arc<AtomicU64>,
-    pub notify: Arc<Notify>,
-    pub body_done_notify: Arc<Notify>,
-    pub download_done: Arc<AtomicBool>,
+    pub temp_file: std::fs::File,
+    pub temp_file_path: PathBuf,
+    pub watch_rx: watch::Receiver<DownloadState>,
     pub bwm: Option<Arc<BandwidthMonitor>>,
 }
 
@@ -162,13 +160,10 @@ pub fn proxy_response(parts: ProxyResponseParts<'_>) -> Result<Response<Streamin
     let body = StreamingBody::new_proxy(
         parts.total_size,
         parts.temp_file,
-        parts.write_offset,
-        parts.notify,
-        parts.body_done_notify,
-        parts.download_done,
+        parts.temp_file_path,
+        parts.watch_rx,
         parts.bwm,
-    )
-    .map_err(HathError::Io)?;
+    );
     builder.body(body).map_err(HathError::Http)
 }
 

@@ -529,6 +529,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha1",
+ "socket2",
  "tempfile",
  "thiserror",
  "tokio",
