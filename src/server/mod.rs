@@ -639,7 +639,6 @@ async fn run_threaded_proxy_test(
     testkey: &str,
 ) -> (u32, u64) {
     use rand::RngExt;
-    use std::time::Instant;
 
     // Java: FileDownloader(source, 10000, 60000, true)
     // connectTimeout=10s, readTimeout=60s, 3 retries
@@ -664,37 +663,7 @@ async fn run_threaded_proxy_test(
         let client = client.clone();
 
         handles.push(tokio::spawn(async move {
-            // Java: FileDownloader(source, 10000, 60000, true)
-            // connectTimeout=10s, readTimeout=60s (set on client).
-            let result = async {
-                let mut resp = client.get(url).send().await.map_err(|_| ())?;
-                let len = resp.content_length().unwrap_or(0);
-                if len < testsize {
-                    return Err(());
-                }
-
-                let mut first_byte_at: Option<Instant> = None;
-                let mut received = 0u64;
-
-                while let Some(chunk) = resp.chunk().await.map_err(|_| ())? {
-                    if !chunk.is_empty() {
-                        first_byte_at.get_or_insert_with(Instant::now);
-                        received += chunk.len() as u64;
-                    }
-                }
-
-                if received != len {
-                    return Err(());
-                }
-
-                let Some(start) = first_byte_at else {
-                    return Err(());
-                };
-                Ok(start.elapsed().as_millis() as u64)
-            }
-            .await;
-
-            result.ok()
+            run_threaded_proxy_test_download(&client, url, testsize).await
         }));
     }
 
@@ -709,6 +678,82 @@ async fn run_threaded_proxy_test(
     }
 
     (successful, total_time_ms)
+}
+
+enum ThreadedProxyTestAttemptError {
+    NotFound,
+    Retryable,
+}
+
+async fn run_threaded_proxy_test_download(
+    client: &reqwest::Client,
+    url: Url,
+    testsize: u64,
+) -> Option<u64> {
+    use std::time::Instant;
+
+    for retries_left in (0..3).rev() {
+        let result = async {
+            let mut resp = client
+                .get(url.clone())
+                .header("Connection", "Close")
+                .header(
+                    hyper::header::USER_AGENT,
+                    format!("Hentai@Home {}", crate::rpc::CLIENT_VERSION),
+                )
+                .send()
+                .await
+                .map_err(|_| ThreadedProxyTestAttemptError::Retryable)?;
+
+            if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                return Err(ThreadedProxyTestAttemptError::NotFound);
+            }
+            if !resp.status().is_success() {
+                return Err(ThreadedProxyTestAttemptError::Retryable);
+            }
+
+            let content_length = resp
+                .content_length()
+                .ok_or(ThreadedProxyTestAttemptError::Retryable)?;
+            let mut first_byte_at: Option<Instant> = None;
+            let mut received = 0u64;
+
+            while let Some(chunk) = resp
+                .chunk()
+                .await
+                .map_err(|_| ThreadedProxyTestAttemptError::Retryable)?
+            {
+                if !chunk.is_empty() {
+                    first_byte_at.get_or_insert_with(Instant::now);
+                    received += chunk.len() as u64;
+                }
+            }
+
+            if received != content_length {
+                return Err(ThreadedProxyTestAttemptError::Retryable);
+            }
+
+            Ok((content_length >= testsize).then(|| {
+                first_byte_at
+                    .map(|start| start.elapsed().as_millis() as u64)
+                    .unwrap_or(0)
+            }))
+        }
+        .await;
+
+        match result {
+            Ok(download_time_ms) => return download_time_ms,
+            Err(ThreadedProxyTestAttemptError::NotFound) => return None,
+            Err(ThreadedProxyTestAttemptError::Retryable) => {
+                tracing::warn!(
+                    "Threaded proxy test failed (retrying, {} left)",
+                    retries_left
+                );
+            }
+        }
+    }
+
+    None
 }
 
 fn build_threaded_proxy_test_url(
