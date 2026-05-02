@@ -3,9 +3,48 @@ use crate::error::{HathError, Result};
 use crate::rpc::{self, Action, ResponseStatus, ServerResponse};
 use crate::stats::Stats;
 use arc_swap::ArcSwap;
-use reqwest::{Client, Url};
+use reqwest::{Client, StatusCode, Url};
+use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+const KEY_EXPIRED_RETRY_LIMIT: u32 = 1;
+
+#[derive(Debug)]
+struct RpcRequestError {
+    message: String,
+}
+
+impl RpcRequestError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for RpcRequestError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.message.fmt(f)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RpcStatusAction {
+    ReadBody,
+    Retry,
+    Abort,
+}
+
+fn rpc_status_action(status: StatusCode) -> RpcStatusAction {
+    if status == StatusCode::NOT_FOUND {
+        RpcStatusAction::Abort
+    } else if status.is_client_error() || status.is_server_error() {
+        RpcStatusAction::Retry
+    } else {
+        RpcStatusAction::ReadBody
+    }
+}
 
 /// Mutable RPC routing state, separated from Config to avoid cloning the
 /// entire Config (including static_ranges HashMap) on every RPC call.
@@ -86,23 +125,24 @@ impl RpcClient {
             // Java: KEY_EXPIRED retry only for string-act calls with non-null retryact.
             // URL/add-based calls (still_alive, get_blacklist, srfetch) do not retry.
             if parsed.fail_code.as_deref() == Some("KEY_EXPIRED")
-                && key_expired_retries < 2
+                && key_expired_retries < KEY_EXPIRED_RETRY_LIMIT
                 && act.supports_key_expired_retry()
             {
                 key_expired_retries += 1;
                 tracing::info!(
                     "KEY_EXPIRED received, refreshing server stat and retrying ({}/{})...",
                     key_expired_retries,
-                    2
+                    KEY_EXPIRED_RETRY_LIMIT
                 );
                 match self.call_stat_inner().await {
                     Ok(stat_resp) if stat_resp.status == ResponseStatus::Ok => {
                         Config::apply_server_response(&self.config, &stat_resp);
                     }
-                    Ok(stat_resp) => {
+                    Ok(stat_resp) if stat_resp.status == ResponseStatus::Null => {
                         let fail_host = stat_resp.fail_host.unwrap_or_else(|| "unknown".into());
                         self.state.lock().unwrap().rpc_last_failed = Some(fail_host);
                     }
+                    Ok(_) => {}
                     Err(_) => {}
                 }
                 continue;
@@ -120,10 +160,12 @@ impl RpcClient {
     }
 
     /// HTTP request with 3-attempt retry matching Java FileDownloader.run().
-    /// Connection/read errors are retried; a non-200 response is received as a
-    /// normal body (Java treats 404 as a no-retry exception, but that occurs at
-    /// the response-parsing level, not at the HTTP level).
-    async fn send_rpc_request(http: &Client, url: Url) -> std::result::Result<String, reqwest::Error> {
+    /// Network/read errors are retried. HTTP 404 is not retried
+    /// (FileNotFoundException); other 4xx/5xx responses are retried.
+    async fn send_rpc_request(
+        http: &Client,
+        url: Url,
+    ) -> std::result::Result<String, RpcRequestError> {
         let mut last_err = None;
         for attempt in 0..3 {
             match http
@@ -132,11 +174,26 @@ impl RpcClient {
                 .send()
                 .await
             {
-                Ok(r) => match r.text().await {
-                    Ok(b) => return Ok(b),
-                    Err(e) => last_err = Some(e),
-                },
-                Err(e) => last_err = Some(e),
+                Ok(r) => {
+                    let status = r.status();
+                    match rpc_status_action(status) {
+                        RpcStatusAction::ReadBody => match r.text().await {
+                            Ok(b) => return Ok(b),
+                            Err(e) => last_err = Some(RpcRequestError::new(e.to_string())),
+                        },
+                        RpcStatusAction::Retry => {
+                            last_err =
+                                Some(RpcRequestError::new(format!("server returned {}", status)));
+                        }
+                        RpcStatusAction::Abort => {
+                            return Err(RpcRequestError::new(format!(
+                                "server returned {}",
+                                status
+                            )));
+                        }
+                    }
+                }
+                Err(e) => last_err = Some(RpcRequestError::new(e.to_string())),
             }
             if attempt < 2 {
                 tracing::debug!("RPC request attempt {} failed, retrying...", attempt + 1);
@@ -281,4 +338,34 @@ pub fn spawn_rpc_failure_clearer(
             }
         },
     ));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn key_expired_retries_once_for_retryact_calls() {
+        assert_eq!(KEY_EXPIRED_RETRY_LIMIT, 1);
+        assert!(Action::ClientStart.supports_key_expired_retry());
+        assert!(!Action::StillAlive.supports_key_expired_retry());
+        assert!(!Action::StaticRangeFetch.supports_key_expired_retry());
+    }
+
+    #[test]
+    fn rpc_http_statuses_follow_file_downloader_retry_shape() {
+        assert_eq!(rpc_status_action(StatusCode::OK), RpcStatusAction::ReadBody);
+        assert_eq!(
+            rpc_status_action(StatusCode::NOT_FOUND),
+            RpcStatusAction::Abort
+        );
+        assert_eq!(
+            rpc_status_action(StatusCode::FORBIDDEN),
+            RpcStatusAction::Retry
+        );
+        assert_eq!(
+            rpc_status_action(StatusCode::INTERNAL_SERVER_ERROR),
+            RpcStatusAction::Retry
+        );
+    }
 }

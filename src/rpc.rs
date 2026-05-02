@@ -165,7 +165,7 @@ pub fn parse_server_response(body: &str, request_host: &str) -> ServerResponse {
             fail_host: Some(request_host.to_lowercase()),
         },
         "KEY_EXPIRED" => ServerResponse {
-            status: ResponseStatus::Null,
+            status: ResponseStatus::Fail,
             lines: vec![],
             fail_code: Some("KEY_EXPIRED".into()),
             fail_host: Some(request_host.to_lowercase()),
@@ -273,5 +273,14 @@ mod tests {
     fn test_parse_empty_is_null() {
         let r = parse_server_response("", "rpc.example.com");
         assert_eq!(r.status, ResponseStatus::Null);
+    }
+
+    #[test]
+    fn test_parse_key_expired_is_fail() {
+        let r = parse_server_response("KEY_EXPIRED", "rpc.example.com");
+
+        assert_eq!(r.status, ResponseStatus::Fail);
+        assert_eq!(r.fail_code.as_deref(), Some("KEY_EXPIRED"));
+        assert_eq!(r.fail_host.as_deref(), Some("rpc.example.com"));
     }
 }
