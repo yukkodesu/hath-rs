@@ -290,7 +290,7 @@ impl StreamingBody {
         // Record stats after actual transmission, not at response construction time.
         // Java: fileSent() in proxyThreadCompleted() (proxy) / initialize() (file, we align
         // to complete); bytesSent() after each socket write — we use actual offset sent.
-        if completed && let Some(ref stats) = self.stats {
+        if completed && let Some(stats) = self.stats.take() {
             if matches!(self.source, DataSource::Proxy { .. }) {
                 // Java: Stats.fileSent() in proxyThreadCompleted()
                 stats.record_file_sent();
@@ -401,9 +401,7 @@ impl Body for StreamingBody {
                 }
 
                 let gate = if let DataSource::Proxy {
-                    watch_rx,
-                    wait_fut,
-                    ..
+                    watch_rx, wait_fut, ..
                 } = &mut self.source
                 {
                     // Sample the latest watch state without holding the borrow.
@@ -414,8 +412,12 @@ impl Body for StreamingBody {
                             DownloadState::Done => (current_total as u64, None),
                             DownloadState::Failed(reason) => {
                                 let incomplete = match reason {
-                                    DownloadFailReason::Timeout => BodyIncompleteReason::ProxyTimeout,
-                                    DownloadFailReason::NetworkError => BodyIncompleteReason::ProxyReadError,
+                                    DownloadFailReason::Timeout => {
+                                        BodyIncompleteReason::ProxyTimeout
+                                    }
+                                    DownloadFailReason::NetworkError => {
+                                        BodyIncompleteReason::ProxyReadError
+                                    }
                                     _ => BodyIncompleteReason::ProxyEndedEarly,
                                 };
                                 (0, Some(incomplete))
@@ -593,6 +595,8 @@ impl Body for StreamingBody {
 mod tests {
     use super::*;
     use http_body_util::BodyExt;
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
 
     #[test]
     fn file_body_skips_integrity_check_when_send_is_partial() {
@@ -678,7 +682,10 @@ mod tests {
         let mut body = StreamingBody::new_proxy(10, file, path.clone(), rx, done_tx, None, None);
         let collected = collect_body(&mut body).await;
         assert_eq!(collected, b"helloworld");
-        assert_eq!(body.completion_status().completion, BodyCompletion::Complete);
+        assert_eq!(
+            body.completion_status().completion,
+            BodyCompletion::Complete
+        );
         drop(tx);
     }
 
@@ -709,5 +716,74 @@ mod tests {
             completion,
             BodyCompletion::Incomplete(BodyIncompleteReason::ProxyReadError)
         );
+    }
+
+    #[tokio::test]
+    async fn proxy_body_records_completion_stats_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy-file");
+        std::fs::write(&path, b"helloworld").unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let (tx, rx) = watch::channel(DownloadState::InProgress(10));
+        let (done_tx, _done_rx) = oneshot::channel();
+        let stats = Arc::new(Stats::new());
+
+        let mut body = StreamingBody::new_proxy(
+            10,
+            file,
+            path.clone(),
+            rx,
+            done_tx,
+            None,
+            Some(stats.clone()),
+        );
+        let collected = collect_body(&mut body).await;
+        assert_eq!(collected, b"helloworld");
+        assert_eq!(stats.files_sent.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.bytes_sent.load(Ordering::Relaxed), 10);
+
+        body.finish();
+        assert_eq!(stats.files_sent.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.bytes_sent.load(Ordering::Relaxed), 10);
+        drop(tx);
+    }
+
+    /// Simulates P0-01 body-stage retry: InProgress resets to 0 (file truncated,
+    /// download restarted), then catches back up. Body must wait through the
+    /// zero-reset and resume reading once the write offset passes its position.
+    #[tokio::test]
+    async fn proxy_body_handles_write_offset_reset_on_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy-retry");
+        // File has 20 bytes; positions 0-19 all valid (retry rewrites from 0).
+        std::fs::write(&path, [0xAAu8; 20]).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let (tx, rx) = watch::channel(DownloadState::InProgress(7));
+        let (done_tx, _done_rx) = oneshot::channel();
+
+        let mut body = StreamingBody::new_proxy(20, file, path.clone(), rx, done_tx, None, None);
+
+        // Spawn the body consumer.
+        let handle = tokio::spawn(async move {
+            let data = collect_body(&mut body).await;
+            (data, body.completion_status().completion)
+        });
+
+        // Body reads 7 bytes (one TCP packet), then hits the wait gate at offset 7.
+        // Simulate retry: InProgress resets to 0.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let _ = tx.send(DownloadState::InProgress(0));
+
+        // Body should now be waiting. Give it time to notice.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        // Retry catches up: write offset passes body's position (7 + 1460).
+        let _ = tx.send(DownloadState::InProgress(20));
+        // Signal download complete.
+        let _ = tx.send(DownloadState::Done);
+
+        let (data, completion) = handle.await.unwrap();
+        assert_eq!(data.len(), 20);
+        assert_eq!(completion, BodyCompletion::Complete);
     }
 }

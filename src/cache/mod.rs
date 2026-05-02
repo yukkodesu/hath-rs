@@ -567,6 +567,7 @@ impl CacheHandler {
                 }
 
                 let mut oldest_modified = u64::MAX;
+                let mut found_valid = false;
 
                 for file in &files {
                     if !file.is_file() {
@@ -627,6 +628,7 @@ impl CacheHandler {
                         continue;
                     }
 
+                    found_valid = true;
                     count += 1;
                     size += hv.size as u64;
 
@@ -645,7 +647,11 @@ impl CacheHandler {
                     }
                 }
 
-                range_ages.insert(static_range, oldest_modified);
+                if found_valid {
+                    range_ages.insert(static_range, oldest_modified);
+                } else {
+                    utils::remove_dir(l2_dir);
+                }
             }
         }
 

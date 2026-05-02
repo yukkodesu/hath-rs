@@ -23,7 +23,7 @@ use hyper::header;
 use hyper::server::conn::http1;
 use hyper::service::Service;
 use hyper::{Request, Response};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use openssl::ssl::SslContext;
 use regex::Regex;
 use reqwest::Url;
@@ -302,6 +302,7 @@ impl Service<Request<Incoming>> for HathService {
                                             &sources,
                                             &config,
                                             Some(state.cache.clone()),
+                                            state.stats.clone(),
                                             &state.proxy_client,
                                         )
                                         .await
@@ -350,7 +351,8 @@ impl Service<Request<Incoming>> for HathService {
                                                                     temp_file: file,
                                                                     temp_file_path: proxy.temp_file,
                                                                     watch_rx: proxy.watch_rx,
-                                                                    proxy_done_tx: proxy.proxy_done_tx,
+                                                                    proxy_done_tx: proxy
+                                                                        .proxy_done_tx,
                                                                     stats: proxy_stats,
                                                                     bwm: bwm_for_request,
                                                                 },
@@ -466,12 +468,11 @@ impl Service<Request<Incoming>> for HathService {
                 }
             }
 
-            // Header throttling: deduct actual serialized header bytes.
+            // Header accounting/throttling: use actual serialized header bytes.
             // Java: bwm.waitForQuota(myThread, headerBytes.length) where headerBytes
-            // is the full serialized HTTP response header.
-            if let Some(ref bwm) = bwm_for_header
-                && let Ok(ref r) = resp
-            {
+            // is the full serialized HTTP response header; Stats.bytesSent records
+            // the same header byte count for non-local clients.
+            if let Ok(ref r) = resp {
                 let reason_len = r.status().canonical_reason().map_or(0, |s| s.len());
                 // Status line: "HTTP/1.1 XXX reason\r\n"
                 let status_line_len = 13 + reason_len; // "HTTP/1.1 " + "XXX " + reason + "\r\n"
@@ -481,7 +482,12 @@ impl Service<Request<Incoming>> for HathService {
                     .map(|(k, v)| k.as_str().len() + 2 + v.as_bytes().len() + 2) // "Key: Value\r\n"
                     .sum();
                 let total_header_bytes = status_line_len + headers_len + 2; // + trailing \r\n
-                bwm.wait_for_quota(total_header_bytes).await;
+                if let Some(ref bwm) = bwm_for_header {
+                    bwm.wait_for_quota(total_header_bytes).await;
+                }
+                if !is_local {
+                    state.stats.record_bytes_sent(total_header_bytes as u64);
+                }
             }
 
             match resp {
@@ -634,10 +640,12 @@ async fn run_threaded_proxy_test(
 ) -> (u32, u64) {
     use rand::RngExt;
     use std::time::Instant;
-    use tokio::time::timeout;
 
+    // Java: FileDownloader(source, 10000, 60000, true)
+    // connectTimeout=10s, readTimeout=60s, 3 retries
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
+        .read_timeout(Duration::from_secs(60))
         .build();
 
     let Ok(client) = client else {
@@ -656,9 +664,9 @@ async fn run_threaded_proxy_test(
         let client = client.clone();
 
         handles.push(tokio::spawn(async move {
-            // Java: FileDownloader(source, 10000, 60000, true) — 10s connect, 60s total.
-            // testtime only affects the /t URL and key, not the timeout.
-            let result = timeout(Duration::from_secs(60), async {
+            // Java: FileDownloader(source, 10000, 60000, true)
+            // connectTimeout=10s, readTimeout=60s (set on client).
+            let result = async {
                 let mut resp = client.get(url).send().await.map_err(|_| ())?;
                 let len = resp.content_length().unwrap_or(0);
                 if len < testsize {
@@ -683,13 +691,10 @@ async fn run_threaded_proxy_test(
                     return Err(());
                 };
                 Ok(start.elapsed().as_millis() as u64)
-            })
+            }
             .await;
 
-            match result {
-                Ok(Ok(ms)) => Some(ms),
-                _ => None,
-            }
+            result.ok()
         }));
     }
 
@@ -966,23 +971,34 @@ async fn run_server(
                         }
                     }
 
-                    // Connection limiting for non-local, non-RPC traffic
+                    // Connection limiting for non-local, non-RPC traffic.
+                    // Java: HTTPServer.run() checks sessionCount > maxConnections
+                    // in the single-threaded accept loop.
+                    // We use fetch_add as an atomic gate to avoid a race between
+                    // the load check and the increment in the spawned task.
+                    let mut _guard: Option<ConnectionGuard> = None;
                     if !is_local && !is_rpc {
                         let max_conns = conn_state.config.load().max_connections();
-                        let active = conn_state.active_connections.load(Ordering::Relaxed);
-
-                        if active > max_conns {
+                        let prev = conn_state.active_connections.fetch_add(1, Ordering::Relaxed);
+                        // Java uses > (not >=), so prev == max_conns is still accepted.
+                        if prev > max_conns {
+                            conn_state.active_connections.fetch_sub(1, Ordering::Relaxed);
                             tracing::warn!(
                                 "Exceeded the maximum allowed number of incoming connections ({}).",
                                 max_conns
                             );
                             return;
                         }
+                        conn_state.stats.set_open_connections(prev + 1);
+                        _guard = Some(ConnectionGuard {
+                            active_connections: conn_state.active_connections.clone(),
+                            stats: conn_state.stats.clone(),
+                        });
 
-                        if active > (max_conns as f64 * 0.8) as u32 && active > 0 {
+                        if prev > (max_conns as f64 * 0.8) as u32 && prev > 0 {
                             tracing::warn!(
                                 "Near connection limit: {} / {} active connections",
-                                active, max_conns
+                                prev + 1, max_conns
                             );
                             let now = Instant::now();
                             let mut last = conn_state.last_overload_notification.lock().await;
@@ -995,12 +1011,6 @@ async fn run_server(
                         }
                     }
 
-                    let _guard = ConnectionGuard {
-                        active_connections: conn_state.active_connections.clone(),
-                        stats: conn_state.stats.clone(),
-                    };
-                    let prev = conn_state.active_connections.fetch_add(1, Ordering::Relaxed);
-                    conn_state.stats.set_open_connections(prev + 1);
 
                     let io = TokioIo::new(tls_stream);
 
@@ -1015,6 +1025,8 @@ async fn run_server(
                     );
 
                     if let Err(e) = http1::Builder::new()
+                        .header_read_timeout(Duration::from_secs(10))
+                        .timer(TokioTimer::new())
                         .serve_connection(io, service)
                         .await
                         && !e.to_string().contains("connection closed") {

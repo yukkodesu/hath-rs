@@ -121,7 +121,6 @@ impl CachePruner {
             }
 
             let last_modified = utils::modified_millis(file);
-            oldest_last_modified = oldest_last_modified.min(last_modified);
             file_count += 1;
 
             if last_modified < plan.cutoff {
@@ -149,6 +148,8 @@ impl CachePruner {
                     1000
                 }))
                 .await;
+            } else {
+                oldest_last_modified = oldest_last_modified.min(last_modified);
             }
         }
 

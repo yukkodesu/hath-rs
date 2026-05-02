@@ -3,7 +3,7 @@ use crate::error::{HathError, Result};
 use crate::rpc::{self, Action, ResponseStatus, ServerResponse};
 use crate::stats::Stats;
 use arc_swap::ArcSwap;
-use reqwest::Client;
+use reqwest::{Client, Url};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -34,8 +34,9 @@ impl RpcClient {
         // timeout. Long timeouts for slow RPC responses.
         let http = Client::builder()
             .user_agent(format!("Hentai@Home {}", rpc::CLIENT_VERSION))
-            .connect_timeout(Duration::from_secs(30))
-            .read_timeout(Duration::from_secs(30))
+            // Java: setConnectTimeout(5000), FileDownloader(timeout=3600000)
+            .connect_timeout(Duration::from_secs(5))
+            .read_timeout(Duration::from_secs(3600))
             .build()
             .map_err(|e| HathError::Network(e.to_string()))?;
         Ok(Self {
@@ -70,18 +71,9 @@ impl RpcClient {
             let url = rpc::make_rpc_url(act, add, &cfg, &self.state.lock().unwrap())?;
             let host = url.host_str().unwrap_or("unknown").to_string();
 
-            // Java: http.keepAlive=false → Connection: close on every request
-            let resp = self
-                .http
-                .get(url.clone())
-                .header("Connection", "close")
-                .send()
-                .await;
-            let body = match resp {
-                Ok(r) => r.text().await,
-                Err(e) => Err(e),
-            };
-            let body = match body {
+            // Java: FileDownloader retries up to 3 times on network failure.
+            // 404 (FileNotFoundException) is not retried; HTTP-level errors are.
+            let body = match Self::send_rpc_request(&self.http, url.clone()).await {
                 Ok(b) => b,
                 Err(e) => {
                     self.state.lock().unwrap().rpc_last_failed = Some(host.clone());
@@ -105,7 +97,7 @@ impl RpcClient {
                 );
                 match self.call_stat_inner().await {
                     Ok(stat_resp) if stat_resp.status == ResponseStatus::Ok => {
-                        crate::config::Config::apply_server_response(&self.config, &stat_resp);
+                        Config::apply_server_response(&self.config, &stat_resp);
                     }
                     Ok(stat_resp) => {
                         let fail_host = stat_resp.fail_host.unwrap_or_else(|| "unknown".into());
@@ -127,22 +119,38 @@ impl RpcClient {
         }
     }
 
+    /// HTTP request with 3-attempt retry matching Java FileDownloader.run().
+    /// Connection/read errors are retried; a non-200 response is received as a
+    /// normal body (Java treats 404 as a no-retry exception, but that occurs at
+    /// the response-parsing level, not at the HTTP level).
+    async fn send_rpc_request(http: &Client, url: Url) -> std::result::Result<String, reqwest::Error> {
+        let mut last_err = None;
+        for attempt in 0..3 {
+            match http
+                .get(url.clone())
+                .header("Connection", "close")
+                .send()
+                .await
+            {
+                Ok(r) => match r.text().await {
+                    Ok(b) => return Ok(b),
+                    Err(e) => last_err = Some(e),
+                },
+                Err(e) => last_err = Some(e),
+            }
+            if attempt < 2 {
+                tracing::debug!("RPC request attempt {} failed, retrying...", attempt + 1);
+            }
+        }
+        Err(last_err.unwrap())
+    }
+
     /// Inline server_stat HTTP call (not recursive through call()).
     async fn call_stat_inner(&self) -> Result<ServerResponse> {
         let cfg = self.config.load();
         let url = rpc::make_rpc_url(Action::ServerStat, "", &cfg, &self.state.lock().unwrap())?;
         let host = url.host_str().unwrap_or("unknown").to_string();
-        let resp = self
-            .http
-            .get(url.clone())
-            .header("Connection", "close")
-            .send()
-            .await;
-        let body = match resp {
-            Ok(r) => r.text().await,
-            Err(e) => Err(e),
-        };
-        let body = match body {
+        let body = match Self::send_rpc_request(&self.http, url.clone()).await {
             Ok(b) => b,
             Err(e) => {
                 self.state.lock().unwrap().rpc_last_failed = Some(host.clone());

@@ -338,8 +338,10 @@ impl Config {
             "max_filename_length" => self.max_filename_length = value.parse().unwrap_or(125),
             "static_ranges" => {
                 self.static_ranges.clear();
+                self.static_range_count = 0;
                 for s in value.split(';') {
                     if s.len() == 4 {
+                        self.static_range_count += 1;
                         self.static_ranges.insert(s.to_string(), 1);
                     }
                 }
