@@ -972,23 +972,29 @@ async fn run_server(
                         }
                     }
 
-                    // Connection limiting for non-local, non-RPC traffic
+                    // Connection limiting for non-local, non-RPC traffic.
+                    // Java: HTTPServer.run() checks sessionCount > maxConnections
+                    // in the single-threaded accept loop.
+                    // We use fetch_add as an atomic gate to avoid a race between
+                    // the load check and the increment in the spawned task.
                     if !is_local && !is_rpc {
                         let max_conns = conn_state.config.load().max_connections();
-                        let active = conn_state.active_connections.load(Ordering::Relaxed);
-
-                        if active > max_conns {
+                        let prev = conn_state.active_connections.fetch_add(1, Ordering::Relaxed);
+                        // Java uses > (not >=), so prev == max_conns is still accepted.
+                        if prev > max_conns {
+                            conn_state.active_connections.fetch_sub(1, Ordering::Relaxed);
                             tracing::warn!(
                                 "Exceeded the maximum allowed number of incoming connections ({}).",
                                 max_conns
                             );
                             return;
                         }
+                        conn_state.stats.set_open_connections(prev + 1);
 
-                        if active > (max_conns as f64 * 0.8) as u32 && active > 0 {
+                        if prev > (max_conns as f64 * 0.8) as u32 && prev > 0 {
                             tracing::warn!(
                                 "Near connection limit: {} / {} active connections",
-                                active, max_conns
+                                prev + 1, max_conns
                             );
                             let now = Instant::now();
                             let mut last = conn_state.last_overload_notification.lock().await;
@@ -1005,8 +1011,6 @@ async fn run_server(
                         active_connections: conn_state.active_connections.clone(),
                         stats: conn_state.stats.clone(),
                     };
-                    let prev = conn_state.active_connections.fetch_add(1, Ordering::Relaxed);
-                    conn_state.stats.set_open_connections(prev + 1);
 
                     let io = TokioIo::new(tls_stream);
 
@@ -1021,6 +1025,7 @@ async fn run_server(
                     );
 
                     if let Err(e) = http1::Builder::new()
+                        .header_read_timeout(Duration::from_secs(10))
                         .serve_connection(io, service)
                         .await
                         && !e.to_string().contains("connection closed") {
