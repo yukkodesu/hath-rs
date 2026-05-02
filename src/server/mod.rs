@@ -23,7 +23,7 @@ use hyper::header;
 use hyper::server::conn::http1;
 use hyper::service::Service;
 use hyper::{Request, Response};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use openssl::ssl::SslContext;
 use regex::Regex;
 use reqwest::Url;
@@ -1025,6 +1025,7 @@ async fn run_server(
 
                     if let Err(e) = http1::Builder::new()
                         .header_read_timeout(Duration::from_secs(10))
+                        .timer(TokioTimer::new())
                         .serve_connection(io, service)
                         .await
                         && !e.to_string().contains("connection closed") {
