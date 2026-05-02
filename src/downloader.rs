@@ -16,11 +16,10 @@ pub enum DownloadMode {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct FileDownloader {
     source: Url,
-    timeout_ms: u64,
-    max_dl_time_ms: u64,
+    connect_timeout_ms: u64,
+    read_time_out: u64,
     retries: AtomicU32,
     mode: DownloadMode,
     allow_proxy: bool,
@@ -32,15 +31,15 @@ pub struct FileDownloader {
 impl FileDownloader {
     pub fn new(
         source: Url,
-        timeout_ms: u64,
-        max_dl_time_ms: u64,
+        connect_timeout_ms: u64,
+        read_time_out: u64,
         mode: DownloadMode,
         allow_proxy: bool,
     ) -> Self {
         Self {
             source,
-            timeout_ms,
-            max_dl_time_ms,
+            connect_timeout_ms,
+            read_time_out,
             retries: AtomicU32::new(3),
             mode,
             allow_proxy,
@@ -57,8 +56,10 @@ impl FileDownloader {
     pub async fn download(&self) -> Result<Option<BytesMut>> {
         let mut builder = Client::builder()
             .user_agent(format!("Hentai@Home {}", crate::rpc::CLIENT_VERSION))
-            // Java: setConnectTimeout(5000) — 5s connect timeout
-            .connect_timeout(std::time::Duration::from_secs(5));
+            // Java: setConnectTimeout(5000)
+            .connect_timeout(std::time::Duration::from_secs(self.connect_timeout_ms))
+            // Java: setReadTimeout(timeout) — per-read timeout, not total
+            .read_timeout(std::time::Duration::from_millis(self.read_time_out));
 
         // Java: SOCKS/HTTP proxy support via Settings.getImageProxy()
         if self.allow_proxy
@@ -94,9 +95,7 @@ impl FileDownloader {
     async fn attempt_download(&self, client: &Client) -> Result<Option<BytesMut>> {
         let mut resp = client
             .get(self.source.clone())
-            // Java: setRequestProperty("Connection", "Close")
             .header("Connection", "Close")
-            .timeout(std::time::Duration::from_millis(self.timeout_ms))
             .send()
             .await
             .map_err(|e| HathError::Network(e.to_string()))?;

@@ -640,10 +640,12 @@ async fn run_threaded_proxy_test(
 ) -> (u32, u64) {
     use rand::RngExt;
     use std::time::Instant;
-    use tokio::time::timeout;
 
+    // Java: FileDownloader(source, 10000, 60000, true)
+    // connectTimeout=10s, readTimeout=60s, 3 retries
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
+        .read_timeout(Duration::from_secs(60))
         .build();
 
     let Ok(client) = client else {
@@ -662,9 +664,9 @@ async fn run_threaded_proxy_test(
         let client = client.clone();
 
         handles.push(tokio::spawn(async move {
-            // Java: FileDownloader(source, 10000, 60000, true) — 10s connect, 60s total.
-            // testtime only affects the /t URL and key, not the timeout.
-            let result = timeout(Duration::from_secs(60), async {
+            // Java: FileDownloader(source, 10000, 60000, true)
+            // connectTimeout=10s, readTimeout=60s (set on client).
+            let result = async {
                 let mut resp = client.get(url).send().await.map_err(|_| ())?;
                 let len = resp.content_length().unwrap_or(0);
                 if len < testsize {
@@ -689,13 +691,10 @@ async fn run_threaded_proxy_test(
                     return Err(());
                 };
                 Ok(start.elapsed().as_millis() as u64)
-            })
+            }
             .await;
 
-            match result {
-                Ok(Ok(ms)) => Some(ms),
-                _ => None,
-            }
+            result.ok()
         }));
     }
 

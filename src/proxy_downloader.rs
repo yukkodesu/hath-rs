@@ -438,14 +438,17 @@ impl ProxyFileDownloader {
 /// Applies image proxy settings from config if configured.
 pub fn build_proxy_client(config: &Config) -> Result<Arc<Client>> {
     let mut builder = proxy_client_builder();
-    if let (Some(proxy_type), Some(proxy_host), Some(proxy_port)) = (
-        &config.image_proxy_type,
-        &config.image_proxy_host,
-        config.image_proxy_port,
-    ) && let Ok(proxy_url) = build_proxy_url(proxy_type, proxy_host, proxy_port)
-        && let Ok(proxy) = reqwest::Proxy::all(proxy_url.as_str())
-    {
-        builder = builder.proxy(proxy);
+    // Java: isImageProxyEnabled() checks host only; type defaults to
+    // "socks"; port defaults to 1080 (socks) or 8080 (http).
+    if let Some(proxy_host) = &config.image_proxy_host {
+        let proxy_type = config.image_proxy_type.as_deref().unwrap_or("socks");
+        let default_port = if proxy_type == "http" { 8080 } else { 1080 };
+        let proxy_port = config.image_proxy_port.unwrap_or(default_port);
+        if let Ok(proxy_url) = build_proxy_url(proxy_type, proxy_host, proxy_port)
+            && let Ok(proxy) = reqwest::Proxy::all(proxy_url.as_str())
+        {
+            builder = builder.proxy(proxy);
+        }
     }
     builder
         .build()
