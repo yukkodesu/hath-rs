@@ -747,4 +747,43 @@ mod tests {
         assert_eq!(stats.bytes_sent.load(Ordering::Relaxed), 10);
         drop(tx);
     }
+
+    /// Simulates P0-01 body-stage retry: InProgress resets to 0 (file truncated,
+    /// download restarted), then catches back up. Body must wait through the
+    /// zero-reset and resume reading once the write offset passes its position.
+    #[tokio::test]
+    async fn proxy_body_handles_write_offset_reset_on_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy-retry");
+        // File has 20 bytes; positions 0-19 all valid (retry rewrites from 0).
+        std::fs::write(&path, [0xAAu8; 20]).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let (tx, rx) = watch::channel(DownloadState::InProgress(7));
+        let (done_tx, _done_rx) = oneshot::channel();
+
+        let mut body = StreamingBody::new_proxy(20, file, path.clone(), rx, done_tx, None, None);
+
+        // Spawn the body consumer.
+        let handle = tokio::spawn(async move {
+            let data = collect_body(&mut body).await;
+            (data, body.completion_status().completion)
+        });
+
+        // Body reads 7 bytes (one TCP packet), then hits the wait gate at offset 7.
+        // Simulate retry: InProgress resets to 0.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let _ = tx.send(DownloadState::InProgress(0));
+
+        // Body should now be waiting. Give it time to notice.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        // Retry catches up: write offset passes body's position (7 + 1460).
+        let _ = tx.send(DownloadState::InProgress(20));
+        // Signal download complete.
+        let _ = tx.send(DownloadState::Done);
+
+        let (data, completion) = handle.await.unwrap();
+        assert_eq!(data.len(), 20);
+        assert_eq!(completion, BodyCompletion::Complete);
+    }
 }
