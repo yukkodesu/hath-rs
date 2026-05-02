@@ -976,6 +976,7 @@ async fn run_server(
                     // in the single-threaded accept loop.
                     // We use fetch_add as an atomic gate to avoid a race between
                     // the load check and the increment in the spawned task.
+                    let mut _guard: Option<ConnectionGuard> = None;
                     if !is_local && !is_rpc {
                         let max_conns = conn_state.config.load().max_connections();
                         let prev = conn_state.active_connections.fetch_add(1, Ordering::Relaxed);
@@ -989,6 +990,10 @@ async fn run_server(
                             return;
                         }
                         conn_state.stats.set_open_connections(prev + 1);
+                        _guard = Some(ConnectionGuard {
+                            active_connections: conn_state.active_connections.clone(),
+                            stats: conn_state.stats.clone(),
+                        });
 
                         if prev > (max_conns as f64 * 0.8) as u32 && prev > 0 {
                             tracing::warn!(
@@ -1006,10 +1011,6 @@ async fn run_server(
                         }
                     }
 
-                    let _guard = ConnectionGuard {
-                        active_connections: conn_state.active_connections.clone(),
-                        stats: conn_state.stats.clone(),
-                    };
 
                     let io = TokioIo::new(tls_stream);
 
