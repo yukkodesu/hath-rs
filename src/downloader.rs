@@ -5,6 +5,7 @@ use reqwest::{Client, Url};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
+use std::time::Duration;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
@@ -18,8 +19,9 @@ pub enum DownloadMode {
 #[derive(Debug)]
 pub struct FileDownloader {
     source: Url,
-    connect_timeout_ms: u64,
-    read_time_out: u64,
+    connect_timeout: Duration,
+    read_timeout: Duration,
+    max_dl_time: Duration,
     retries: AtomicU32,
     mode: DownloadMode,
     allow_proxy: bool,
@@ -31,15 +33,17 @@ pub struct FileDownloader {
 impl FileDownloader {
     pub fn new(
         source: Url,
-        connect_timeout_ms: u64,
-        read_time_out: u64,
+        read_timeout_ms: u64,
+        max_dl_time_ms: u64,
         mode: DownloadMode,
         allow_proxy: bool,
     ) -> Self {
         Self {
             source,
-            connect_timeout_ms,
-            read_time_out,
+            connect_timeout: Duration::from_secs(5),
+            read_timeout: Duration::from_millis(read_timeout_ms),
+            // Java FileDownloader stores maxDLTime but does not enforce it.
+            max_dl_time: Duration::from_millis(max_dl_time_ms),
             retries: AtomicU32::new(3),
             mode,
             allow_proxy,
@@ -47,6 +51,18 @@ impl FileDownloader {
             content_length: AtomicI32::new(0),
             download_time_millis: AtomicU64::new(0),
         }
+    }
+
+    pub fn set_connect_timeout(&mut self, timeout: Duration) {
+        self.connect_timeout = timeout;
+    }
+
+    pub fn set_read_timeout(&mut self, timeout: Duration) {
+        self.read_timeout = timeout;
+    }
+
+    pub fn max_dl_time(&self) -> Duration {
+        self.max_dl_time
     }
 
     pub fn set_download_limiter(&mut self, limiter: Arc<BandwidthMonitor>) {
@@ -57,9 +73,9 @@ impl FileDownloader {
         let mut builder = Client::builder()
             .user_agent(format!("Hentai@Home {}", crate::rpc::CLIENT_VERSION))
             // Java: setConnectTimeout(5000)
-            .connect_timeout(std::time::Duration::from_secs(self.connect_timeout_ms))
+            .connect_timeout(self.connect_timeout)
             // Java: setReadTimeout(timeout) — per-read timeout, not total
-            .read_timeout(std::time::Duration::from_millis(self.read_time_out));
+            .read_timeout(self.read_timeout);
 
         // Java: SOCKS/HTTP proxy support via Settings.getImageProxy()
         if self.allow_proxy

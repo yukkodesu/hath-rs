@@ -3,10 +3,12 @@ use crate::error::{HathError, Result};
 use crate::rpc::{self, Action, ResponseStatus, ServerResponse};
 use crate::stats::Stats;
 use arc_swap::ArcSwap;
+use rand::Rng;
 use reqwest::{Client, StatusCode, Url};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::task::JoinHandle;
 
 const KEY_EXPIRED_RETRY_LIMIT: u32 = 1;
 
@@ -50,21 +52,98 @@ fn rpc_status_action(status: StatusCode) -> RpcStatusAction {
 /// entire Config (including static_ranges HashMap) on every RPC call.
 /// Java: Settings.rpcServerCurrent / rpcServerLastFailed (static fields).
 #[derive(Default)]
-pub struct RpcState {
+struct RpcState {
     /// Currently selected RPC host. Cached until failure or periodic reset.
     /// Java: Settings.rpcServerCurrent
-    pub rpc_current: Option<String>,
+    rpc_current: Option<String>,
     /// Last failed RPC host, skipped during host selection.
     /// Java: Settings.rpcServerLastFailed
-    pub rpc_last_failed: Option<String>,
+    rpc_last_failed: Option<String>,
+}
+
+#[derive(Default)]
+struct RpcRouter {
+    state: Mutex<RpcState>,
+}
+
+impl RpcRouter {
+    fn select_host(&self, config: &Config) -> String {
+        let mut state = self.state.lock().unwrap();
+
+        if let Some(ref current) = state.rpc_current
+            && !Self::host_is_configured(config, current)
+        {
+            state.rpc_current = None;
+        }
+
+        if let Some(ref current) = state.rpc_current {
+            if let Some(ref failed) = state.rpc_last_failed
+                && current == failed
+            {
+                tracing::debug!("{} was marked as last failed (from cache)", failed);
+            } else {
+                return current.clone();
+            }
+        }
+
+        Self::choose_host(config, state.rpc_last_failed.as_deref())
+    }
+
+    fn mark_failed(&self, host: String) {
+        self.state.lock().unwrap().rpc_last_failed = Some(host);
+    }
+
+    fn mark_success(&self, host: String) {
+        self.state.lock().unwrap().rpc_current = Some(host);
+    }
+
+    fn clear(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.rpc_last_failed = None;
+        state.rpc_current = None;
+    }
+
+    fn host_is_configured(config: &Config, host: &str) -> bool {
+        config
+            .rpc_servers
+            .iter()
+            .any(|server| server.to_string().to_lowercase() == host)
+    }
+
+    fn choose_host(config: &Config, last_failed: Option<&str>) -> String {
+        if config.rpc_servers.is_empty() {
+            return "rpc.hentaiathome.net".to_string();
+        }
+        if config.rpc_servers.len() == 1 {
+            return config.rpc_servers[0].to_string().to_lowercase();
+        }
+
+        let mut rng = rand::rng();
+        let mut idx: isize = (rng.next_u32() as usize % config.rpc_servers.len()) as isize;
+        let dir: isize = if rng.next_u32() & 1 == 0 { -1 } else { 1 };
+        let len = config.rpc_servers.len() as isize;
+        loop {
+            let candidate = config.rpc_servers[((len + idx) % len) as usize]
+                .to_string()
+                .to_lowercase();
+            if let Some(failed) = last_failed
+                && candidate == failed
+            {
+                tracing::debug!("{} was marked as last failed", failed);
+                idx += dir;
+                continue;
+            }
+            tracing::debug!("Selected rpcServerCurrent={}", candidate);
+            break candidate;
+        }
+    }
 }
 
 /// Shared HTTP client for RPC calls.
 pub struct RpcClient {
     http: Client,
     config: Arc<ArcSwap<Config>>,
-    /// Mutable routing state kept here to avoid per-call Config clone.
-    state: Mutex<RpcState>,
+    router: RpcRouter,
 }
 
 impl RpcClient {
@@ -81,7 +160,7 @@ impl RpcClient {
         Ok(Self {
             http,
             config,
-            state: Mutex::new(RpcState::default()),
+            router: RpcRouter::default(),
         })
     }
 
@@ -92,22 +171,8 @@ impl RpcClient {
         let mut key_expired_retries = 0u32;
         loop {
             let cfg = self.config.load();
-            // Java: Settings.apply("rpc_server_ip") clears rpcServerCurrent if it's
-            // no longer in the new server list. We do the equivalent check here since
-            // rpc_current is now in RpcState rather than Config.
-            {
-                let mut state = self.state.lock().unwrap();
-                if let Some(ref current) = state.rpc_current {
-                    let still_valid = cfg
-                        .rpc_servers
-                        .iter()
-                        .any(|s| s.to_string().to_lowercase() == *current);
-                    if !still_valid {
-                        state.rpc_current = None;
-                    }
-                }
-            }
-            let url = rpc::make_rpc_url(act, add, &cfg, &self.state.lock().unwrap())?;
+            let host = self.router.select_host(&cfg);
+            let url = rpc::make_rpc_url(act, add, &cfg, &host)?;
             let host = url.host_str().unwrap_or("unknown").to_string();
 
             // Java: FileDownloader retries up to 3 times on network failure.
@@ -115,7 +180,7 @@ impl RpcClient {
             let body = match Self::send_rpc_request(&self.http, url.clone()).await {
                 Ok(b) => b,
                 Err(e) => {
-                    self.state.lock().unwrap().rpc_last_failed = Some(host.clone());
+                    self.router.mark_failed(host.clone());
                     return Err(HathError::Rpc(format!("request failed: {}", e)));
                 }
             };
@@ -140,7 +205,7 @@ impl RpcClient {
                     }
                     Ok(stat_resp) if stat_resp.status == ResponseStatus::Null => {
                         let fail_host = stat_resp.fail_host.unwrap_or_else(|| "unknown".into());
-                        self.state.lock().unwrap().rpc_last_failed = Some(fail_host);
+                        self.router.mark_failed(fail_host);
                     }
                     Ok(_) => {}
                     Err(_) => {}
@@ -150,9 +215,9 @@ impl RpcClient {
 
             if parsed.status == ResponseStatus::Null {
                 let fail_host = parsed.fail_host.as_deref().unwrap_or(&host).to_string();
-                self.state.lock().unwrap().rpc_last_failed = Some(fail_host);
+                self.router.mark_failed(fail_host);
             } else {
-                self.state.lock().unwrap().rpc_current = Some(host.clone());
+                self.router.mark_success(host.clone());
             }
 
             return Ok(parsed);
@@ -205,12 +270,13 @@ impl RpcClient {
     /// Inline server_stat HTTP call (not recursive through call()).
     async fn call_stat_inner(&self) -> Result<ServerResponse> {
         let cfg = self.config.load();
-        let url = rpc::make_rpc_url(Action::ServerStat, "", &cfg, &self.state.lock().unwrap())?;
+        let host = self.router.select_host(&cfg);
+        let url = rpc::make_rpc_url(Action::ServerStat, "", &cfg, &host)?;
         let host = url.host_str().unwrap_or("unknown").to_string();
         let body = match Self::send_rpc_request(&self.http, url.clone()).await {
             Ok(b) => b,
             Err(e) => {
-                self.state.lock().unwrap().rpc_last_failed = Some(host.clone());
+                self.router.mark_failed(host.clone());
                 return Err(HathError::Rpc(format!("stat request failed: {}", e)));
             }
         };
@@ -286,7 +352,7 @@ pub fn spawn_still_alive_heartbeat(
     rpc_client: Arc<RpcClient>,
     stats: Arc<Stats>,
     shutdown: tokio_util::sync::CancellationToken,
-) {
+) -> JoinHandle<()> {
     tokio::spawn(crate::utils::tick_every(
         shutdown.clone(),
         Duration::from_secs(110),
@@ -318,31 +384,32 @@ pub fn spawn_still_alive_heartbeat(
                 }
             }
         },
-    ));
+    ))
 }
 
 /// Spawn periodic RPC server failure clearer (4h interval).
 pub fn spawn_rpc_failure_clearer(
     rpc_client: Arc<RpcClient>,
     shutdown: tokio_util::sync::CancellationToken,
-) {
+) -> JoinHandle<()> {
     tokio::spawn(crate::utils::tick_every(
         shutdown,
         Duration::from_secs(14400),
         move || {
             let rpc_client = rpc_client.clone();
             async move {
-                let mut state = rpc_client.state.lock().unwrap();
-                state.rpc_last_failed = None;
-                state.rpc_current = None;
+                rpc_client.router.clear();
             }
         },
-    ));
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{FakeHttpServer, FakeResponse, FixtureDirs};
+    use arc_swap::ArcSwap;
+    use std::net::{IpAddr, Ipv4Addr};
 
     #[test]
     fn key_expired_retries_once_for_retryact_calls() {
@@ -367,5 +434,89 @@ mod tests {
             rpc_status_action(StatusCode::INTERNAL_SERVER_ERROR),
             RpcStatusAction::Retry
         );
+    }
+
+    fn config_with_rpc_servers(servers: &str) -> Config {
+        let fixture = FixtureDirs::new();
+        let mut config = fixture.config();
+        config.apply_setting("rpc_server_ip", servers);
+        config
+    }
+
+    #[test]
+    fn rpc_router_reuses_valid_current_host() {
+        let config = config_with_rpc_servers("192.0.2.1;192.0.2.2");
+        let router = RpcRouter::default();
+        router.mark_success("192.0.2.1".to_string());
+
+        assert_eq!(router.select_host(&config), "192.0.2.1");
+    }
+
+    #[test]
+    fn rpc_router_invalidates_current_host_after_server_list_changes() {
+        let mut config = config_with_rpc_servers("192.0.2.1");
+        let router = RpcRouter::default();
+        router.mark_success("192.0.2.1".to_string());
+
+        config.apply_setting("rpc_server_ip", "192.0.2.2");
+
+        assert_eq!(router.select_host(&config), "192.0.2.2");
+        assert!(router.state.lock().unwrap().rpc_current.is_none());
+    }
+
+    #[test]
+    fn rpc_router_skips_last_failed_host_when_alternates_exist() {
+        let config = config_with_rpc_servers("192.0.2.1;192.0.2.2");
+        let router = RpcRouter::default();
+        router.mark_failed("192.0.2.1".to_string());
+
+        assert_eq!(router.select_host(&config), "192.0.2.2");
+    }
+
+    fn rpc_client_for_fake_server(server: &FakeHttpServer) -> RpcClient {
+        let fixture = FixtureDirs::new();
+        let mut config = fixture.config();
+        config.rpc_servers = vec![IpAddr::V4(Ipv4Addr::LOCALHOST)];
+        config.rpc_port = server.port();
+        config.rpc_path = "rpc".to_string();
+        RpcClient::new(Arc::new(ArcSwap::from_pointee(config))).unwrap()
+    }
+
+    #[tokio::test]
+    async fn key_expired_refreshes_stat_and_retries_retryact_rpc() {
+        let now = chrono::Utc::now().timestamp();
+        let server = FakeHttpServer::start(vec![
+            FakeResponse::ok("KEY_EXPIRED"),
+            FakeResponse::ok(format!("OK\nserver_time={}", now)),
+            FakeResponse::ok("OK\n"),
+        ])
+        .await;
+        let client = rpc_client_for_fake_server(&server);
+
+        let response = client.client_start().await.unwrap();
+
+        assert_eq!(response.status, ResponseStatus::Ok);
+        let requests = server.requests();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[0].contains("act=client_start"));
+        assert!(requests[1].contains("act=server_stat"));
+        assert!(requests[2].contains("act=client_start"));
+    }
+
+    #[tokio::test]
+    async fn rpc_http_500_retries_against_fake_rpc_server() {
+        let server = FakeHttpServer::start(vec![
+            FakeResponse::status(500, "Internal Server Error", "try again"),
+            FakeResponse::ok("OK\n"),
+        ])
+        .await;
+        let client = rpc_client_for_fake_server(&server);
+
+        let response = client.server_stat().await.unwrap();
+
+        assert_eq!(response.status, ResponseStatus::Ok);
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|r| r.contains("act=server_stat")));
     }
 }

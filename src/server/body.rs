@@ -21,7 +21,7 @@ use std::task::{Context, Poll};
 use tokio::sync::{oneshot, watch};
 
 use crate::bandwidth::BandwidthMonitor;
-use crate::proxy_downloader::{DownloadFailReason, DownloadState};
+use crate::proxy_downloader::{DownloadFailReason, DownloadState, ProxyBodySource};
 use crate::stats::Stats;
 
 /// Java Settings.TCP_PACKET_SIZE = 1460
@@ -70,8 +70,8 @@ enum DataSource {
 /// When `bwm` is [`Some`], data is split into 1460-byte chunks and each chunk
 /// is throttled via [`BandwidthMonitor::wait_for_quota`] before being yielded.
 ///
-/// For proxy mode, the body receives chunks from an mpsc channel fed by the
-/// background download task.
+/// For proxy mode, the body reads a temp file while a watch channel publishes
+/// write progress from the background download task.
 pub struct StreamingBody {
     source: DataSource,
     offset: usize,
@@ -200,19 +200,17 @@ impl StreamingBody {
         }
     }
 
-    /// Create a proxy-streaming body backed by a temp file + watch channel.
+    /// Create a proxy-streaming body backed by a temp file and downloader progress source.
     ///
     /// `file` must be opened for reading at offset 0.
-    /// `watch_rx` delivers write progress from the background download task.
     pub fn new_proxy(
         total_size: usize,
         file: std::fs::File,
-        temp_file: PathBuf,
-        watch_rx: watch::Receiver<DownloadState>,
-        proxy_done_tx: oneshot::Sender<()>,
+        source: ProxyBodySource,
         bwm: Option<Arc<BandwidthMonitor>>,
         stats: Option<Arc<Stats>>,
     ) -> Self {
+        let (temp_file, watch_rx, proxy_done_tx) = source.into_components();
         Self {
             source: DataSource::Proxy {
                 file,
@@ -679,7 +677,8 @@ mod tests {
         let (tx, rx) = watch::channel(DownloadState::InProgress(10));
         let (done_tx, _done_rx) = oneshot::channel();
 
-        let mut body = StreamingBody::new_proxy(10, file, path.clone(), rx, done_tx, None, None);
+        let source = ProxyBodySource::for_test(path.clone(), rx, done_tx);
+        let mut body = StreamingBody::new_proxy(10, file, source, None, None);
         let collected = collect_body(&mut body).await;
         assert_eq!(collected, b"helloworld");
         assert_eq!(
@@ -699,7 +698,8 @@ mod tests {
         let (tx, rx) = watch::channel(DownloadState::InProgress(7));
         let (done_tx, _done_rx) = oneshot::channel();
 
-        let mut body = StreamingBody::new_proxy(100, file, path.clone(), rx, done_tx, None, None);
+        let source = ProxyBodySource::for_test(path.clone(), rx, done_tx);
+        let mut body = StreamingBody::new_proxy(100, file, source, None, None);
 
         // Advance: body will read 7 bytes then watch shows Failed.
         let handle = tokio::spawn(async move {
@@ -728,15 +728,8 @@ mod tests {
         let (done_tx, _done_rx) = oneshot::channel();
         let stats = Arc::new(Stats::new());
 
-        let mut body = StreamingBody::new_proxy(
-            10,
-            file,
-            path.clone(),
-            rx,
-            done_tx,
-            None,
-            Some(stats.clone()),
-        );
+        let source = ProxyBodySource::for_test(path.clone(), rx, done_tx);
+        let mut body = StreamingBody::new_proxy(10, file, source, None, Some(stats.clone()));
         let collected = collect_body(&mut body).await;
         assert_eq!(collected, b"helloworld");
         assert_eq!(stats.files_sent.load(Ordering::Relaxed), 1);
@@ -761,7 +754,8 @@ mod tests {
         let (tx, rx) = watch::channel(DownloadState::InProgress(7));
         let (done_tx, _done_rx) = oneshot::channel();
 
-        let mut body = StreamingBody::new_proxy(20, file, path.clone(), rx, done_tx, None, None);
+        let source = ProxyBodySource::for_test(path.clone(), rx, done_tx);
+        let mut body = StreamingBody::new_proxy(20, file, source, None, None);
 
         // Spawn the body consumer.
         let handle = tokio::spawn(async move {

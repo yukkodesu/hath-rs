@@ -12,7 +12,8 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use super::body::{BodyCompletion, BodyCompletionSnapshot, BodyCompletionStatus};
+use super::super::body::{BodyCompletion, BodyCompletionSnapshot, BodyCompletionStatus};
+use super::session::SessionHandle;
 
 pub fn access_log_prefix(conn_id: u32, client_ip: IpAddr) -> String {
     format!("{{{}{:<17} ", conn_id, format!("/{}}}", client_ip))
@@ -38,7 +39,9 @@ pub fn access_log_request_info(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccessLogCompletion {
-    Finished,
+    Finished {
+        offset: usize,
+    },
     Incomplete {
         reason: &'static str,
         offset: usize,
@@ -53,15 +56,23 @@ pub enum AccessLogCompletion {
 impl AccessLogCompletion {
     fn label(self) -> &'static str {
         match self {
-            Self::Finished => "Finished",
+            Self::Finished { .. } => "Finished",
             Self::Incomplete { .. } => "Incomplete",
             Self::Aborted { .. } => "Aborted",
         }
     }
 
+    fn offset(self) -> usize {
+        match self {
+            Self::Finished { offset }
+            | Self::Incomplete { offset, .. }
+            | Self::Aborted { offset, .. } => offset,
+        }
+    }
+
     fn write_suffix(self, line: &mut String) {
         match self {
-            Self::Finished => {}
+            Self::Finished { .. } => {}
             Self::Incomplete {
                 reason,
                 offset,
@@ -82,14 +93,14 @@ impl AccessLogCompletion {
 
 pub fn access_log_completion_line(
     info: &str,
-    content_length: usize,
     elapsed: Duration,
     completion: AccessLogCompletion,
 ) -> String {
     let seconds = elapsed.as_secs_f64();
     let elapsed_ms = elapsed.as_millis();
+    let offset = completion.offset();
     let speed = if elapsed_ms >= 10 {
-        format!(" ({:.2} KB/s)", content_length as f64 / elapsed_ms as f64)
+        format!(" ({:.2} KB/s)", offset as f64 / elapsed_ms as f64)
     } else {
         String::new()
     };
@@ -106,7 +117,9 @@ pub fn access_log_completion_line(
 
 fn access_log_completion_from_body(snapshot: BodyCompletionSnapshot) -> AccessLogCompletion {
     match snapshot.completion {
-        BodyCompletion::Complete => AccessLogCompletion::Finished,
+        BodyCompletion::Complete => AccessLogCompletion::Finished {
+            offset: snapshot.offset,
+        },
         BodyCompletion::Incomplete(reason) => AccessLogCompletion::Incomplete {
             reason: reason.as_str(),
             offset: snapshot.offset,
@@ -124,14 +137,21 @@ pub struct AccessLogService<S> {
     inner: S,
     conn_id: u32,
     remote_addr: SocketAddr,
+    session: Option<SessionHandle>,
 }
 
 impl<S> AccessLogService<S> {
-    pub fn new(inner: S, conn_id: u32, remote_addr: SocketAddr) -> Self {
+    pub fn new(
+        inner: S,
+        conn_id: u32,
+        remote_addr: SocketAddr,
+        session: Option<SessionHandle>,
+    ) -> Self {
         Self {
             inner,
             conn_id,
             remote_addr,
+            session,
         }
     }
 }
@@ -160,6 +180,7 @@ where
             crate::utils::normalize_ip(self.remote_addr.ip()),
         );
         let start = Instant::now();
+        let session = self.session.clone();
         let fut = self.inner.call(req);
 
         Box::pin(async move {
@@ -177,7 +198,7 @@ where
             let body = if head_only {
                 AccessLogBody::new_without_completion(body)
             } else {
-                AccessLogBody::new(body, info, content_length.unwrap_or(0), start)
+                AccessLogBody::new(body, info, start, session)
             };
             Ok(Response::from_parts(parts, body))
         })
@@ -187,17 +208,17 @@ where
 pub struct AccessLogBody<B: BodyCompletionStatus> {
     inner: B,
     info: Option<String>,
-    content_length: usize,
     start: Instant,
+    session: Option<SessionHandle>,
 }
 
 impl<B: BodyCompletionStatus> AccessLogBody<B> {
-    pub fn new(inner: B, info: String, content_length: usize, start: Instant) -> Self {
+    pub fn new(inner: B, info: String, start: Instant, session: Option<SessionHandle>) -> Self {
         Self {
             inner,
             info: Some(info),
-            content_length,
             start,
+            session,
         }
     }
 
@@ -205,22 +226,17 @@ impl<B: BodyCompletionStatus> AccessLogBody<B> {
         Self {
             inner,
             info: None,
-            content_length: 0,
             start: Instant::now(),
+            session: None,
         }
     }
 
     fn log_completion(&mut self, completion: AccessLogCompletion) {
         if let Some(info) = self.info.take() {
-            let line = access_log_completion_line(
-                &info,
-                self.content_length,
-                self.start.elapsed(),
-                completion,
-            );
+            let line = access_log_completion_line(&info, self.start.elapsed(), completion);
             match completion {
                 AccessLogCompletion::Incomplete { .. } => tracing::warn!("{}", line),
-                AccessLogCompletion::Finished | AccessLogCompletion::Aborted { .. } => {
+                AccessLogCompletion::Finished { .. } | AccessLogCompletion::Aborted { .. } => {
                     tracing::info!("{}", line);
                 }
             }
@@ -233,7 +249,9 @@ impl<B: BodyCompletionStatus> Drop for AccessLogBody<B> {
         if self.info.is_some() {
             let snapshot = self.inner.completion_status();
             let completion = if snapshot.offset >= snapshot.total_size {
-                AccessLogCompletion::Finished
+                AccessLogCompletion::Finished {
+                    offset: snapshot.offset,
+                }
             } else {
                 AccessLogCompletion::Aborted {
                     offset: snapshot.offset,
@@ -257,6 +275,14 @@ where
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         match Pin::new(&mut self.inner).poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                if frame.data_ref().is_some_and(|data| !data.is_empty())
+                    && let Some(session) = &self.session
+                {
+                    session.mark_packet_sent();
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
             Poll::Ready(None) => {
                 let snapshot = self.inner.completion_status();
                 self.log_completion(access_log_completion_from_body(snapshot));
@@ -287,16 +313,14 @@ mod tests {
         assert_eq!(
             access_log_completion_line(
                 &info,
-                145678,
                 Duration::from_millis(750),
-                AccessLogCompletion::Finished,
+                AccessLogCompletion::Finished { offset: 145678 },
             ),
             "{12/222.135.74.27}   Code=200 Bytes=145678   Finished processing request in 0.75 seconds (194.24 KB/s)"
         );
         assert_eq!(
             access_log_completion_line(
                 &info,
-                145678,
                 Duration::from_millis(750),
                 AccessLogCompletion::Incomplete {
                     reason: "proxy_timeout",
@@ -304,19 +328,18 @@ mod tests {
                     total_size: 145678,
                 },
             ),
-            "{12/222.135.74.27}   Code=200 Bytes=145678   Incomplete processing request in 0.75 seconds (194.24 KB/s) reason=proxy_timeout offset=4096 expected=145678"
+            "{12/222.135.74.27}   Code=200 Bytes=145678   Incomplete processing request in 0.75 seconds (5.46 KB/s) reason=proxy_timeout offset=4096 expected=145678"
         );
         assert_eq!(
             access_log_completion_line(
                 &info,
-                145678,
                 Duration::from_millis(750),
                 AccessLogCompletion::Aborted {
                     offset: 4096,
                     total_size: 145678,
                 },
             ),
-            "{12/222.135.74.27}   Code=200 Bytes=145678   Aborted processing request in 0.75 seconds (194.24 KB/s) offset=4096 expected=145678"
+            "{12/222.135.74.27}   Code=200 Bytes=145678   Aborted processing request in 0.75 seconds (5.46 KB/s) offset=4096 expected=145678"
         );
     }
 }

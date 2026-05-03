@@ -9,10 +9,13 @@ use crate::stats::Stats;
 use arc_swap::{ArcSwap, ArcSwapOption};
 use clap::Parser;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify};
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 /// Main client entry point. Follows Java HentaiAtHomeClient.run() lifecycle.
 pub async fn run() -> Result<()> {
@@ -35,7 +38,7 @@ pub async fn run() -> Result<()> {
         "This software comes with ABSOLUTELY NO WARRANTY. This is free software, and you are welcome to modify and redistribute it under the GPL v3 license."
     );
 
-    let shutdown = tokio_util::sync::CancellationToken::new();
+    let shutdown = CancellationToken::new();
 
     // Handle shutdown signals for graceful exit (Java: ShutdownHook).
     // On Unix: SIGINT (Ctrl+C), SIGTERM (docker stop / systemctl stop), SIGQUIT.
@@ -115,7 +118,7 @@ pub async fn run() -> Result<()> {
         tls_acceptor: Arc::new(ArcSwapOption::const_empty()),
         cert_expiry: Arc::new(Mutex::new(None)),
         bandwidth_monitor: Arc::new(ArcSwapOption::const_empty()),
-        active_connections: Arc::new(AtomicU32::new(0)),
+        session_manager: Arc::new(server::SessionManager::new(stats.clone())),
         next_conn_id: Arc::new(AtomicU32::new(0)),
         last_overload_notification: Arc::new(Mutex::new(None)),
         do_cert_refresh: Arc::new(AtomicBool::new(false)),
@@ -182,7 +185,7 @@ pub async fn run() -> Result<()> {
         false
     };
 
-    if startup_ok {
+    let background_tasks = if startup_ok {
         // 10. Allow normal connections
         allow_connections.store(true, Ordering::SeqCst);
         report_shutdown.store(true, Ordering::SeqCst);
@@ -207,19 +210,17 @@ pub async fn run() -> Result<()> {
         tracing::info!("Startup completed successfully. Starting normal operation");
 
         // 11. Spawn periodic background tasks
-        cache::spawn_pruner(cache.clone(), config.clone(), shutdown.clone());
-        cache::spawn_periodic_stats(cache.clone(), stats.clone(), shutdown.clone());
-        server::spawn_flood_control_pruner(app_state.clone(), shutdown.clone());
-        rpc_client::spawn_still_alive_heartbeat(
-            rpc_client.clone(),
+        Some(spawn_background_tasks(
+            cache.clone(),
+            config.clone(),
             stats.clone(),
+            app_state.clone(),
+            rpc_client.clone(),
             shutdown.clone(),
-        );
-        server::spawn_time_cert_check(config.clone(), app_state.clone(), shutdown.clone());
-        rpc_client::spawn_rpc_failure_clearer(rpc_client.clone(), shutdown.clone());
-        cache::spawn_blacklist_fetcher(rpc_client.clone(), cache.clone(), shutdown.clone());
-        server::spawn_cert_refresh_watcher(app_state.clone(), rpc_client.clone(), shutdown.clone());
-    }
+        ))
+    } else {
+        None
+    };
 
     // Wait for shutdown signal
     shutdown.cancelled().await;
@@ -235,6 +236,9 @@ pub async fn run() -> Result<()> {
     }
     tokio::time::sleep(Duration::from_secs(1)).await;
     server::stop_server(&app_state).await;
+    if let Some(background_tasks) = background_tasks {
+        background_tasks.join_for(Duration::from_secs(5)).await;
+    }
     cache.save_persistent_data();
     {
         let cfg = config.load();
@@ -242,6 +246,111 @@ pub async fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn spawn_background_tasks(
+    cache: Arc<CacheHandler>,
+    config: Arc<ArcSwap<Config>>,
+    stats: Arc<Stats>,
+    app_state: AppState,
+    rpc_client: Arc<RpcClient>,
+    shutdown: CancellationToken,
+) -> BackgroundTasks {
+    let mut tasks = BackgroundTasks::new();
+    tasks.track(
+        "cache-pruner",
+        cache::spawn_pruner(cache.clone(), config.clone(), shutdown.clone()),
+    );
+    tasks.track(
+        "cache-periodic-stats",
+        cache::spawn_periodic_stats(cache.clone(), stats.clone(), shutdown.clone()),
+    );
+    tasks.track(
+        "flood-control-pruner",
+        server::spawn_flood_control_pruner(app_state.clone(), shutdown.clone()),
+    );
+    tasks.track(
+        "session-reaper",
+        server::spawn_session_reaper(app_state.session_manager.clone(), shutdown.clone()),
+    );
+    tasks.track(
+        "still-alive-heartbeat",
+        rpc_client::spawn_still_alive_heartbeat(rpc_client.clone(), stats, shutdown.clone()),
+    );
+    tasks.track(
+        "time-cert-check",
+        server::spawn_time_cert_check(config, app_state.clone(), shutdown.clone()),
+    );
+    tasks.track(
+        "rpc-failure-clearer",
+        rpc_client::spawn_rpc_failure_clearer(rpc_client.clone(), shutdown.clone()),
+    );
+    tasks.track(
+        "blacklist-fetcher",
+        cache::spawn_blacklist_fetcher(rpc_client.clone(), cache, shutdown.clone()),
+    );
+    tasks.track(
+        "cert-refresh-watcher",
+        server::spawn_cert_refresh_watcher(app_state, rpc_client, shutdown),
+    );
+    tasks
+}
+
+struct BackgroundTasks {
+    tasks: VecDeque<BackgroundTask>,
+}
+
+struct BackgroundTask {
+    name: &'static str,
+    handle: JoinHandle<()>,
+}
+
+impl BackgroundTasks {
+    fn new() -> Self {
+        Self {
+            tasks: VecDeque::new(),
+        }
+    }
+
+    fn track(&mut self, name: &'static str, handle: JoinHandle<()>) {
+        self.tasks.push_back(BackgroundTask { name, handle });
+    }
+
+    async fn join_for(mut self, timeout: Duration) {
+        if self.tasks.is_empty() {
+            return;
+        }
+
+        let deadline = tokio::time::sleep(timeout);
+        tokio::pin!(deadline);
+
+        while let Some(mut task) = self.tasks.pop_front() {
+            tokio::select! {
+                result = &mut task.handle => {
+                    if let Err(e) = result
+                        && !e.is_cancelled()
+                    {
+                        tracing::warn!("Background task {} exited with error: {}", task.name, e);
+                    }
+                }
+                _ = &mut deadline => {
+                    tracing::warn!(
+                        "Timed out waiting for background task {} to stop; aborting remaining tasks",
+                        task.name
+                    );
+                    task.handle.abort();
+                    self.abort_remaining();
+                    return;
+                }
+            }
+        }
+    }
+
+    fn abort_remaining(&mut self) {
+        for task in self.tasks.drain(..) {
+            task.handle.abort();
+        }
+    }
 }
 
 /// Wait for any shutdown signal.

@@ -9,11 +9,13 @@ pub mod logging;
 pub mod proxy_downloader;
 pub mod rpc;
 pub mod rpc_client;
-pub mod scheduler;
 pub mod server;
 pub mod stats;
 pub mod types;
 pub mod utils;
+
+#[cfg(test)]
+pub(crate) mod test_support;
 
 #[tokio::main]
 async fn main() {
