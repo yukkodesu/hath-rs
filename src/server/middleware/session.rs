@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 const PENDING_TIMEOUT: Duration = Duration::from_secs(30);
@@ -231,6 +232,23 @@ impl SessionHandle {
             state.kind = kind;
         }
     }
+}
+
+/// Spawn Java-style session timeout cleanup.
+pub fn spawn_session_reaper(
+    session_manager: Arc<SessionManager>,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> JoinHandle<()> {
+    tokio::spawn(crate::utils::tick_every(
+        shutdown,
+        Duration::from_secs(10),
+        move || {
+            let session_manager = session_manager.clone();
+            async move {
+                session_manager.nuke_old_connections();
+            }
+        },
+    ))
 }
 
 #[cfg(test)]

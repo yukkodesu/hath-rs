@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 ///
 /// Takes `Arc<CacheHandler>` directly — no outer Mutex needed because
 /// CacheHandler manages its own fine-grained locks internally.
-pub struct CachePruner {
+pub(super) struct CachePruner {
     cache: Arc<CacheHandler>,
     config: Arc<ArcSwap<Config>>,
     /// Seconds between cache checks when not over limit.
@@ -23,7 +23,7 @@ pub struct CachePruner {
 }
 
 impl CachePruner {
-    pub fn new(
+    pub(super) fn new(
         cache: Arc<CacheHandler>,
         config: Arc<ArcSwap<Config>>,
         shutdown: CancellationToken,
@@ -36,7 +36,7 @@ impl CachePruner {
         }
     }
 
-    pub async fn run(mut self) {
+    pub(super) async fn run(mut self) {
         let mut cache_check_ticks = 0u32;
         let mut disk_check_ticks = 0u32;
 

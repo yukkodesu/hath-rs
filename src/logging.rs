@@ -1,7 +1,7 @@
+use crate::config::Config;
 use std::path::Path;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{EnvFilter, Registry, filter, fmt, prelude::*};
-use crate::config::Config;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogLevel {
@@ -18,9 +18,7 @@ pub struct LoggingHandle {
 
 impl LoggingHandle {
     fn new(config: Config) -> Self {
-        Self {
-            config
-        }
+        Self { config }
     }
 }
 
@@ -36,7 +34,7 @@ pub fn init_logging(log_dir: &Path, config: Config) -> std::io::Result<LoggingHa
     let err_appender = RollingFileAppender::new(Rotation::NEVER, log_dir, "log_err");
 
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    
+
     let config = handle.config.clone();
     let file_filter = filter::filter_fn(move |_| config.disable_logging);
     let file_layer = fmt::layer()

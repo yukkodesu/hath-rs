@@ -1,7 +1,6 @@
 use crate::error::{HathError, Result};
 use crate::types::{ClientId, ClientKey};
 use clap::Parser;
-use rand::Rng;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -199,51 +198,6 @@ impl Config {
         }
     }
 
-    /// Pick an RPC host using routing state from RpcClient.
-    /// Uses cached `state.rpc_current` if set and not last-failed,
-    /// otherwise selects a random server from `rpc_servers`.
-    pub fn get_rpc_host(&self, state: &crate::rpc_client::RpcState) -> String {
-        let host = if let Some(ref host) = state.rpc_current {
-            if let Some(ref failed) = state.rpc_last_failed
-                && *host == *failed
-            {
-                tracing::debug!("{} was marked as last failed (from cache)", failed);
-                None
-            } else {
-                Some(host.clone())
-            }
-        } else {
-            None
-        };
-
-        host.unwrap_or_else(|| {
-            if self.rpc_servers.is_empty() {
-                return "rpc.hentaiathome.net".to_string();
-            }
-            if self.rpc_servers.len() == 1 {
-                return self.rpc_servers[0].to_string().to_lowercase();
-            }
-            let mut rng = rand::rng();
-            let mut idx: isize = (rng.next_u32() as usize % self.rpc_servers.len()) as isize;
-            let dir: isize = if rng.next_u32() & 1 == 0 { -1 } else { 1 };
-            let len = self.rpc_servers.len() as isize;
-            loop {
-                let candidate = self.rpc_servers[((len + idx) % len) as usize]
-                    .to_string()
-                    .to_lowercase();
-                if let Some(ref failed) = state.rpc_last_failed
-                    && candidate == *failed
-                {
-                    tracing::debug!("{} was marked as last failed", failed);
-                    idx += dir;
-                    continue;
-                }
-                tracing::debug!("Selected rpcServerCurrent={}", candidate);
-                break candidate;
-            }
-        })
-    }
-
     pub fn is_static_range(&self, range: &str) -> bool {
         self.static_ranges.contains_key(range)
     }
@@ -284,9 +238,8 @@ impl Config {
                     .filter_map(|s| s.trim().parse::<IpAddr>().ok())
                     .map(crate::utils::normalize_ip)
                     .collect();
-                // Java: clear cached host if it's no longer in the new server list.
-                // rpc_current is now in RpcState inside RpcClient; the equivalent
-                // staleness check runs at the top of RpcClient::call() each time.
+                // RPC routing state lives inside RpcClient; changing rpc_server_ip
+                // only updates this settings snapshot.
             }
             "rpc_path" => self.rpc_path = value.to_string(),
             "host" => {
@@ -469,14 +422,11 @@ mod tests {
     }
 
     #[test]
-    fn test_get_rpc_host_normalizes_ipv4_mapped() {
+    fn test_rpc_server_ip_normalizes_ipv4_mapped() {
         let mut config = Config::load(test_cli()).unwrap();
         // ::ffff:192.0.2.1 is IPv4-mapped IPv6 — normalize_ip strips the prefix
         config.apply_setting("rpc_server_ip", "::ffff:192.0.2.1");
 
-        assert_eq!(
-            config.get_rpc_host(&crate::rpc_client::RpcState::default()),
-            "192.0.2.1"
-        );
+        assert_eq!(config.rpc_servers, vec![IpAddr::V4([192, 0, 2, 1].into())]);
     }
 }

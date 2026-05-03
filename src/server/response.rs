@@ -2,13 +2,11 @@ use super::body::{FileBodyParams, StreamingBody};
 use crate::bandwidth::BandwidthMonitor;
 use crate::error::{HathError, Result};
 use crate::hvfile::HVFile;
-use crate::proxy_downloader::DownloadState;
 use crate::stats::Stats;
 use bytes::Bytes;
 use hyper::{Response, StatusCode, header};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
-use tokio::sync::{oneshot, watch};
 
 /// Build a Hyper Response with proper headers.
 /// Java: Cache-Control + Content-Length only added when contentLength > 0.
@@ -115,6 +113,26 @@ pub fn head_response(content_type: &str, total_size: usize) -> Result<Response<S
         .map_err(HathError::Http)
 }
 
+/// Build a proxy body response after ProxyTransfer has initialized upstream.
+/// Java: HTTPResponseProcessorProxy uses the upstream-validated content length
+/// and mime type, with the same cache/content-length header rule as file bodies.
+pub fn proxy_body_response(
+    content_type: &str,
+    total_size: usize,
+    body: StreamingBody,
+) -> Result<Response<StreamingBody>> {
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CONNECTION, "close");
+    if total_size > 0 {
+        builder = builder
+            .header(header::CACHE_CONTROL, "public, max-age=31536000")
+            .header(header::CONTENT_LENGTH, total_size);
+    }
+    builder.body(body).map_err(HathError::Http)
+}
+
 /// Build a speedtest response with optional bandwidth throttling.
 /// Java: HTTPResponseProcessorSpeedtest inherits getContentType() from
 /// HTTPResponseProcessor → Settings.CONTENT_TYPE_DEFAULT = "text/html; charset=iso-8859-1"
@@ -136,48 +154,14 @@ pub fn speedtest_response(
         .map_err(HathError::Http)
 }
 
-/// Build a response for a proxy file download in progress.
-/// The body reads from temp_file, gated on watch_rx progress.
-/// Java: HTTPResponseProcessorProxy + ProxyFileDownloader.
-pub struct ProxyResponseParts<'a> {
-    pub content_type: &'a str,
-    pub total_size: usize,
-    pub temp_file: std::fs::File,
-    pub temp_file_path: PathBuf,
-    pub watch_rx: watch::Receiver<DownloadState>,
-    pub proxy_done_tx: oneshot::Sender<()>,
-    pub bwm: Option<Arc<BandwidthMonitor>>,
-    pub stats: Option<Arc<Stats>>,
-}
-
-pub fn proxy_response(parts: ProxyResponseParts<'_>) -> Result<Response<StreamingBody>> {
-    let mut builder = Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, parts.content_type)
-        .header(header::CONNECTION, "close");
-    if parts.total_size > 0 {
-        builder = builder
-            .header(header::CACHE_CONTROL, "public, max-age=31536000")
-            .header(header::CONTENT_LENGTH, parts.total_size);
-    }
-    let body = StreamingBody::new_proxy(
-        parts.total_size,
-        parts.temp_file,
-        parts.temp_file_path,
-        parts.watch_rx,
-        parts.proxy_done_tx,
-        parts.bwm,
-        parts.stats,
-    );
-    builder.body(body).map_err(HathError::Http)
-}
-
 /// Serve a cached file with optional bandwidth throttling and inline integrity
 /// check. Java: HTTPResponseProcessorFile streams from disk via FileChannel,
 /// computes SHA1 incrementally, deletes corrupt file in cleanup() after send.
 pub fn file_response(
     hv_file: &HVFile,
     cache_dir: &Path,
+    head_only: bool,
+    file_stats: Arc<Stats>,
     bwm: Option<Arc<BandwidthMonitor>>,
     verify: bool,
     cache_handler: Option<Arc<crate::cache::CacheHandler>>,
@@ -200,6 +184,12 @@ pub fn file_response(
             expected_size,
             actual_len
         )));
+    }
+
+    file_stats.record_file_sent();
+
+    if head_only {
+        return head_response(hv_file.mime_type(), expected_size);
     }
 
     let mime = hv_file.mime_type().to_string();

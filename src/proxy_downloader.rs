@@ -16,7 +16,7 @@ use tokio::sync::{oneshot, watch};
 /// Why a proxy download failed, carried by `DownloadState::Failed`.
 /// Kept in this module so it can evolve independently of `BodyIncompleteReason`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DownloadFailReason {
+pub(crate) enum DownloadFailReason {
     PrematureEof,
     NetworkError,
     Timeout,
@@ -27,7 +27,7 @@ pub enum DownloadFailReason {
 
 /// State published by ProxyDownloadTask to StreamingBody via watch channel.
 #[derive(Clone, Debug)]
-pub enum DownloadState {
+pub(crate) enum DownloadState {
     /// Download in progress; value is bytes written to temp file so far.
     InProgress(u64),
     /// Download complete: SHA1 verified, file renamed to cache.
@@ -41,16 +41,73 @@ pub enum DownloadState {
 ///
 /// After construction the download runs in a background tokio task.
 /// The body reads from the temp file, gated on the watch-published write offset.
-pub struct ProxyFileDownloader {
-    pub content_length: usize,
-    pub content_type: String,
-    /// Path to the temp file being written by ProxyDownloadTask.
-    pub temp_file: PathBuf,
-    /// Watch receiver for download progress. Move into StreamingBody (GET) or drop (HEAD).
-    pub watch_rx: watch::Receiver<DownloadState>,
-    /// Send on this when the proxy body has finished transmitting (GET) or is not needed (HEAD).
-    /// ProxyDownloadTask waits for this signal before rename/delete — matching Java proxyThreadCompleted().
-    pub proxy_done_tx: oneshot::Sender<()>,
+pub(crate) struct ProxyFileDownloader {
+    content_length: usize,
+    content_type: String,
+    temp_file: PathBuf,
+    watch_rx: watch::Receiver<DownloadState>,
+    proxy_done_tx: oneshot::Sender<()>,
+}
+
+pub(crate) struct ProxyDownloadParts {
+    content_length: usize,
+    content_type: String,
+    temp_file: PathBuf,
+    watch_rx: watch::Receiver<DownloadState>,
+    proxy_done_tx: oneshot::Sender<()>,
+}
+
+pub(crate) struct ProxyBodySource {
+    temp_file: PathBuf,
+    watch_rx: watch::Receiver<DownloadState>,
+    proxy_done_tx: oneshot::Sender<()>,
+}
+
+impl ProxyDownloadParts {
+    pub(crate) fn content_length(&self) -> usize {
+        self.content_length
+    }
+
+    pub(crate) fn content_type(&self) -> &str {
+        &self.content_type
+    }
+
+    pub(crate) fn open_temp_file(&self) -> io::Result<std::fs::File> {
+        std::fs::File::open(&self.temp_file)
+    }
+
+    pub(crate) fn abandon(self) {
+        drop(self.proxy_done_tx);
+    }
+
+    pub(crate) fn into_body_source(self) -> ProxyBodySource {
+        ProxyBodySource {
+            temp_file: self.temp_file,
+            watch_rx: self.watch_rx,
+            proxy_done_tx: self.proxy_done_tx,
+        }
+    }
+}
+
+impl ProxyBodySource {
+    pub(crate) fn into_components(
+        self,
+    ) -> (PathBuf, watch::Receiver<DownloadState>, oneshot::Sender<()>) {
+        (self.temp_file, self.watch_rx, self.proxy_done_tx)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        temp_file: PathBuf,
+        watch_rx: watch::Receiver<DownloadState>,
+        proxy_done_tx: oneshot::Sender<()>,
+    ) -> Self {
+        Self {
+            temp_file,
+            watch_rx,
+            proxy_done_tx,
+        }
+    }
 }
 
 trait ProxyReconnect {
@@ -438,11 +495,24 @@ impl ProxyFileDownloader {
             .map_err(HathError::Io)?;
         Ok(temp_file)
     }
+
+    pub(crate) fn into_parts(self) -> ProxyDownloadParts {
+        ProxyDownloadParts {
+            content_length: self.content_length,
+            content_type: self.content_type,
+            temp_file: self.temp_file,
+            watch_rx: self.watch_rx,
+            proxy_done_tx: self.proxy_done_tx,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn release_downstream(self) {}
 }
 
 /// Build the shared reqwest::Client used for all proxy file downloads.
 /// Applies image proxy settings from config if configured.
-pub fn build_proxy_client(config: &Config) -> Result<Arc<Client>> {
+pub(crate) fn build_proxy_client(config: &Config) -> Result<Arc<Client>> {
     let mut builder = proxy_client_builder();
     // Java: isImageProxyEnabled() checks host only; type defaults to
     // "socks"; port defaults to 1080 (socks) or 8080 (http).
@@ -462,7 +532,7 @@ pub fn build_proxy_client(config: &Config) -> Result<Arc<Client>> {
         .map_err(|e| HathError::Network(e.to_string()))
 }
 
-pub fn build_proxy_url(proxy_type: &str, proxy_host: &str, proxy_port: u16) -> Result<Url> {
+pub(crate) fn build_proxy_url(proxy_type: &str, proxy_host: &str, proxy_port: u16) -> Result<Url> {
     let mut url = match proxy_type {
         "socks" => Url::parse("socks://hath.invalid/"),
         "http" => Url::parse("http://hath.invalid/"),
@@ -572,6 +642,7 @@ fn validate_proxy_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{FakeHttpServer, FakeResponse, FixtureDirs, wait_for_file_contents};
     use bytes::Bytes;
     use std::collections::VecDeque;
     use std::convert::Infallible;
@@ -678,6 +749,10 @@ mod tests {
 
     const FINAL_BODY: &[u8] = b"0123456789abcdefghij";
 
+    fn fileid_for_body(body: &[u8]) -> String {
+        format!("{}-{}-jpg", utils::sha1_bytes(body), body.len())
+    }
+
     struct BodyRetryRun {
         state: DownloadState,
         cache_body: Vec<u8>,
@@ -755,6 +830,95 @@ mod tests {
             }
             rx.changed().await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn proxy_downloader_retries_body_stage_against_fake_upstream() {
+        let fixture = FixtureDirs::new();
+        let config = fixture.config();
+        let body = FINAL_BODY.to_vec();
+        let fileid = fileid_for_body(&body);
+        let hv = HVFile::from_fileid(&fileid).unwrap();
+        let server = FakeHttpServer::start(vec![
+            FakeResponse::ok(body.clone()).close_after(7),
+            FakeResponse::ok(body.clone()),
+        ])
+        .await;
+        let client = build_proxy_client(&config).unwrap();
+        let stats = Arc::new(Stats::new());
+
+        let proxy = ProxyFileDownloader::new(
+            &fileid,
+            &[server.url("/image")],
+            &config,
+            None,
+            stats,
+            &client,
+        )
+        .await
+        .unwrap();
+        proxy.release_downstream();
+
+        wait_for_file_contents(&hv.cache_path(&config.cache_dir), &body).await;
+        assert_eq!(server.requests().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn proxy_head_path_still_finalizes_into_cache() {
+        let fixture = FixtureDirs::new();
+        let config = fixture.config();
+        let body = FINAL_BODY.to_vec();
+        let fileid = fileid_for_body(&body);
+        let hv = HVFile::from_fileid(&fileid).unwrap();
+        let server = FakeHttpServer::start(vec![FakeResponse::ok(body.clone())]).await;
+        let client = build_proxy_client(&config).unwrap();
+
+        let proxy = ProxyFileDownloader::new(
+            &fileid,
+            &[server.url("/head")],
+            &config,
+            None,
+            Arc::new(Stats::new()),
+            &client,
+        )
+        .await
+        .unwrap();
+
+        // Java initializes ProxyFileDownloader for HEAD, but HTTPSession skips
+        // writing a body. Releasing downstream is the Rust equivalent signal.
+        proxy.release_downstream();
+
+        wait_for_file_contents(&hv.cache_path(&config.cache_dir), &body).await;
+        assert_eq!(server.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn proxy_client_abort_still_allows_successful_upstream_to_finalize() {
+        let fixture = FixtureDirs::new();
+        let config = fixture.config();
+        let body = FINAL_BODY.to_vec();
+        let fileid = fileid_for_body(&body);
+        let hv = HVFile::from_fileid(&fileid).unwrap();
+        let server = FakeHttpServer::start(vec![FakeResponse::ok(body.clone())]).await;
+        let client = build_proxy_client(&config).unwrap();
+
+        let proxy = ProxyFileDownloader::new(
+            &fileid,
+            &[server.url("/abort")],
+            &config,
+            None,
+            Arc::new(Stats::new()),
+            &client,
+        )
+        .await
+        .unwrap();
+        // Release the downstream completion gate before reading any bytes.
+        // Java requestCompleted() still releases the proxy finalization gate
+        // when the downstream request is over, including abort paths.
+        proxy.release_downstream();
+
+        wait_for_file_contents(&hv.cache_path(&config.cache_dir), &body).await;
+        assert_eq!(server.requests().len(), 1);
     }
 
     #[tokio::test]
