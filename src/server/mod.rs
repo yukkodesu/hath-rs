@@ -2,11 +2,13 @@ mod access_log;
 mod body;
 mod request;
 mod response;
+mod session;
 mod tls;
 
 use self::access_log::AccessLogService;
 use self::body::StreamingBody;
 use self::request::RequestType;
+pub use self::session::{SessionHandle, SessionManager};
 pub use self::tls::{spawn_cert_refresh_watcher, spawn_time_cert_check};
 use crate::bandwidth::BandwidthMonitor;
 use crate::cache::CacheHandler;
@@ -23,7 +25,7 @@ use hyper::header;
 use hyper::server::conn::http1;
 use hyper::service::Service;
 use hyper::{Request, Response};
-use hyper_util::rt::{TokioIo, TokioTimer};
+use hyper_util::rt::TokioIo;
 use openssl::ssl::SslContext;
 use regex::Regex;
 use reqwest::Url;
@@ -56,8 +58,8 @@ pub struct AppState {
     /// Bandwidth throttling monitor (shared across all connections).
     /// If throttle_bytes is 0, no throttling is applied (None).
     pub bandwidth_monitor: Arc<ArcSwapOption<BandwidthMonitor>>,
-    /// Count of currently active connections (for max_connections enforcement).
-    pub active_connections: Arc<std::sync::atomic::AtomicU32>,
+    /// Connection/session lifecycle manager (max connections + timeout cleanup).
+    pub session_manager: Arc<SessionManager>,
     /// Monotonic connection/session id for Java-style access logs.
     pub next_conn_id: Arc<AtomicU32>,
     /// Timestamp of last overload notification (rate-limited to once per 30s).
@@ -118,20 +120,6 @@ impl FloodControlEntry {
     }
 }
 
-/// RAII guard that decrements active_connections and updates Stats on drop.
-/// Java: HTTPServer.removeHTTPSession() / connectionFinished()
-struct ConnectionGuard {
-    active_connections: Arc<std::sync::atomic::AtomicU32>,
-    stats: Arc<Stats>,
-}
-
-impl Drop for ConnectionGuard {
-    fn drop(&mut self) {
-        let prev = self.active_connections.fetch_sub(1, Ordering::Relaxed);
-        self.stats.set_open_connections(prev.saturating_sub(1));
-    }
-}
-
 static LOCAL_NETWORK_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|169\.254\.|::1|0:0:0:0:0:0:0:1|fc|fd)")
         .expect("invalid regex")
@@ -165,6 +153,7 @@ fn configure_send_buffer(stream: &TcpStream, config: &Config) {
 pub struct HathService {
     pub state: AppState,
     pub remote_addr: SocketAddr,
+    pub session: SessionHandle,
 }
 
 impl Service<Request<Incoming>> for HathService {
@@ -176,6 +165,7 @@ impl Service<Request<Incoming>> for HathService {
     fn call(&self, req: Request<Incoming>) -> Self::Future {
         let state = self.state.clone();
         let remote_addr = self.remote_addr;
+        let session = self.session.clone();
 
         Box::pin(async move {
             // Load config once for this request (owned Arc, safe across .await)
@@ -210,6 +200,10 @@ impl Service<Request<Incoming>> for HathService {
                 client_ip,
                 &config,
             );
+            match &request_type {
+                RequestType::ServerCommand { valid: true, .. } => session.mark_servercmd(),
+                _ => session.mark_normal(),
+            }
 
             // Clone BWM for later header throttling (bwm_for_request is consumed by response builders)
             let bwm_for_header = bwm_for_request.clone();
@@ -639,13 +633,13 @@ async fn run_threaded_proxy_test(
     testkey: &str,
 ) -> (u32, u64) {
     use rand::RngExt;
-    use std::time::Instant;
 
     // Java: FileDownloader(source, 10000, 60000, true)
-    // connectTimeout=10s, readTimeout=60s, 3 retries
+    // connectTimeout=5s, readTimeout=10s,
+    // maxDLTime=60s is stored but not enforced, 3 retries.
     let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(10))
-        .read_timeout(Duration::from_secs(60))
+        .connect_timeout(Duration::from_secs(5))
+        .read_timeout(Duration::from_secs(10))
         .build();
 
     let Ok(client) = client else {
@@ -664,37 +658,7 @@ async fn run_threaded_proxy_test(
         let client = client.clone();
 
         handles.push(tokio::spawn(async move {
-            // Java: FileDownloader(source, 10000, 60000, true)
-            // connectTimeout=10s, readTimeout=60s (set on client).
-            let result = async {
-                let mut resp = client.get(url).send().await.map_err(|_| ())?;
-                let len = resp.content_length().unwrap_or(0);
-                if len < testsize {
-                    return Err(());
-                }
-
-                let mut first_byte_at: Option<Instant> = None;
-                let mut received = 0u64;
-
-                while let Some(chunk) = resp.chunk().await.map_err(|_| ())? {
-                    if !chunk.is_empty() {
-                        first_byte_at.get_or_insert_with(Instant::now);
-                        received += chunk.len() as u64;
-                    }
-                }
-
-                if received != len {
-                    return Err(());
-                }
-
-                let Some(start) = first_byte_at else {
-                    return Err(());
-                };
-                Ok(start.elapsed().as_millis() as u64)
-            }
-            .await;
-
-            result.ok()
+            run_threaded_proxy_test_download(&client, url, testsize).await
         }));
     }
 
@@ -709,6 +673,82 @@ async fn run_threaded_proxy_test(
     }
 
     (successful, total_time_ms)
+}
+
+enum ThreadedProxyTestAttemptError {
+    NotFound,
+    Retryable,
+}
+
+async fn run_threaded_proxy_test_download(
+    client: &reqwest::Client,
+    url: Url,
+    testsize: u64,
+) -> Option<u64> {
+    use std::time::Instant;
+
+    for retries_left in (0..3).rev() {
+        let result = async {
+            let mut resp = client
+                .get(url.clone())
+                .header("Connection", "Close")
+                .header(
+                    hyper::header::USER_AGENT,
+                    format!("Hentai@Home {}", crate::rpc::CLIENT_VERSION),
+                )
+                .send()
+                .await
+                .map_err(|_| ThreadedProxyTestAttemptError::Retryable)?;
+
+            if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                return Err(ThreadedProxyTestAttemptError::NotFound);
+            }
+            if !resp.status().is_success() {
+                return Err(ThreadedProxyTestAttemptError::Retryable);
+            }
+
+            let content_length = resp
+                .content_length()
+                .ok_or(ThreadedProxyTestAttemptError::Retryable)?;
+            let mut first_byte_at: Option<Instant> = None;
+            let mut received = 0u64;
+
+            while let Some(chunk) = resp
+                .chunk()
+                .await
+                .map_err(|_| ThreadedProxyTestAttemptError::Retryable)?
+            {
+                if !chunk.is_empty() {
+                    first_byte_at.get_or_insert_with(Instant::now);
+                    received += chunk.len() as u64;
+                }
+            }
+
+            if received != content_length {
+                return Err(ThreadedProxyTestAttemptError::Retryable);
+            }
+
+            Ok((content_length >= testsize).then(|| {
+                first_byte_at
+                    .map(|start| start.elapsed().as_millis() as u64)
+                    .unwrap_or(0)
+            }))
+        }
+        .await;
+
+        match result {
+            Ok(download_time_ms) => return download_time_ms,
+            Err(ThreadedProxyTestAttemptError::NotFound) => return None,
+            Err(ThreadedProxyTestAttemptError::Retryable) => {
+                tracing::warn!(
+                    "Threaded proxy test failed (retrying, {} left)",
+                    retries_left
+                );
+            }
+        }
+    }
+
+    None
 }
 
 fn build_threaded_proxy_test_url(
@@ -775,7 +815,7 @@ pub async fn stop_server(state: &AppState) {
     }
 
     for close_wait_cycles in 1..25 {
-        let active = state.active_connections.load(Ordering::Relaxed);
+        let active = state.session_manager.active_count();
         if active == 0 {
             break;
         }
@@ -822,6 +862,18 @@ pub fn spawn_flood_control_pruner(state: AppState, shutdown: tokio_util::sync::C
     ));
 }
 
+/// Spawn Java-style session timeout cleanup.
+pub fn spawn_session_reaper(state: AppState, shutdown: tokio_util::sync::CancellationToken) {
+    tokio::spawn(crate::utils::tick_every(
+        shutdown,
+        Duration::from_secs(10),
+        move || {
+            let state = state.clone();
+            async move { nuke_old_connections(&state).await }
+        },
+    ));
+}
+
 /// Prune stale flood control entries. Called periodically from main loop.
 pub async fn prune_flood_control(state: &AppState) {
     let mut fc = state.flood_control.lock().await;
@@ -829,10 +881,9 @@ pub async fn prune_flood_control(state: &AppState) {
     fc.retain(|_, entry| !entry.is_stale(now));
 }
 
-/// Nuke old connections (simplified — Hyper handles most connection lifecycle).
-pub async fn nuke_old_connections(_state: &AppState) {
-    // Hyper's http1::Builder doesn't expose connection tracking.
-    // We rely on Hyper's built-in timeouts instead of Java's manual nuke.
+/// Nuke old connections using Java HTTPSession timeout rules.
+pub async fn nuke_old_connections(state: &AppState) {
+    state.session_manager.nuke_old_connections();
 }
 
 /// Run one TLS HTTP server generation. Sends readiness via `ready_tx` after successful bind.
@@ -971,30 +1022,28 @@ async fn run_server(
                         }
                     }
 
-                    // Connection limiting for non-local, non-RPC traffic.
-                    // Java: HTTPServer.run() checks sessionCount > maxConnections
-                    // in the single-threaded accept loop.
-                    // We use fetch_add as an atomic gate to avoid a race between
-                    // the load check and the increment in the spawned task.
-                    let mut _guard: Option<ConnectionGuard> = None;
-                    if !is_local && !is_rpc {
-                        let max_conns = conn_state.config.load().max_connections();
-                        let prev = conn_state.active_connections.fetch_add(1, Ordering::Relaxed);
-                        // Java uses > (not >=), so prev == max_conns is still accepted.
-                        if prev > max_conns {
-                            conn_state.active_connections.fetch_sub(1, Ordering::Relaxed);
+                    let conn_id = conn_state.next_conn_id.fetch_add(1, Ordering::Relaxed) + 1;
+                    let max_conns = conn_state.config.load().max_connections();
+                    let admission = match conn_state.session_manager.admit(
+                        conn_id,
+                        remote_addr,
+                        is_local,
+                        is_rpc,
+                        max_conns,
+                    ) {
+                        Ok(admission) => admission,
+                        Err(self::session::SessionAdmitError::MaxConnectionsExceeded {
+                            max_connections,
+                        }) => {
                             tracing::warn!(
                                 "Exceeded the maximum allowed number of incoming connections ({}).",
-                                max_conns
+                                max_connections
                             );
                             return;
                         }
-                        conn_state.stats.set_open_connections(prev + 1);
-                        _guard = Some(ConnectionGuard {
-                            active_connections: conn_state.active_connections.clone(),
-                            stats: conn_state.stats.clone(),
-                        });
+                    };
 
+                    if let Some(prev) = admission.active_before {
                         if prev > (max_conns as f64 * 0.8) as u32 && prev > 0 {
                             tracing::warn!(
                                 "Near connection limit: {} / {} active connections",
@@ -1011,27 +1060,32 @@ async fn run_server(
                         }
                     }
 
-
                     let io = TokioIo::new(tls_stream);
-
-                    let conn_id = conn_state.next_conn_id.fetch_add(1, Ordering::Relaxed) + 1;
+                    let session_handle = admission.handle.clone();
+                    let cancel = admission.cancel.clone();
+                    let _session_guard = admission.guard;
                     let service = AccessLogService::new(
                         HathService {
-                            state: conn_state,
+                            state: conn_state.clone(),
                             remote_addr,
+                            session: session_handle.clone(),
                         },
                         conn_id,
                         remote_addr,
+                        Some(session_handle),
                     );
 
-                    if let Err(e) = http1::Builder::new()
-                        .header_read_timeout(Duration::from_secs(10))
-                        .timer(TokioTimer::new())
-                        .serve_connection(io, service)
-                        .await
-                        && !e.to_string().contains("connection closed") {
-                            tracing::debug!("HTTP connection error: {}", e);
+                    tokio::select! {
+                        result = http1::Builder::new().serve_connection(io, service) => {
+                            if let Err(e) = result
+                                && !e.to_string().contains("connection closed") {
+                                    tracing::debug!("HTTP connection error: {}", e);
+                                }
                         }
+                        _ = cancel.cancelled() => {
+                            tracing::debug!("HTTP session {} timed out; closing connection", conn_id);
+                        }
+                    }
                 });
             }
         }

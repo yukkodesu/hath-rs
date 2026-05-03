@@ -115,7 +115,7 @@ pub async fn run() -> Result<()> {
         tls_acceptor: Arc::new(ArcSwapOption::const_empty()),
         cert_expiry: Arc::new(Mutex::new(None)),
         bandwidth_monitor: Arc::new(ArcSwapOption::const_empty()),
-        active_connections: Arc::new(AtomicU32::new(0)),
+        session_manager: Arc::new(server::SessionManager::new(stats.clone())),
         next_conn_id: Arc::new(AtomicU32::new(0)),
         last_overload_notification: Arc::new(Mutex::new(None)),
         do_cert_refresh: Arc::new(AtomicBool::new(false)),
@@ -210,6 +210,7 @@ pub async fn run() -> Result<()> {
         cache::spawn_pruner(cache.clone(), config.clone(), shutdown.clone());
         cache::spawn_periodic_stats(cache.clone(), stats.clone(), shutdown.clone());
         server::spawn_flood_control_pruner(app_state.clone(), shutdown.clone());
+        server::spawn_session_reaper(app_state.clone(), shutdown.clone());
         rpc_client::spawn_still_alive_heartbeat(
             rpc_client.clone(),
             stats.clone(),
