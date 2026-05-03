@@ -641,10 +641,11 @@ async fn run_threaded_proxy_test(
     use rand::RngExt;
 
     // Java: FileDownloader(source, 10000, 60000, true)
-    // connectTimeout=10s, readTimeout=60s, 3 retries
+    // connectTimeout=5s, readTimeout=10s,
+    // maxDLTime=60s is stored but not enforced, 3 retries.
     let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(10))
-        .read_timeout(Duration::from_secs(60))
+        .connect_timeout(Duration::from_secs(5))
+        .read_timeout(Duration::from_secs(10))
         .build();
 
     let Ok(client) = client else {
