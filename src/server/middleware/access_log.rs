@@ -12,7 +12,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use super::body::{BodyCompletion, BodyCompletionSnapshot, BodyCompletionStatus};
+use super::super::body::{BodyCompletion, BodyCompletionSnapshot, BodyCompletionStatus};
 use super::session::SessionHandle;
 
 pub fn access_log_prefix(conn_id: u32, client_ip: IpAddr) -> String {

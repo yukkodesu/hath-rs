@@ -12,6 +12,7 @@ use openssl::pkcs12::Pkcs12;
 use openssl::provider::Provider;
 use openssl::ssl::{SslContext, SslMethod};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::task::JoinHandle;
 
 const SECS_PER_DAY: i64 = 86400;
 const CERT_RENEWAL_WINDOW_SECS: i64 = SECS_PER_DAY;
@@ -38,12 +39,8 @@ pub(super) async fn build_tls_acceptor(
     let cert_path = config.data_dir.join("hathcert.p12");
 
     if force_download || !cert_path.exists() {
-        let cert_url = rpc::make_rpc_url(
-            Action::GetCertificate,
-            "",
-            config,
-            &crate::rpc_client::RpcState::default(),
-        )?;
+        let host = rpc::default_rpc_host(config);
+        let cert_url = rpc::make_rpc_url(Action::GetCertificate, "", config, &host)?;
         let downloader = crate::downloader::FileDownloader::new(
             cert_url,
             10000,
@@ -126,7 +123,7 @@ pub fn spawn_cert_refresh_watcher(
     state: AppState,
     rpc_client: Arc<RpcClient>,
     shutdown: tokio_util::sync::CancellationToken,
-) {
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -221,7 +218,7 @@ pub fn spawn_cert_refresh_watcher(
             state.do_cert_refresh.store(false, Ordering::Release);
             tracing::info!("Certificate refresh completed successfully");
         }
-    });
+    })
 }
 
 /// Spawn periodic time check + cert expiry check (5min interval).
@@ -230,7 +227,7 @@ pub fn spawn_time_cert_check(
     config: Arc<ArcSwap<Config>>,
     state: AppState,
     shutdown: tokio_util::sync::CancellationToken,
-) {
+) -> JoinHandle<()> {
     let global_shutdown = shutdown.clone();
     tokio::spawn(crate::utils::tick_every(
         shutdown,
@@ -255,5 +252,5 @@ pub fn spawn_time_cert_check(
                 }
             }
         },
-    ));
+    ))
 }

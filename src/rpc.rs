@@ -1,6 +1,7 @@
 use crate::config::Config;
 use crate::error::{HathError, Result};
 use crate::utils;
+use rand::Rng;
 use reqwest::Url;
 use std::fmt;
 use std::net::IpAddr;
@@ -96,13 +97,7 @@ pub fn make_rpc_query(act: Action, add: &str, config: &Config) -> String {
 }
 
 /// Build the full RPC URL for a given action.
-pub fn make_rpc_url(
-    act: Action,
-    add: &str,
-    config: &Config,
-    state: &crate::rpc_client::RpcState,
-) -> Result<Url> {
-    let host = config.get_rpc_host(state);
+pub fn make_rpc_url(act: Action, add: &str, config: &Config, host: &str) -> Result<Url> {
     let query = make_rpc_query(act, add, config);
     let mut url = Url::parse("http://rpc.hentaiathome.net/")
         .map_err(|e| HathError::Rpc(format!("invalid URL base: {}", e)))?;
@@ -123,6 +118,21 @@ pub fn make_rpc_url(
     url.set_path(config.rpc_path.trim_end_matches('?'));
     url.set_query(Some(&query));
     Ok(url)
+}
+
+/// Host used by one-off RPC-shaped downloads that do not participate in
+/// RpcClient's Java routing state, such as certificate fetches.
+pub fn default_rpc_host(config: &Config) -> String {
+    if config.rpc_servers.is_empty() {
+        return "rpc.hentaiathome.net".to_string();
+    }
+    if config.rpc_servers.len() == 1 {
+        return config.rpc_servers[0].to_string().to_lowercase();
+    }
+
+    let mut rng = rand::rng();
+    let idx = rng.next_u32() as usize % config.rpc_servers.len();
+    config.rpc_servers[idx].to_string().to_lowercase()
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -221,13 +231,8 @@ mod tests {
         // ::ffff:192.0.2.1 normalizes to plain IPv4 192.0.2.1
         config.apply_setting("rpc_server_ip", "::ffff:192.0.2.1");
 
-        let url = make_rpc_url(
-            Action::GetCertificate,
-            "",
-            &config,
-            &crate::rpc_client::RpcState::default(),
-        )
-        .unwrap();
+        let host = default_rpc_host(&config);
+        let url = make_rpc_url(Action::GetCertificate, "", &config, &host).unwrap();
 
         assert!(
             url.as_str()
@@ -241,13 +246,8 @@ mod tests {
         config.apply_setting("rpc_server_ip", "192.0.2.1");
         config.apply_setting("rpc_server_port", "8080");
 
-        let url = make_rpc_url(
-            Action::GetCertificate,
-            "",
-            &config,
-            &crate::rpc_client::RpcState::default(),
-        )
-        .unwrap();
+        let host = default_rpc_host(&config);
+        let url = make_rpc_url(Action::GetCertificate, "", &config, &host).unwrap();
 
         assert!(
             url.as_str()
