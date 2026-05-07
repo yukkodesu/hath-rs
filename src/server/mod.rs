@@ -24,11 +24,11 @@ use crate::stats::Stats;
 use crate::utils;
 
 use arc_swap::{ArcSwap, ArcSwapOption};
+use dashmap::DashMap;
 use hyper::server::conn::http1;
 use hyper_util::rt::TokioIo;
 use openssl::ssl::SslContext;
 use regex::Regex;
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -45,8 +45,8 @@ pub(crate) struct AppState {
     pub(crate) cache: Arc<CacheHandler>,
     pub(crate) rpc_client: Arc<RpcClient>,
     pub(crate) allow_normal_connections: Arc<std::sync::atomic::AtomicBool>,
-    /// Flood control table (IP -> entry). Uses Arc<Mutex> for shared access.
-    pub(crate) flood_control: Arc<Mutex<HashMap<String, FloodControlEntry>>>,
+    /// Flood control table (IP -> entry). Sharded because it is touched by each incoming connection.
+    pub(crate) flood_control: Arc<DashMap<String, FloodControlEntry>>,
     /// TLS context that can be swapped at runtime (e.g. cert refresh).
     pub(crate) tls_acceptor: Arc<ArcSwapOption<SslContext>>,
     /// Certificate expiry as a Unix timestamp (seconds). Checked periodically;

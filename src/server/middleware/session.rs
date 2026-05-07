@@ -1,8 +1,8 @@
 use crate::stats::Stats;
-use std::collections::HashMap;
+use dashmap::DashMap;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -75,7 +75,7 @@ impl SessionState {
 struct SessionManagerInner {
     stats: Arc<Stats>,
     active_connections: AtomicU32,
-    sessions: Mutex<HashMap<u32, SessionState>>,
+    sessions: DashMap<u32, SessionState>,
 }
 
 #[derive(Debug, Clone)]
@@ -89,7 +89,7 @@ impl SessionManager {
             inner: Arc::new(SessionManagerInner {
                 stats,
                 active_connections: AtomicU32::new(0),
-                sessions: Mutex::new(HashMap::new()),
+                sessions: DashMap::new(),
             }),
         }
     }
@@ -127,8 +127,6 @@ impl SessionManager {
         let cancel = CancellationToken::new();
         self.inner
             .sessions
-            .lock()
-            .unwrap()
             .insert(conn_id, SessionState::new(remote_addr, cancel.clone()));
 
         Ok(SessionAdmission {
@@ -150,23 +148,20 @@ impl SessionManager {
         let now = Instant::now();
         let mut expired = Vec::new();
 
-        {
-            let mut sessions = self.inner.sessions.lock().unwrap();
-            sessions.retain(|conn_id, state| {
-                if let Some(reason) = state.timeout_reason(now) {
-                    tracing::debug!(
-                        "Adding session {} ({}) to timeout kill queue: {:?}",
-                        conn_id,
-                        state.remote_addr,
-                        reason
-                    );
-                    expired.push((*conn_id, state.cancel.clone()));
-                    false
-                } else {
-                    true
-                }
-            });
-        }
+        self.inner.sessions.retain(|conn_id, state| {
+            if let Some(reason) = state.timeout_reason(now) {
+                tracing::debug!(
+                    "Adding session {} ({}) to timeout kill queue: {:?}",
+                    conn_id,
+                    state.remote_addr,
+                    reason
+                );
+                expired.push((*conn_id, state.cancel.clone()));
+                false
+            } else {
+                true
+            }
+        });
 
         for (conn_id, cancel) in &expired {
             tracing::debug!("Closing timed-out HTTP session {}", conn_id);
@@ -193,7 +188,7 @@ pub struct SessionGuard {
 
 impl Drop for SessionGuard {
     fn drop(&mut self) {
-        self.inner.sessions.lock().unwrap().remove(&self.conn_id);
+        self.inner.sessions.remove(&self.conn_id);
         if self.counted {
             let prev = self
                 .inner
@@ -222,13 +217,13 @@ impl SessionHandle {
     }
 
     pub fn mark_packet_sent(&self) {
-        if let Some(state) = self.inner.sessions.lock().unwrap().get_mut(&self.conn_id) {
+        if let Some(mut state) = self.inner.sessions.get_mut(&self.conn_id) {
             state.last_packet_send = Some(Instant::now());
         }
     }
 
     fn mark_kind(&self, kind: SessionKind) {
-        if let Some(state) = self.inner.sessions.lock().unwrap().get_mut(&self.conn_id) {
+        if let Some(mut state) = self.inner.sessions.get_mut(&self.conn_id) {
             state.kind = kind;
         }
     }
@@ -341,10 +336,8 @@ mod tests {
     fn reaper_cancels_timed_out_sessions() {
         let manager = SessionManager::new(Arc::new(Stats::new()));
         let admission = manager.admit(1, remote_addr(), true, false, 0).unwrap();
-        {
-            let mut sessions = manager.inner.sessions.lock().unwrap();
-            sessions.get_mut(&1).unwrap().started_at = Instant::now() - Duration::from_secs(31);
-        }
+        manager.inner.sessions.get_mut(&1).unwrap().started_at =
+            Instant::now() - Duration::from_secs(31);
 
         assert_eq!(manager.nuke_old_connections(), 1);
         assert!(admission.cancel.is_cancelled());

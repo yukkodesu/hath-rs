@@ -143,7 +143,7 @@ mod tests {
     use crate::stats::Stats;
     use crate::test_support::FixtureDirs;
     use arc_swap::{ArcSwap, ArcSwapOption};
-    use std::collections::HashMap;
+    use dashmap::DashMap;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -169,7 +169,7 @@ mod tests {
             cache,
             rpc_client,
             allow_normal_connections: Arc::new(AtomicBool::new(true)),
-            flood_control: Arc::new(Mutex::new(HashMap::new())),
+            flood_control: Arc::new(DashMap::new()),
             tls_acceptor: Arc::new(ArcSwapOption::const_empty()),
             cert_expiry: Arc::new(Mutex::new(None)),
             bandwidth_monitor: Arc::new(ArcSwapOption::const_empty()),

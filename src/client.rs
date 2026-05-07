@@ -8,7 +8,7 @@ use crate::stats::Stats;
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use clap::Parser;
-use std::collections::HashMap;
+use dashmap::DashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -104,7 +104,7 @@ pub async fn run() -> Result<()> {
     // Used to decide whether to send client_stop on shutdown. allow_connections
     // is toggled during cert refresh, so it can't serve this purpose.
     let report_shutdown = Arc::new(AtomicBool::new(false));
-    let flood_control = Arc::new(Mutex::new(HashMap::new()));
+    let flood_control = Arc::new(DashMap::new());
 
     let proxy_client = crate::proxy_downloader::build_proxy_client(&config.load())?;
 

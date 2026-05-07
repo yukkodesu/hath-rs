@@ -128,8 +128,8 @@ pub(crate) async fn admit_connection(
     }
 
     if !is_local && !is_rpc && !config.disable_flood_control {
-        let mut fc = state.flood_control.lock().await;
-        let entry = fc
+        let mut entry = state
+            .flood_control
             .entry(host_addr.to_string())
             .or_insert_with(|| FloodControlEntry {
                 connect_count: 0,
@@ -204,9 +204,8 @@ pub(crate) fn spawn_flood_control_pruner(
 
 /// Prune stale flood control entries. Called periodically from main loop.
 pub(crate) async fn prune_flood_control(state: &AppState) {
-    let mut fc = state.flood_control.lock().await;
     let now = Instant::now();
-    fc.retain(|_, entry| !entry.is_stale(now));
+    state.flood_control.retain(|_, entry| !entry.is_stale(now));
 }
 
 #[cfg(test)]
