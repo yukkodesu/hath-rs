@@ -17,6 +17,12 @@ pub mod utils;
 #[cfg(test)]
 pub(crate) mod test_support;
 
+/// Opt-in allocator for deployment builds. The default build deliberately
+/// continues to use Rust's platform allocator for compatibility.
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[tokio::main]
 async fn main() {
     if let Err(e) = client::run().await {

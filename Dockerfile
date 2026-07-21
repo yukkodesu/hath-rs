@@ -10,7 +10,7 @@ WORKDIR /build
 COPY . .
 RUN --mount=type=cache,target=/build/target \
     --mount=type=cache,target=/usr/local/cargo/registry \
-    cargo build --release && \
+    cargo build --release --features mimalloc && \
     mkdir -p /build/out && \
     cp /build/target/release/hath-rs /build/out/hath-rs
 
