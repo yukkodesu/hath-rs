@@ -26,7 +26,7 @@ use arc_swap::ArcSwap;
 use std::collections::HashMap;
 use std::fs;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
@@ -46,10 +46,16 @@ pub struct CacheHandler {
     config: Arc<ArcSwap<Config>>,
     stats: Arc<Stats>,
     lru: std::sync::Mutex<LruState>,
+    /// Serializes count/size mutations so the pair cannot underflow or be
+    /// persisted as a partially applied file operation.
+    accounting: std::sync::Mutex<()>,
     cache_count: AtomicU32,
     cache_size: AtomicU64,
     static_range_oldest: std::sync::Mutex<HashMap<String, u64>>,
     cache_loaded: bool,
+    /// Cleared when accounting detects an invariant violation. A later clean
+    /// restart must rescan rather than trust the resulting counters.
+    persistent_state_valid: AtomicBool,
     last_file_verification_cooldown: std::sync::Mutex<std::time::Instant>,
 }
 
@@ -90,6 +96,11 @@ impl CacheHandler {
         } else {
             None
         };
+
+        // Java: deletePersistentData() after the load decision. Any state we
+        // retained above is now in-memory only until a clean shutdown writes a
+        // new snapshot.
+        persistent::clear(&cfg)?;
 
         let cache_loaded;
         let startup_state = if let Some(state) = persistent_state {
@@ -160,10 +171,12 @@ impl CacheHandler {
             config,
             stats,
             lru: std::sync::Mutex::new(startup_state.lru),
+            accounting: std::sync::Mutex::new(()),
             cache_count: AtomicU32::new(startup_state.cache_count),
             cache_size: AtomicU64::new(startup_state.cache_size),
             static_range_oldest: std::sync::Mutex::new(startup_state.static_range_oldest),
             cache_loaded,
+            persistent_state_valid: AtomicBool::new(true),
             last_file_verification_cooldown: std::sync::Mutex::new(std::time::Instant::now()),
         })
     }
@@ -183,6 +196,11 @@ impl CacheHandler {
         let cfg = self.config.load();
 
         let result: std::result::Result<(), String> = (|| {
+            if !self.persistent_state_valid.load(Ordering::Acquire) {
+                return Err(
+                    "cache accounting state is invalid; forcing rescan on next startup".to_string(),
+                );
+            }
             let static_range_ages = {
                 let ages = self.static_range_oldest.lock().unwrap();
                 ages.clone()
@@ -191,12 +209,15 @@ impl CacheHandler {
                 let lru = self.lru.lock().unwrap();
                 (lru.lru_cache_table.to_vec(), lru.lru_clear_pointer)
             };
-            let state = PersistentCacheState {
-                cache_count: self.cache_count.load(Ordering::Relaxed),
-                cache_size: self.cache_size.load(Ordering::Relaxed),
-                lru_clear_pointer,
-                static_range_ages,
-                lru_cache_table,
+            let state = {
+                let _accounting = self.accounting.lock().unwrap();
+                PersistentCacheState {
+                    cache_count: self.cache_count.load(Ordering::Relaxed),
+                    cache_size: self.cache_size.load(Ordering::Relaxed),
+                    lru_clear_pointer,
+                    static_range_ages,
+                    lru_cache_table,
+                }
             };
             persistent::save(&cfg, &state).map_err(|e| e.to_string())?;
 
@@ -205,6 +226,16 @@ impl CacheHandler {
 
         if let Err(e) = result {
             tracing::warn!("Failed to save persistent cache data: {}", e);
+            self.discard_persistent_data();
+        }
+    }
+
+    /// Ensure the next startup rebuilds cache state from the filesystem.
+    pub fn discard_persistent_data(&self) {
+        self.persistent_state_valid.store(false, Ordering::Release);
+        let cfg = self.config.load();
+        if let Err(e) = persistent::clear(&cfg) {
+            tracing::warn!("Failed to discard persistent cache data: {}", e);
         }
     }
 
@@ -237,12 +268,7 @@ impl CacheHandler {
             let path = hv.cache_path(&cfg.cache_dir);
             if path.exists() {
                 fs::remove_file(&path)?;
-                self.cache_count.fetch_sub(1, Ordering::Relaxed);
-                self.cache_size.fetch_sub(hv.size as u64, Ordering::Relaxed);
-                let count = self.cache_count.load(Ordering::Relaxed);
-                self.stats.set_cache_count(count);
-                self.stats
-                    .set_cache_size(self.get_cache_size_with_overhead());
+                self.account_file_removed(&hv);
             }
         }
         Ok(())
@@ -276,14 +302,7 @@ impl CacheHandler {
     }
 
     pub fn register_proxy_file(&self, hv_file: &HVFile) {
-        // addFileToActiveCache
-        self.cache_count.fetch_add(1, Ordering::Relaxed);
-        self.cache_size
-            .fetch_add(hv_file.size as u64, Ordering::Relaxed);
-        let count = self.cache_count.load(Ordering::Relaxed);
-        self.stats.set_cache_count(count);
-        self.stats
-            .set_cache_size(self.get_cache_size_with_overhead());
+        self.account_file_added(hv_file);
 
         // markRecentlyAccessed with skipMetaUpdate=true
         if let Ok(mut lru) = self.lru.try_lock() {
@@ -300,6 +319,62 @@ impl CacheHandler {
             );
             range_ages.insert(static_range.to_string(), utils::millis_now());
         }
+    }
+
+    /// Record a cache file removed by the pruner after its filesystem unlink
+    /// has succeeded. This is deliberately separate from `delete_file...`,
+    /// whose path is reconstructed from a file id.
+    pub(super) fn record_pruned_file(&self, hv_file: &HVFile) {
+        self.account_file_removed(hv_file);
+    }
+
+    fn account_file_added(&self, hv_file: &HVFile) {
+        let _accounting = self.accounting.lock().unwrap();
+        let count = self.cache_count.load(Ordering::Relaxed);
+        let size = self.cache_size.load(Ordering::Relaxed);
+        let Some(next_count) = count.checked_add(1) else {
+            self.invalidate_accounting("cache count overflow while registering a file");
+            return;
+        };
+        let Some(next_size) = size.checked_add(hv_file.size as u64) else {
+            self.invalidate_accounting("cache size overflow while registering a file");
+            return;
+        };
+        self.cache_count.store(next_count, Ordering::Relaxed);
+        self.cache_size.store(next_size, Ordering::Relaxed);
+        self.update_cache_stats(next_count, next_size);
+    }
+
+    fn account_file_removed(&self, hv_file: &HVFile) {
+        let _accounting = self.accounting.lock().unwrap();
+        let count = self.cache_count.load(Ordering::Relaxed);
+        let size = self.cache_size.load(Ordering::Relaxed);
+        let Some(next_count) = count.checked_sub(1) else {
+            self.invalidate_accounting("cache count underflow while removing a file");
+            return;
+        };
+        let Some(next_size) = size.checked_sub(hv_file.size as u64) else {
+            self.invalidate_accounting("cache size underflow while removing a file");
+            return;
+        };
+        self.cache_count.store(next_count, Ordering::Relaxed);
+        self.cache_size.store(next_size, Ordering::Relaxed);
+        self.update_cache_stats(next_count, next_size);
+    }
+
+    fn update_cache_stats(&self, count: u32, size: u64) {
+        let cfg = self.config.load();
+        self.stats.set_cache_count(count);
+        self.stats
+            .set_cache_size(Self::cache_size_with_overhead(size, count, &cfg));
+    }
+
+    fn invalidate_accounting(&self, message: &str) {
+        self.persistent_state_valid.store(false, Ordering::Release);
+        tracing::error!(
+            "CacheHandler: {}; forcing a cache rescan on next startup",
+            message
+        );
     }
 
     /// Java: checkAndPruneCache() — phase 1 (lock held, read-only).
@@ -338,7 +413,14 @@ impl CacheHandler {
             bytes_to_free = want_free - (cache_limit - cache_size_with_overhead);
         }
 
-        if bytes_to_free == 0 || count == 0 || range_ages.is_empty() {
+        // Java only prunes while the server currently assigns static ranges.
+        // `static_range_oldest` can contain persisted ranges from an older
+        // assignment and must not independently authorize deletion.
+        if bytes_to_free == 0
+            || count == 0
+            || config.static_range_count == 0
+            || range_ages.is_empty()
+        {
             return PruneAction::NoPrune {
                 frequency: prune_frequency(cache_limit, cache_size_with_overhead, want_free),
             };
@@ -394,8 +476,8 @@ impl CacheHandler {
 
     /// Java: checkAndPruneCache() — phase 3 (lock held, write).
     ///
-    /// Applies the results of a prune pass that was executed outside the lock.
-    /// Updates [`static_range_oldest`], cache counters, and stats.
+    /// Applies range-age metadata from a fully completed prune pass. Successful
+    /// file deletions have already updated counters at unlink time.
     fn apply_prune_result(&self, result: PruneResult) {
         {
             let mut range_ages = self.static_range_oldest.lock().unwrap();
@@ -415,15 +497,6 @@ impl CacheHandler {
                 );
             }
         } // release range_ages lock
-
-        self.cache_count
-            .fetch_sub(result.files_deleted as u32, Ordering::Relaxed);
-        self.cache_size
-            .fetch_sub(result.bytes_deleted, Ordering::Relaxed);
-        let count = self.cache_count.load(Ordering::Relaxed);
-        self.stats.set_cache_count(count);
-        self.stats
-            .set_cache_size(self.get_cache_size_with_overhead());
     }
 }
 
@@ -457,4 +530,130 @@ pub fn spawn_periodic_stats(
             }
         },
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::FixtureDirs;
+
+    #[test]
+    fn startup_consumes_persistent_files_after_loading_them() {
+        let fixture = FixtureDirs::new();
+        let config = fixture.config();
+        let state = PersistentCacheState {
+            cache_count: 7,
+            cache_size: 99,
+            lru_clear_pointer: 0,
+            static_range_ages: HashMap::new(),
+            lru_cache_table: vec![0; LRU_CACHE_SIZE],
+        };
+        persistent::save(&config, &state).unwrap();
+
+        let config = Arc::new(ArcSwap::from_pointee(config));
+        let stats = Arc::new(Stats::new());
+        let cache = CacheHandler::new(
+            config.clone(),
+            stats,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .unwrap();
+
+        assert_eq!(cache.cache_count.load(Ordering::Relaxed), state.cache_count);
+        assert_eq!(cache.cache_size.load(Ordering::Relaxed), state.cache_size);
+        for name in ["pcache_info", "pcache_ages", "pcache_lru"] {
+            assert!(
+                !config.load().data_dir.join(name).exists(),
+                "{name} should only exist after a clean shutdown save"
+            );
+        }
+    }
+
+    #[test]
+    fn forced_rescan_also_discards_persistent_files() {
+        let fixture = FixtureDirs::new();
+        let mut config = fixture.config();
+        let state = PersistentCacheState::default();
+        persistent::save(&config, &state).unwrap();
+        config.rescan_cache = true;
+
+        let config = Arc::new(ArcSwap::from_pointee(config));
+        CacheHandler::new(
+            config.clone(),
+            Arc::new(Stats::new()),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .unwrap();
+
+        for name in ["pcache_info", "pcache_ages", "pcache_lru"] {
+            assert!(
+                !config.load().data_dir.join(name).exists(),
+                "{name} should be discarded before a forced rescan"
+            );
+        }
+    }
+
+    #[test]
+    fn deleting_a_file_updates_accounting_once_after_successful_unlink() {
+        let fixture = FixtureDirs::new();
+        let mut config = fixture.config();
+        config.static_ranges.insert("aabb".to_string(), 0);
+        let hv = HVFile::from_fileid("aabbccddeeff00112233445566778899aabbccdd-4-jpg").unwrap();
+        let path = hv.cache_path(&config.cache_dir);
+        utils::ensure_dir(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"data").unwrap();
+
+        let config = Arc::new(ArcSwap::from_pointee(config));
+        let stats = Arc::new(Stats::new());
+        let cache =
+            CacheHandler::new(config, stats, tokio_util::sync::CancellationToken::new()).unwrap();
+
+        cache.delete_file_from_cache(hv.fileid().as_str()).unwrap();
+        cache.delete_file_from_cache(hv.fileid().as_str()).unwrap();
+
+        assert_eq!(cache.cache_count.load(Ordering::Relaxed), 0);
+        assert_eq!(cache.cache_size.load(Ordering::Relaxed), 0);
+    }
+
+    fn cache_with_prunable_range(static_range_count: u32) -> (Arc<ArcSwap<Config>>, CacheHandler) {
+        let fixture = FixtureDirs::new();
+        let mut config = fixture.config();
+        config.disklimit_bytes = 1;
+        config.static_range_count = static_range_count;
+        let config = Arc::new(ArcSwap::from_pointee(config));
+        let cache = CacheHandler::new(
+            config.clone(),
+            Arc::new(Stats::new()),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .unwrap();
+        cache.cache_count.store(1, Ordering::Relaxed);
+        cache.cache_size.store(4, Ordering::Relaxed);
+        cache
+            .static_range_oldest
+            .lock()
+            .unwrap()
+            .insert("aabb".to_string(), 0);
+        (config, cache)
+    }
+
+    #[test]
+    fn prune_does_not_use_historical_range_state_without_current_assignment() {
+        let (config, cache) = cache_with_prunable_range(0);
+
+        assert!(matches!(
+            cache.check_prune_action(&config.load()),
+            PruneAction::NoPrune { .. }
+        ));
+    }
+
+    #[test]
+    fn prune_uses_historical_range_state_when_current_assignment_exists() {
+        let (config, cache) = cache_with_prunable_range(1);
+
+        match cache.check_prune_action(&config.load()) {
+            PruneAction::Prune(plan) => assert_eq!(plan.static_range, "aabb"),
+            PruneAction::NoPrune { .. } => panic!("assigned static range should be prunable"),
+        }
+    }
 }

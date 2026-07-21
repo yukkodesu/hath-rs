@@ -1,3 +1,4 @@
+use crate::server::peer::AdmissionClass;
 use crate::stats::Stats;
 use dashmap::DashMap;
 use std::net::SocketAddr;
@@ -102,27 +103,24 @@ impl SessionManager {
         &self,
         conn_id: u32,
         remote_addr: SocketAddr,
-        is_local: bool,
-        is_rpc: bool,
+        admission_class: AdmissionClass,
         max_connections: u32,
     ) -> Result<SessionAdmission, SessionAdmitError> {
-        let counted = !is_local && !is_rpc;
-        let mut active_before = None;
-
-        if counted {
-            let prev = self
+        let active_before = match admission_class {
+            AdmissionClass::Exempt => self.inner.active_connections.fetch_add(1, Ordering::AcqRel),
+            AdmissionClass::Limited => self
                 .inner
                 .active_connections
-                .fetch_add(1, Ordering::Relaxed);
-            if prev > max_connections {
-                self.inner
-                    .active_connections
-                    .fetch_sub(1, Ordering::Relaxed);
-                return Err(SessionAdmitError::MaxConnectionsExceeded { max_connections });
-            }
-            self.inner.stats.set_open_connections(prev + 1);
-            active_before = Some(prev);
-        }
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    (current <= max_connections)
+                        .then(|| current.checked_add(1))
+                        .flatten()
+                })
+                .map_err(|_| SessionAdmitError::MaxConnectionsExceeded { max_connections })?,
+        };
+        self.inner
+            .stats
+            .set_open_connections(active_before.saturating_add(1));
 
         let cancel = CancellationToken::new();
         self.inner
@@ -132,7 +130,6 @@ impl SessionManager {
         Ok(SessionAdmission {
             guard: SessionGuard {
                 conn_id,
-                counted,
                 inner: self.inner.clone(),
             },
             handle: SessionHandle {
@@ -140,7 +137,8 @@ impl SessionManager {
                 inner: self.inner.clone(),
             },
             cancel,
-            active_before,
+            active_before: matches!(admission_class, AdmissionClass::Limited)
+                .then_some(active_before),
         })
     }
 
@@ -182,22 +180,16 @@ pub struct SessionAdmission {
 #[derive(Debug)]
 pub struct SessionGuard {
     conn_id: u32,
-    counted: bool,
     inner: Arc<SessionManagerInner>,
 }
 
 impl Drop for SessionGuard {
     fn drop(&mut self) {
         self.inner.sessions.remove(&self.conn_id);
-        if self.counted {
-            let prev = self
-                .inner
-                .active_connections
-                .fetch_sub(1, Ordering::Relaxed);
-            self.inner
-                .stats
-                .set_open_connections(prev.saturating_sub(1));
-        }
+        let prev = self.inner.active_connections.fetch_sub(1, Ordering::AcqRel);
+        self.inner
+            .stats
+            .set_open_connections(prev.saturating_sub(1));
     }
 }
 
@@ -311,23 +303,32 @@ mod tests {
     fn public_admission_preserves_java_max_connection_boundary() {
         let manager = SessionManager::new(Arc::new(Stats::new()));
         let first = manager
-            .admit(1, remote_addr(), false, false, 0)
+            .admit(1, remote_addr(), AdmissionClass::Limited, 0)
             .expect("prev == max is accepted");
         assert_eq!(manager.active_count(), 1);
-        assert!(manager.admit(2, remote_addr(), false, false, 0).is_err());
+        assert!(
+            manager
+                .admit(2, remote_addr(), AdmissionClass::Limited, 0)
+                .is_err()
+        );
         assert_eq!(manager.active_count(), 1);
         drop(first);
         assert_eq!(manager.active_count(), 0);
     }
 
     #[test]
-    fn local_and_rpc_sessions_are_not_counted() {
+    fn exempt_sessions_are_counted_before_normal_limit_is_checked() {
         let manager = SessionManager::new(Arc::new(Stats::new()));
-        let local = manager.admit(1, remote_addr(), true, false, 0).unwrap();
-        let rpc = manager.admit(2, remote_addr(), false, true, 0).unwrap();
+        let rpc = manager
+            .admit(1, remote_addr(), AdmissionClass::Exempt, 0)
+            .unwrap();
 
-        assert_eq!(manager.active_count(), 0);
-        drop(local);
+        assert_eq!(manager.active_count(), 1);
+        assert!(
+            manager
+                .admit(2, remote_addr(), AdmissionClass::Limited, 0)
+                .is_err()
+        );
         drop(rpc);
         assert_eq!(manager.active_count(), 0);
     }
@@ -335,7 +336,9 @@ mod tests {
     #[test]
     fn reaper_cancels_timed_out_sessions() {
         let manager = SessionManager::new(Arc::new(Stats::new()));
-        let admission = manager.admit(1, remote_addr(), true, false, 0).unwrap();
+        let admission = manager
+            .admit(1, remote_addr(), AdmissionClass::Exempt, 0)
+            .unwrap();
         manager.inner.sessions.get_mut(&1).unwrap().started_at =
             Instant::now() - Duration::from_secs(31);
 

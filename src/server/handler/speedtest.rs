@@ -1,25 +1,18 @@
-use super::super::body::StreamingBody;
-use super::super::response;
-use super::RequestContext;
+use super::super::response::{self, ResponseSpec};
 use crate::error::Result;
-use hyper::Response;
 
 pub(super) fn handle_speedtest(
     testsize: u32,
     valid: bool,
     forbidden: bool,
     head_only: bool,
-    ctx: RequestContext,
-) -> Result<Response<StreamingBody>> {
+) -> Result<ResponseSpec> {
     if valid {
-        if !head_only && ctx.client.is_normal_hath_connection() {
-            ctx.state.stats.record_bytes_sent(testsize as u64);
-        }
         if head_only {
             // Java: speedtest inherits CONTENT_TYPE_DEFAULT = text/html
             response::head_response("text/html; charset=iso-8859-1", testsize as usize)
         } else {
-            response::speedtest_response(testsize as usize, ctx.client.bwm)
+            response::speedtest_response(testsize as usize)
         }
     } else if forbidden {
         // Java: responseStatusCode = 403 for expired or invalid key

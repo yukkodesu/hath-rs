@@ -39,6 +39,11 @@ pub(super) fn save(config: &Config, state: &PersistentCacheState) -> Result<()> 
     let lru_path = config.data_dir.join("pcache_lru");
     let info_path = config.data_dir.join("pcache_info");
 
+    // `pcache_info` is the publish marker. Remove any old marker before
+    // writing so an interrupted save can only force a rescan, never validate
+    // stale companion files.
+    remove_if_exists(&info_path)?;
+
     let ages_data = bincode::serialize(&state.static_range_ages)
         .map_err(|e| HathError::Cache(format!("Failed to serialize ages: {}", e)))?;
     fs::write(&ages_path, &ages_data)
@@ -59,6 +64,29 @@ pub(super) fn save(config: &Config, state: &PersistentCacheState) -> Result<()> 
         .map_err(|e| HathError::Cache(format!("Failed to write info: {}", e)))?;
 
     Ok(())
+}
+
+/// Remove every persistent cache artifact.
+///
+/// Java deletes this set after deciding whether startup can reuse it. A later
+/// clean shutdown is the only point at which a new set becomes authoritative.
+pub(super) fn clear(config: &Config) -> Result<()> {
+    for name in ["pcache_info", "pcache_ages", "pcache_lru"] {
+        remove_if_exists(&config.data_dir.join(name))?;
+    }
+    Ok(())
+}
+
+fn remove_if_exists(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(HathError::Cache(format!(
+            "Failed to remove persistent cache file {}: {}",
+            path.display(),
+            e
+        ))),
+    }
 }
 
 /// Java: `CacheHandler.loadPersistentData()`
@@ -234,5 +262,19 @@ mod tests {
         assert_eq!(loaded.static_range_ages.get("abcd"), Some(&1234));
         assert_eq!(loaded.lru_cache_table, state.lru_cache_table);
         assert!(temp.path().join("pcache_info").exists());
+    }
+
+    #[test]
+    fn clear_removes_every_persistent_cache_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = config_for_data_dir(temp.path());
+        let state = PersistentCacheState::default();
+
+        save(&config, &state).unwrap();
+        clear(&config).unwrap();
+
+        for name in ["pcache_info", "pcache_ages", "pcache_lru"] {
+            assert!(!temp.path().join(name).exists(), "{name} should be removed");
+        }
     }
 }

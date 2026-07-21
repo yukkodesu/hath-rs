@@ -1,3 +1,4 @@
+use super::peer;
 use crate::config::Config;
 use crate::hvfile::HVFile;
 use crate::utils::{self, Additional, parse_additional};
@@ -95,7 +96,7 @@ fn parse_file_serve(url_parts: &[&str], config: &Config, head_only: bool) -> Req
 }
 
 fn parse_server_command(url_parts: &[&str], client_ip: IpAddr, config: &Config) -> RequestType {
-    let is_from_rpc = config.rpc_servers.contains(&client_ip) || config.disable_ip_origin_check;
+    let is_from_rpc = peer::is_rpc_authorized(client_ip, config);
 
     if url_parts.len() < 6 {
         return RequestType::ServerCommand {
@@ -258,5 +259,31 @@ mod tests {
     fn test_keystamp_without_separator() {
         let c = test_config();
         assert!(!validate_keystamp("test", Some("noseparator"), &c));
+    }
+
+    #[test]
+    fn servercmd_authorization_uses_the_current_config_snapshot() {
+        let mut authorized = test_config();
+        let peer_ip: IpAddr = "203.0.113.9".parse().unwrap();
+        authorized.rpc_servers.push(peer_ip);
+        let command_time = authorized.server_time();
+        let key = utils::sha1_string(&format!(
+            "hentai@home-servercmd-still_alive--{}-{}-{}",
+            authorized.client_id.0,
+            command_time,
+            authorized.client_key.as_str()
+        ));
+        let path = format!("/servercmd/still_alive//{command_time}/{key}");
+
+        assert!(matches!(
+            parse_request("GET", &path, peer_ip, &authorized),
+            RequestType::ServerCommand { valid: true, .. }
+        ));
+
+        authorized.rpc_servers.clear();
+        assert!(matches!(
+            parse_request("GET", &path, peer_ip, &authorized),
+            RequestType::ServerCommand { valid: false, .. }
+        ));
     }
 }

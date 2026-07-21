@@ -1,11 +1,10 @@
-use super::super::body::StreamingBody;
 use super::super::proxy_transfer::ProxyTransfer;
-use super::super::response;
+use super::super::response::{self, ResponseSpec};
 use super::RequestContext;
 use crate::error::Result;
 use crate::hvfile::HVFile;
 use crate::utils::Additional;
-use hyper::{Response, StatusCode};
+use hyper::StatusCode;
 use reqwest::Url;
 
 pub(super) async fn handle_file_serve(
@@ -15,7 +14,7 @@ pub(super) async fn handle_file_serve(
     keystamp_valid: bool,
     head_only: bool,
     ctx: RequestContext,
-) -> Result<Response<StreamingBody>> {
+) -> Result<ResponseSpec> {
     // Java validates fileindex/xres BEFORE cache hit check
     // (line 194 in HTTPResponse.processRequest). Even a cached
     // file with missing/invalid arguments returns 404.
@@ -53,20 +52,13 @@ pub(super) async fn handle_file_serve(
         let verify = recently_accessed
             && !ctx.config.disable_file_verification
             && !ctx.state.cache.is_file_verification_on_cooldown();
-        let stats = if ctx.client.is_normal_hath_connection() {
-            Some(ctx.state.stats.clone())
-        } else {
-            None
-        };
         return response::file_response(
             hv,
             &ctx.config.cache_dir,
             head_only,
             ctx.state.stats.clone(),
-            ctx.client.bwm,
             verify,
             Some(ctx.state.cache.clone()),
-            stats,
         );
     }
 
@@ -100,16 +92,7 @@ pub(super) async fn handle_file_serve(
                 )
                 .await
                 {
-                    Ok(proxy) => {
-                        // Stats for proxy are recorded in body's finish_with()
-                        // after actual transmission - Java: proxyThreadCompleted().
-                        let proxy_stats = if ctx.client.is_normal_hath_connection() {
-                            Some(ctx.state.stats.clone())
-                        } else {
-                            None
-                        };
-                        proxy.into_response(head_only, ctx.client.bwm, proxy_stats)
-                    }
+                    Ok(proxy) => proxy.into_response(head_only, ctx.state.stats.clone()),
                     Err(e) => {
                         tracing::warn!("Proxy download failed for {}: {}", fileid, e);
                         if let crate::error::HathError::ProxyDownloader { status, message } = e {
@@ -139,7 +122,6 @@ mod tests {
     use crate::cache::CacheHandler;
     use crate::rpc_client::RpcClient;
     use crate::server::AppState;
-    use crate::server::handler::RequestClientContext;
     use crate::stats::Stats;
     use crate::test_support::FixtureDirs;
     use arc_swap::{ArcSwap, ArcSwapOption};
@@ -213,7 +195,6 @@ mod tests {
             true,
             RequestContext {
                 config: state.config.load_full(),
-                client: RequestClientContext::new(false, false, None),
                 state: state.clone(),
             },
         )
