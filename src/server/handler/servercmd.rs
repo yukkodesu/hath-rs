@@ -1,12 +1,11 @@
 use super::super::AppState;
-use super::super::body::StreamingBody;
-use super::super::response;
+use super::super::response::{self, ResponseSpec};
 use super::super::threaded_proxy::run_threaded_proxy_test;
 use crate::bandwidth::BandwidthMonitor;
 use crate::config::Config;
 use crate::error::Result;
 use crate::utils;
-use hyper::{Response, StatusCode};
+use hyper::StatusCode;
 use std::sync::Arc;
 
 /// Helper for `threaded_proxy_test`: extract required params from Additional,
@@ -41,8 +40,7 @@ pub(super) async fn handle_server_command(
     command: &str,
     additional: &str,
     state: &AppState,
-    bwm: Option<Arc<BandwidthMonitor>>,
-) -> Result<Response<StreamingBody>> {
+) -> Result<ResponseSpec> {
     match command.to_lowercase().as_str() {
         "still_alive" => {
             response::text_response(StatusCode::OK, "I feel FANTASTIC and I'm still alive")
@@ -91,7 +89,7 @@ pub(super) async fn handle_server_command(
             // testsize is read from addTable with default 1_000_000. No upper limit.
             let add = utils::parse_additional(additional);
             let testsize: usize = required_param!(add, testsize, usize, default 1_000_000);
-            response::speedtest_response(testsize, bwm)
+            response::speedtest_response(testsize)
         }
         "refresh_settings" => {
             match state.rpc_client.refresh_settings().await {

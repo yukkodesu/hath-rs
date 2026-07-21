@@ -1,12 +1,11 @@
 use super::body::StreamingBody;
-use super::response;
-use crate::bandwidth::BandwidthMonitor;
+use super::response::{self, ResponseSpec};
 use crate::cache::CacheHandler;
 use crate::config::Config;
 use crate::error::Result;
 use crate::proxy_downloader::ProxyFileDownloader;
 use crate::stats::Stats;
-use hyper::{Response, StatusCode};
+use hyper::StatusCode;
 use std::sync::Arc;
 
 pub(crate) struct ProxyTransfer {
@@ -41,9 +40,8 @@ impl ProxyTransfer {
     pub(crate) fn into_response(
         self,
         head_only: bool,
-        bwm: Option<Arc<BandwidthMonitor>>,
-        stats: Option<Arc<Stats>>,
-    ) -> Result<Response<StreamingBody>> {
+        file_stats: Arc<Stats>,
+    ) -> Result<ResponseSpec> {
         let Self {
             fileid,
             content_length,
@@ -67,8 +65,12 @@ impl ProxyTransfer {
             }
         };
 
-        let body =
-            StreamingBody::new_proxy(content_length, file, parts.into_body_source(), bwm, stats);
+        let body = StreamingBody::new_proxy(
+            content_length,
+            file,
+            parts.into_body_source(),
+            Some(file_stats),
+        );
         let response = response::proxy_body_response(&content_type, content_length, body);
 
         if response.is_ok() {

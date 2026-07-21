@@ -108,6 +108,14 @@ Deepen an HTTP response-policy Module which turns semantic outcomes into a
 fully assembled response and its associated header accounting. Preserve
 existing behaviour first with golden response tests, then migrate callers.
 
+Decision (2026-07-21): Hyper owns the final HTTP wire representation. The
+response-policy Module should make a best-effort response from Hyper's status
+and header model, rather than reproduce Java reason phrases, error text, or
+header ordering byte-for-byte. Flow control and statistics are different: they
+must be exact with respect to the final response model and each body frame
+actually produced, including internal-error and incomplete-body paths.
+This deliberate scope is recorded in `docs/adr/0001-hyper-wire-best-effort.md`.
+
 Benefits:
 
 - Locality: status, headers, cache semantics, error modes, and accounting are

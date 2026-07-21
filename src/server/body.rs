@@ -82,8 +82,10 @@ pub struct StreamingBody {
     /// Whether a throttle just completed (prevents double-throttle for same chunk).
     throttled: bool,
     completion: BodyCompletion,
-    /// When set, record stats on body completion. None for text/speedtest responses.
-    stats: Option<Arc<Stats>>,
+    /// Records each body frame produced for a remote Peer.
+    traffic_stats: Option<Arc<Stats>>,
+    /// Java proxy completion records a file sent independently of traffic bytes.
+    proxy_file_stats: Option<Arc<Stats>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,19 +136,17 @@ pub struct FileBodyParams {
     pub expected_hash: String,
     pub verify: bool,
     pub cache_handler: Option<Arc<crate::cache::CacheHandler>>,
-    pub bwm: Option<Arc<BandwidthMonitor>>,
-    pub stats: Option<Arc<Stats>>,
 }
 
 impl StreamingBody {
     /// Create a new static body from pre-loaded data (zero-copy for `Bytes::from_static`).
-    pub fn new(data: Bytes, bwm: Option<Arc<BandwidthMonitor>>) -> Self {
-        Self::from_bytes(data, bwm)
+    pub fn new(data: Bytes) -> Self {
+        Self::from_bytes(data)
     }
 
     /// Zero-allocation empty body (for HEAD responses).
     pub fn empty() -> Self {
-        Self::from_bytes(Bytes::new(), None)
+        Self::from_bytes(Bytes::new())
     }
 
     /// Create a file-streaming body from an already-open file handle.
@@ -162,41 +162,44 @@ impl StreamingBody {
             },
             offset: 0,
             total_size: p.total_size,
-            bwm: p.bwm,
+            bwm: None,
             throttle_fut: None,
             throttled: false,
             completion: BodyCompletion::Running,
-            stats: p.stats,
+            traffic_stats: None,
+            proxy_file_stats: None,
         }
     }
 
     /// Create a body that serves random-looking chunks from a reusable 8 KiB pool.
-    pub fn new_random(total_size: usize, bwm: Option<Arc<BandwidthMonitor>>) -> Self {
+    pub fn new_random(total_size: usize) -> Self {
         let mut random_bytes = vec![0; SPEEDTEST_RANDOM_LENGTH].into_boxed_slice();
         rand::rng().fill_bytes(&mut random_bytes);
         Self {
             source: DataSource::Random { random_bytes },
             offset: 0,
             total_size,
-            bwm,
+            bwm: None,
             throttle_fut: None,
             throttled: false,
             completion: BodyCompletion::Running,
-            stats: None,
+            traffic_stats: None,
+            proxy_file_stats: None,
         }
     }
 
-    fn from_bytes(data: Bytes, bwm: Option<Arc<BandwidthMonitor>>) -> Self {
+    fn from_bytes(data: Bytes) -> Self {
         let total_size = data.len();
         Self {
             source: DataSource::Static { data },
             offset: 0,
             total_size,
-            bwm,
+            bwm: None,
             throttle_fut: None,
             throttled: false,
             completion: BodyCompletion::Running,
-            stats: None,
+            traffic_stats: None,
+            proxy_file_stats: None,
         }
     }
 
@@ -207,8 +210,7 @@ impl StreamingBody {
         total_size: usize,
         file: std::fs::File,
         source: ProxyBodySource,
-        bwm: Option<Arc<BandwidthMonitor>>,
-        stats: Option<Arc<Stats>>,
+        proxy_file_stats: Option<Arc<Stats>>,
     ) -> Self {
         let (temp_file, watch_rx, proxy_done_tx) = source.into_components();
         Self {
@@ -222,12 +224,23 @@ impl StreamingBody {
             },
             offset: 0,
             total_size,
-            bwm,
+            bwm: None,
             throttle_fut: None,
             throttled: false,
             completion: BodyCompletion::Running,
-            stats,
+            traffic_stats: None,
+            proxy_file_stats,
         }
+    }
+
+    /// Configure remote traffic accounting after response policy finalization.
+    pub(crate) fn enable_traffic_accounting(&mut self, stats: Arc<Stats>) {
+        self.traffic_stats = Some(stats);
+    }
+
+    /// Configure body-frame flow control after response policy finalization.
+    pub(crate) fn enable_flow_control(&mut self, bwm: Arc<BandwidthMonitor>) {
+        self.bwm = Some(bwm);
     }
 }
 
@@ -285,16 +298,12 @@ impl StreamingBody {
             }
         }
 
-        // Record stats after actual transmission, not at response construction time.
-        // Java: fileSent() in proxyThreadCompleted() (proxy) / initialize() (file, we align
-        // to complete); bytesSent() after each socket write — we use actual offset sent.
-        if completed && let Some(stats) = self.stats.take() {
-            if matches!(self.source, DataSource::Proxy { .. }) {
-                // Java: Stats.fileSent() in proxyThreadCompleted()
-                stats.record_file_sent();
-            }
-            // bytesSent: actual bytes transmitted, not declared content-length
-            stats.record_bytes_sent(self.offset as u64);
+        if completed
+            && matches!(self.source, DataSource::Proxy { .. })
+            && let Some(stats) = self.proxy_file_stats.take()
+        {
+            // Java: Stats.fileSent() in proxyThreadCompleted().
+            stats.record_file_sent();
         }
     }
 
@@ -569,6 +578,9 @@ impl Body for StreamingBody {
 
             match result {
                 ChunkResult::Data(chunk) => {
+                    if let Some(stats) = &self.traffic_stats {
+                        stats.record_bytes_sent(chunk.len() as u64);
+                    }
                     self.offset += chunk.len();
                     return Poll::Ready(Some(Ok(Frame::data(chunk))));
                 }
@@ -610,8 +622,6 @@ mod tests {
             expected_hash: "0000000000000000000000000000000000000000".to_string(),
             verify: true,
             cache_handler: None,
-            bwm: None,
-            stats: None,
         });
         body.offset = 4;
         body.finish();
@@ -638,8 +648,6 @@ mod tests {
             expected_hash: "0000000000000000000000000000000000000000".to_string(),
             verify: false,
             cache_handler: None,
-            bwm: None,
-            stats: None,
         });
 
         let frame = body.frame().await.unwrap().unwrap();
@@ -678,7 +686,7 @@ mod tests {
         let (done_tx, _done_rx) = oneshot::channel();
 
         let source = ProxyBodySource::for_test(path.clone(), rx, done_tx);
-        let mut body = StreamingBody::new_proxy(10, file, source, None, None);
+        let mut body = StreamingBody::new_proxy(10, file, source, None);
         let collected = collect_body(&mut body).await;
         assert_eq!(collected, b"helloworld");
         assert_eq!(
@@ -699,7 +707,7 @@ mod tests {
         let (done_tx, _done_rx) = oneshot::channel();
 
         let source = ProxyBodySource::for_test(path.clone(), rx, done_tx);
-        let mut body = StreamingBody::new_proxy(100, file, source, None, None);
+        let mut body = StreamingBody::new_proxy(100, file, source, None);
 
         // Advance: body will read 7 bytes then watch shows Failed.
         let handle = tokio::spawn(async move {
@@ -729,7 +737,8 @@ mod tests {
         let stats = Arc::new(Stats::new());
 
         let source = ProxyBodySource::for_test(path.clone(), rx, done_tx);
-        let mut body = StreamingBody::new_proxy(10, file, source, None, Some(stats.clone()));
+        let mut body = StreamingBody::new_proxy(10, file, source, Some(stats.clone()));
+        body.enable_traffic_accounting(stats.clone());
         let collected = collect_body(&mut body).await;
         assert_eq!(collected, b"helloworld");
         assert_eq!(stats.files_sent.load(Ordering::Relaxed), 1);
@@ -739,6 +748,26 @@ mod tests {
         assert_eq!(stats.files_sent.load(Ordering::Relaxed), 1);
         assert_eq!(stats.bytes_sent.load(Ordering::Relaxed), 10);
         drop(tx);
+    }
+
+    #[tokio::test]
+    async fn traffic_stats_include_frames_produced_before_body_is_dropped() {
+        let stats = Arc::new(Stats::new());
+        let mut body = StreamingBody::new_random(TCP_PACKET_SIZE * 2);
+        body.enable_traffic_accounting(stats.clone());
+
+        let frame = body.frame().await.unwrap().unwrap();
+        assert_eq!(frame.into_data().unwrap().len(), TCP_PACKET_SIZE);
+        assert_eq!(
+            stats.bytes_sent.load(Ordering::Relaxed),
+            TCP_PACKET_SIZE as u64
+        );
+
+        drop(body);
+        assert_eq!(
+            stats.bytes_sent.load(Ordering::Relaxed),
+            TCP_PACKET_SIZE as u64
+        );
     }
 
     /// Simulates P0-01 body-stage retry: InProgress resets to 0 (file truncated,
@@ -755,7 +784,7 @@ mod tests {
         let (done_tx, _done_rx) = oneshot::channel();
 
         let source = ProxyBodySource::for_test(path.clone(), rx, done_tx);
-        let mut body = StreamingBody::new_proxy(20, file, source, None, None);
+        let mut body = StreamingBody::new_proxy(20, file, source, None);
 
         // Spawn the body consumer.
         let handle = tokio::spawn(async move {
