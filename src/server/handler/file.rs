@@ -53,7 +53,7 @@ pub(super) async fn handle_file_serve(
         let verify = recently_accessed
             && !ctx.config.disable_file_verification
             && !ctx.state.cache.is_file_verification_on_cooldown();
-        let stats = if ctx.client.is_normal_hath_connection() {
+        let stats = if ctx.client.records_traffic() {
             Some(ctx.state.stats.clone())
         } else {
             None
@@ -103,7 +103,7 @@ pub(super) async fn handle_file_serve(
                     Ok(proxy) => {
                         // Stats for proxy are recorded in body's finish_with()
                         // after actual transmission - Java: proxyThreadCompleted().
-                        let proxy_stats = if ctx.client.is_normal_hath_connection() {
+                        let proxy_stats = if ctx.client.records_traffic() {
                             Some(ctx.state.stats.clone())
                         } else {
                             None
@@ -213,7 +213,7 @@ mod tests {
             true,
             RequestContext {
                 config: state.config.load_full(),
-                client: RequestClientContext::new(false, false, None),
+                client: RequestClientContext::new(false, None),
                 state: state.clone(),
             },
         )

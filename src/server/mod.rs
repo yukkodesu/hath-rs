@@ -2,6 +2,7 @@ mod admission;
 mod body;
 mod handler;
 mod middleware;
+mod peer;
 mod proxy_transfer;
 mod request;
 mod response;
@@ -21,17 +22,14 @@ use crate::config::Config;
 use crate::error::{HathError, Result};
 use crate::rpc_client::RpcClient;
 use crate::stats::Stats;
-use crate::utils;
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use dashmap::DashMap;
 use hyper::server::conn::http1;
 use hyper_util::rt::TokioIo;
 use openssl::ssl::SslContext;
-use regex::Regex;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
@@ -78,8 +76,8 @@ pub(crate) struct AppState {
     pub(crate) proxy_client: Arc<reqwest::Client>,
 }
 
-static LOCAL_NETWORK_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|169\.254\.|::1|0:0:0:0:0:0:0:1|fc|fd)")
+static LOCAL_NETWORK_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|169\.254\.|::1|0:0:0:0:0:0:0:1|fc|fd)")
         .expect("invalid regex")
 });
 
@@ -226,11 +224,6 @@ async fn run_server(
 
                 let conn_state = state.clone();
                 tokio::spawn(async move {
-                    // Normalize IPv4-mapped IPv6 (::ffff:a.b.c.d) → plain IPv4.
-                    // Must happen inside the task so host_addr is available after
-                    // the TLS handshake for the allow/flood-control checks below.
-                    let host_addr = utils::normalize_ip(remote_addr.ip()).to_string().to_lowercase();
-
                     // --- TLS handshake first (matches Java: SSLServerSocket.accept()
                     //     completes the handshake before any policy checks are applied) ---
                     let ssl = match openssl::ssl::Ssl::new(ssl_context.as_ref()) {
@@ -259,11 +252,12 @@ async fn run_server(
 
                     // --- Post-handshake policy checks (Java: HTTPServer.run() order) ---
                     let cfg = conn_state.config.load_full();
+                    let origin = peer::SessionOrigin::from_remote_addr(remote_addr, &cfg);
                     admission::configure_send_buffer(tls_stream.get_ref(), &cfg);
                     let admission = match admission::admit_connection(
                         &conn_state,
                         remote_addr,
-                        &host_addr,
+                        origin,
                         &cfg,
                     )
                     .await
@@ -283,7 +277,7 @@ async fn run_server(
                     let service = AccessLogService::new(
                         HathService {
                             state: conn_state.clone(),
-                            remote_addr,
+                            origin,
                             session: session_handle.clone(),
                         },
                         conn_id,

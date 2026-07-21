@@ -1,5 +1,6 @@
+use super::AppState;
 use super::middleware::session::{SessionAdmitError, SessionGuard, SessionHandle};
-use super::{AppState, LOCAL_NETWORK_RE};
+use super::peer::{self, SessionOrigin};
 use crate::config::Config;
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
@@ -66,12 +67,6 @@ pub(crate) enum AdmissionRejection {
     MaxConnectionsExceeded { max_connections: u32 },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PeerClassification {
-    is_local: bool,
-    is_rpc: bool,
-}
-
 pub(crate) fn configure_send_buffer(stream: &TcpStream, config: &Config) {
     if config.throttle_bytes == 0 {
         return;
@@ -97,28 +92,18 @@ pub(crate) fn configure_send_buffer(stream: &TcpStream, config: &Config) {
     }
 }
 
-fn classify_peer(host_addr: &str, config: &Config) -> PeerClassification {
-    let is_local = LOCAL_NETWORK_RE.is_match(host_addr) || config.client_host == host_addr;
-    // Java: isValidRPCServer returns true when disableIPOriginCheck is set.
-    let is_rpc = config.disable_ip_origin_check
-        || config
-            .rpc_servers
-            .iter()
-            .any(|s| s.to_string().to_lowercase() == host_addr);
-
-    PeerClassification { is_local, is_rpc }
-}
-
 pub(crate) async fn admit_connection(
     state: &AppState,
     remote_addr: SocketAddr,
-    host_addr: &str,
+    origin: SessionOrigin,
     config: &Config,
 ) -> AdmissionOutcome {
-    let PeerClassification { is_local, is_rpc } = classify_peer(host_addr, config);
+    let rpc_authorized = peer::is_rpc_authorized(origin.peer_ip(), config);
+    let admission_class = origin.admission_class(rpc_authorized);
+    let host_addr = origin.peer_ip();
 
     let allow = state.allow_normal_connections.load(Ordering::Relaxed);
-    if !allow && !is_rpc {
+    if !allow && !rpc_authorized {
         tracing::warn!(
             "Rejecting connection from {} during startup (rpc_servers={:?})",
             host_addr,
@@ -127,7 +112,7 @@ pub(crate) async fn admit_connection(
         return AdmissionOutcome::Rejected(AdmissionRejection::Startup);
     }
 
-    if !is_local && !is_rpc && !config.disable_flood_control {
+    if matches!(admission_class, peer::AdmissionClass::Limited) && !config.disable_flood_control {
         let mut entry = state
             .flood_control
             .entry(host_addr.to_string())
@@ -143,11 +128,11 @@ pub(crate) async fn admit_connection(
     }
 
     let conn_id = state.next_conn_id.fetch_add(1, Ordering::Relaxed) + 1;
-    let max_conns = state.config.load().max_connections();
+    let max_conns = config.max_connections();
     let admission =
         match state
             .session_manager
-            .admit(conn_id, remote_addr, is_local, is_rpc, max_conns)
+            .admit(conn_id, remote_addr, admission_class, max_conns)
         {
             Ok(admission) => admission,
             Err(SessionAdmitError::MaxConnectionsExceeded { max_connections }) => {
@@ -161,21 +146,22 @@ pub(crate) async fn admit_connection(
             }
         };
 
-    if let Some(prev) = admission.active_before {
-        if prev > (max_conns as f64 * 0.8) as u32 && prev > 0 {
-            tracing::warn!(
-                "Near connection limit: {} / {} active connections",
-                prev + 1,
-                max_conns
-            );
-            let now = Instant::now();
-            let mut last = state.last_overload_notification.lock().await;
-            let should_notify = last.is_none_or(|t| now - t >= Duration::from_secs(30));
-            if should_notify {
-                *last = Some(now);
-                drop(last);
-                let _ = state.rpc_client.notify_overload().await;
-            }
+    if let Some(prev) = admission.active_before
+        && prev > (max_conns as f64 * 0.8) as u32
+        && prev > 0
+    {
+        tracing::warn!(
+            "Near connection limit: {} / {} active connections",
+            prev + 1,
+            max_conns
+        );
+        let now = Instant::now();
+        let mut last = state.last_overload_notification.lock().await;
+        let should_notify = last.is_none_or(|t| now - t >= Duration::from_secs(30));
+        if should_notify {
+            *last = Some(now);
+            drop(last);
+            let _ = state.rpc_client.notify_overload().await;
         }
     }
 

@@ -1,20 +1,19 @@
+use super::AppState;
 use super::body::StreamingBody;
 use super::handler::{RequestClientContext, RequestContext, handle_request};
 use super::middleware::session::SessionHandle;
+use super::peer::SessionOrigin;
 use super::request::{self, RequestType};
-use super::{AppState, LOCAL_NETWORK_RE};
-use crate::utils;
 use hyper::body::Incoming;
 use hyper::header;
 use hyper::service::Service;
 use hyper::{Request, Response};
 use std::future::Future;
-use std::net::SocketAddr;
 use std::pin::Pin;
 
 pub(crate) struct HathService {
     pub(crate) state: AppState,
-    pub(crate) remote_addr: SocketAddr,
+    pub(crate) origin: SessionOrigin,
     pub(crate) session: SessionHandle,
 }
 
@@ -26,28 +25,17 @@ impl Service<Request<Incoming>> for HathService {
 
     fn call(&self, req: Request<Incoming>) -> Self::Future {
         let state = self.state.clone();
-        let remote_addr = self.remote_addr;
+        let origin = self.origin;
         let session = self.session.clone();
 
         Box::pin(async move {
             // Load config once for this request (owned Arc, safe across .await)
             let config = state.config.load_full();
 
-            // Normalize IPv4-mapped IPv6 to plain IPv4 (dual-stack listener).
-            let client_ip = utils::normalize_ip(remote_addr.ip());
-
-            // Determine if this is a local/RPC connection (skip bandwidth throttling)
-            let host_addr = client_ip.to_string().to_lowercase();
-            let is_local = LOCAL_NETWORK_RE.is_match(&host_addr) || config.client_host == host_addr;
-            let is_rpc = config
-                .rpc_servers
-                .iter()
-                .any(|s| s.to_string().to_lowercase() == host_addr);
-
             // Determine bandwidth monitor for this request.
             // Java: Only local connections skip throttling.
             // RPC servers on non-local IPs are still throttled.
-            let bwm_for_request = if is_local {
+            let bwm_for_request = if origin.is_local() {
                 None
             } else {
                 state.bandwidth_monitor.load_full()
@@ -59,7 +47,7 @@ impl Service<Request<Incoming>> for HathService {
                     .path_and_query()
                     .map(|p| p.as_str())
                     .unwrap_or("/"),
-                client_ip,
+                origin.peer_ip(),
                 &config,
             );
             match &request_type {
@@ -75,7 +63,7 @@ impl Service<Request<Incoming>> for HathService {
                 RequestContext {
                     state: state.clone(),
                     config: config.clone(),
-                    client: RequestClientContext::new(is_local, is_rpc, bwm_for_request),
+                    client: RequestClientContext::new(origin.is_local(), bwm_for_request),
                 },
             )
             .await;
@@ -116,7 +104,7 @@ impl Service<Request<Incoming>> for HathService {
                 if let Some(ref bwm) = bwm_for_header {
                     bwm.wait_for_quota(total_header_bytes).await;
                 }
-                if !is_local {
+                if !origin.is_local() {
                     state.stats.record_bytes_sent(total_header_bytes as u64);
                 }
             }

@@ -12,7 +12,7 @@ pub(super) fn handle_speedtest(
     ctx: RequestContext,
 ) -> Result<Response<StreamingBody>> {
     if valid {
-        if !head_only && ctx.client.is_normal_hath_connection() {
+        if !head_only && ctx.client.records_traffic() {
             ctx.state.stats.record_bytes_sent(testsize as u64);
         }
         if head_only {

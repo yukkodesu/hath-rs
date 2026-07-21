@@ -19,21 +19,16 @@ use self::speedtest::handle_speedtest;
 #[derive(Clone)]
 pub(crate) struct RequestClientContext {
     pub(crate) is_local: bool,
-    pub(crate) is_rpc: bool,
     pub(crate) bwm: Option<Arc<BandwidthMonitor>>,
 }
 
 impl RequestClientContext {
-    pub(crate) fn new(is_local: bool, is_rpc: bool, bwm: Option<Arc<BandwidthMonitor>>) -> Self {
-        Self {
-            is_local,
-            is_rpc,
-            bwm,
-        }
+    pub(crate) fn new(is_local: bool, bwm: Option<Arc<BandwidthMonitor>>) -> Self {
+        Self { is_local, bwm }
     }
 
-    pub(crate) fn is_normal_hath_connection(&self) -> bool {
-        !self.is_local && !self.is_rpc
+    pub(crate) fn records_traffic(&self) -> bool {
+        !self.is_local
     }
 }
 
@@ -86,9 +81,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn request_client_context_identifies_normal_hath_connections() {
-        assert!(RequestClientContext::new(false, false, None).is_normal_hath_connection());
-        assert!(!RequestClientContext::new(true, false, None).is_normal_hath_connection());
-        assert!(!RequestClientContext::new(false, true, None).is_normal_hath_connection());
+    fn traffic_policy_exempts_only_local_peers() {
+        assert!(RequestClientContext::new(false, None).records_traffic());
+        assert!(!RequestClientContext::new(true, None).records_traffic());
     }
 }
