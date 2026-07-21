@@ -27,8 +27,6 @@ pub(super) struct PruneResult {
     pub(super) file_count: usize,
     /// Oldest last-modified timestamp among remaining files.
     pub(super) oldest_last_modified: u64,
-    pub(super) files_deleted: usize,
-    pub(super) bytes_deleted: u64,
 }
 
 /// The recommended action after checking cache state.

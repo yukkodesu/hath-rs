@@ -236,10 +236,20 @@ pub async fn run() -> Result<()> {
     }
     tokio::time::sleep(Duration::from_secs(1)).await;
     server::stop_server(&app_state).await;
-    if let Some(background_tasks) = background_tasks {
-        background_tasks.join_for(Duration::from_secs(5)).await;
+    let background_tasks_stopped = if let Some(background_tasks) = background_tasks {
+        background_tasks.join_for(Duration::from_secs(5)).await
+    } else {
+        true
+    };
+    if background_tasks_stopped {
+        cache.save_persistent_data();
+    } else {
+        tracing::warn!(
+            "Skipping persistent cache save because background shutdown was incomplete; \
+             the next startup will rescan the cache"
+        );
+        cache.discard_persistent_data();
     }
-    cache.save_persistent_data();
     {
         let cfg = config.load();
         cfg.save_client_login().ok();
@@ -316,9 +326,9 @@ impl BackgroundTasks {
         self.tasks.push_back(BackgroundTask { name, handle });
     }
 
-    async fn join_for(mut self, timeout: Duration) {
+    async fn join_for(mut self, timeout: Duration) -> bool {
         if self.tasks.is_empty() {
-            return;
+            return true;
         }
 
         let deadline = tokio::time::sleep(timeout);
@@ -327,10 +337,12 @@ impl BackgroundTasks {
         while let Some(mut task) = self.tasks.pop_front() {
             tokio::select! {
                 result = &mut task.handle => {
-                    if let Err(e) = result
-                        && !e.is_cancelled()
-                    {
-                        tracing::warn!("Background task {} exited with error: {}", task.name, e);
+                    if let Err(e) = result {
+                        if !e.is_cancelled() {
+                            tracing::warn!("Background task {} exited with error: {}", task.name, e);
+                        }
+                        self.abort_remaining();
+                        return false;
                     }
                 }
                 _ = &mut deadline => {
@@ -340,10 +352,11 @@ impl BackgroundTasks {
                     );
                     task.handle.abort();
                     self.abort_remaining();
-                    return;
+                    return false;
                 }
             }
         }
+        true
     }
 
     fn abort_remaining(&mut self) {
@@ -373,5 +386,18 @@ async fn shutdown_signal() {
     {
         tokio::signal::ctrl_c().await.ok();
         tracing::info!("Interrupt received, shutting down gracefully...");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn background_task_timeout_prevents_a_clean_shutdown_result() {
+        let mut tasks = BackgroundTasks::new();
+        tasks.track("never-finishes", tokio::spawn(std::future::pending()));
+
+        assert!(!tasks.join_for(Duration::from_millis(1)).await);
     }
 }

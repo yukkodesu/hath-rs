@@ -8,6 +8,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
+enum PruneExecution {
+    Completed(PruneResult),
+    Interrupted,
+}
+
 /// Java: CachePruner — runs in a background task, periodically checking
 /// whether the cache has exceeded the disk limit and pruning old files.
 ///
@@ -68,10 +73,17 @@ impl CachePruner {
             match action {
                 PruneAction::Prune(plan) => {
                     // Phase 2: execute I/O without holding any locks.
-                    let result = Self::execute_prune(&plan).await;
-                    // Phase 3: apply result (brief internal lock on static_range_oldest).
-                    self.cache.apply_prune_result(result);
-                    self.check_frequency = 0; // Re-check immediately after pruning.
+                    match self.execute_prune(&plan).await {
+                        PruneExecution::Completed(result) => {
+                            if self.shutdown.is_cancelled() {
+                                break;
+                            }
+                            // Phase 3: apply range-age metadata after a complete scan.
+                            self.cache.apply_prune_result(result);
+                            self.check_frequency = 0; // Re-check immediately after pruning.
+                        }
+                        PruneExecution::Interrupted => break,
+                    }
                 }
                 PruneAction::NoPrune { frequency } => {
                     self.check_frequency = frequency;
@@ -107,15 +119,17 @@ impl CachePruner {
 
     /// Delete files matching the prune plan. Called without any cache locks
     /// so file I/O and sleep delays don't block other cache operations.
-    async fn execute_prune(plan: &PrunePlan) -> PruneResult {
-        let mut files_deleted = 0usize;
-        let mut bytes_deleted = 0u64;
+    async fn execute_prune(&self, plan: &PrunePlan) -> PruneExecution {
+        let mut valid_files_deleted = 0usize;
         let mut oldest_last_modified = u64::MAX;
         let mut file_count = 0usize;
 
         let files = utils::list_sorted_files(&plan.range_dir);
 
         for file in &files {
+            if self.shutdown.is_cancelled() {
+                return PruneExecution::Interrupted;
+            }
             if !file.is_file() {
                 continue;
             }
@@ -127,8 +141,8 @@ impl CachePruner {
                 let filename = file.file_name().and_then(|n| n.to_str()).unwrap_or("");
                 if let Some(hv) = HVFile::from_fileid(filename) {
                     if fs::remove_file(file).is_ok() {
-                        files_deleted += 1;
-                        bytes_deleted += hv.size as u64;
+                        valid_files_deleted += 1;
+                        self.cache.record_pruned_file(&hv);
                         tracing::debug!(
                             "CacheHandler: Pruned file {} lastModified={} size={}",
                             hv.fileid(),
@@ -142,12 +156,14 @@ impl CachePruner {
                 }
 
                 // Delay between deletions to reduce disk activity bursts.
-                tokio::time::sleep(Duration::from_millis(if plan.fast_delete {
-                    100
-                } else {
-                    1000
-                }))
-                .await;
+                tokio::select! {
+                    _ = self.shutdown.cancelled() => return PruneExecution::Interrupted,
+                    _ = tokio::time::sleep(Duration::from_millis(if plan.fast_delete {
+                        100
+                    } else {
+                        1000
+                    })) => {}
+                }
             } else {
                 oldest_last_modified = oldest_last_modified.min(last_modified);
             }
@@ -161,15 +177,78 @@ impl CachePruner {
                 .as_millis() as u64;
         }
 
-        file_count -= files_deleted;
+        file_count -= valid_files_deleted;
 
-        PruneResult {
+        PruneExecution::Completed(PruneResult {
             static_range: plan.static_range.clone(),
             range_dir: plan.range_dir.clone(),
             file_count,
             oldest_last_modified,
-            files_deleted,
-            bytes_deleted,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::FixtureDirs;
+    use crate::{cache::CacheHandler, stats::Stats};
+    use std::sync::atomic::Ordering;
+
+    #[tokio::test]
+    async fn interrupted_prune_accounts_for_completed_unlinks_without_updating_range_age() {
+        let fixture = FixtureDirs::new();
+        let mut config = fixture.config();
+        config.static_ranges.insert("aabb".to_string(), 0);
+        let first = HVFile::from_fileid("aabbccddeeff00112233445566778899aabbccdd-4-jpg").unwrap();
+        let second = HVFile::from_fileid("aabbccddeeff00112233445566778899aabbccde-4-jpg").unwrap();
+        for hv in [&first, &second] {
+            let path = hv.cache_path(&config.cache_dir);
+            utils::ensure_dir(path.parent().unwrap()).unwrap();
+            fs::write(path, b"data").unwrap();
         }
+
+        let config = Arc::new(ArcSwap::from_pointee(config));
+        let cache = Arc::new(
+            CacheHandler::new(
+                config.clone(),
+                Arc::new(Stats::new()),
+                CancellationToken::new(),
+            )
+            .unwrap(),
+        );
+        let shutdown = CancellationToken::new();
+        let pruner = CachePruner::new(cache.clone(), config, shutdown.clone());
+        let plan = PrunePlan {
+            static_range: "aabb".to_string(),
+            range_dir: first
+                .cache_path(&fixture.cache_dir)
+                .parent()
+                .unwrap()
+                .to_path_buf(),
+            cutoff: crate::utils::millis_now().saturating_add(1),
+            fast_delete: false,
+        };
+
+        let task = tokio::spawn(async move { pruner.execute_prune(&plan).await });
+        for _ in 0..50 {
+            if cache.cache_count.load(Ordering::Relaxed) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(cache.cache_count.load(Ordering::Relaxed), 1);
+
+        shutdown.cancel();
+        assert!(matches!(task.await.unwrap(), PruneExecution::Interrupted));
+        assert_eq!(cache.cache_count.load(Ordering::Relaxed), 1);
+        assert_eq!(cache.cache_size.load(Ordering::Relaxed), 4);
+        assert!(
+            cache
+                .static_range_oldest
+                .lock()
+                .unwrap()
+                .contains_key("aabb")
+        );
     }
 }
