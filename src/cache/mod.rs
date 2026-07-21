@@ -413,7 +413,14 @@ impl CacheHandler {
             bytes_to_free = want_free - (cache_limit - cache_size_with_overhead);
         }
 
-        if bytes_to_free == 0 || count == 0 || range_ages.is_empty() {
+        // Java only prunes while the server currently assigns static ranges.
+        // `static_range_oldest` can contain persisted ranges from an older
+        // assignment and must not independently authorize deletion.
+        if bytes_to_free == 0
+            || count == 0
+            || config.static_range_count == 0
+            || range_ages.is_empty()
+        {
             return PruneAction::NoPrune {
                 frequency: prune_frequency(cache_limit, cache_size_with_overhead, want_free),
             };
@@ -606,5 +613,47 @@ mod tests {
 
         assert_eq!(cache.cache_count.load(Ordering::Relaxed), 0);
         assert_eq!(cache.cache_size.load(Ordering::Relaxed), 0);
+    }
+
+    fn cache_with_prunable_range(static_range_count: u32) -> (Arc<ArcSwap<Config>>, CacheHandler) {
+        let fixture = FixtureDirs::new();
+        let mut config = fixture.config();
+        config.disklimit_bytes = 1;
+        config.static_range_count = static_range_count;
+        let config = Arc::new(ArcSwap::from_pointee(config));
+        let cache = CacheHandler::new(
+            config.clone(),
+            Arc::new(Stats::new()),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .unwrap();
+        cache.cache_count.store(1, Ordering::Relaxed);
+        cache.cache_size.store(4, Ordering::Relaxed);
+        cache
+            .static_range_oldest
+            .lock()
+            .unwrap()
+            .insert("aabb".to_string(), 0);
+        (config, cache)
+    }
+
+    #[test]
+    fn prune_does_not_use_historical_range_state_without_current_assignment() {
+        let (config, cache) = cache_with_prunable_range(0);
+
+        assert!(matches!(
+            cache.check_prune_action(&config.load()),
+            PruneAction::NoPrune { .. }
+        ));
+    }
+
+    #[test]
+    fn prune_uses_historical_range_state_when_current_assignment_exists() {
+        let (config, cache) = cache_with_prunable_range(1);
+
+        match cache.check_prune_action(&config.load()) {
+            PruneAction::Prune(plan) => assert_eq!(plan.static_range, "aabb"),
+            PruneAction::NoPrune { .. } => panic!("assigned static range should be prunable"),
+        }
     }
 }
