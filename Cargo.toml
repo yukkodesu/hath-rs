@@ -3,6 +3,11 @@ name = "hath-rs"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# Keep the platform allocator as the default. Enable this feature in deployment
+# builds to evaluate mimalloc under the target workload.
+mimalloc = ["dep:mimalloc"]
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
@@ -33,6 +38,7 @@ fs2 = "0.4"
 arc-swap = "1.9.1"
 uuid = { version = "1", features = ["v7"] }
 socket2 = "0.6"
+mimalloc = { git = "https://github.com/yukkodesu/mimalloc_rust.git", rev = "4b108a9173a53a167b4d8be20f5146597d83b9c6", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
