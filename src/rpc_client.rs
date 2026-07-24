@@ -12,6 +12,28 @@ use tokio::task::JoinHandle;
 
 const KEY_EXPIRED_RETRY_LIMIT: u32 = 1;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GalleryAck {
+    pub(crate) gid: u32,
+    pub(crate) minxres: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GalleryFileRequest {
+    pub(crate) gid: u32,
+    pub(crate) page: u32,
+    pub(crate) fileindex: u32,
+    pub(crate) xres: String,
+    pub(crate) attempt: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum GalleryQueueReply {
+    NoPendingDownloads,
+    InvalidRequest,
+    Metadata(String),
+}
+
 #[derive(Debug)]
 struct RpcRequestError {
     message: String,
@@ -345,6 +367,79 @@ impl RpcClient {
         let add = format!("{};{};{}", fileindex, xres, fileid);
         self.call(Action::StaticRangeFetch, &add).await
     }
+
+    /// Fetch the next gallery metadata document, optionally acknowledging the
+    /// preceding gallery. This endpoint returns plain text rather than the
+    /// normal "OK\n..." RPC envelope.
+    pub(crate) async fn fetch_gallery_queue(
+        &self,
+        ack: Option<&GalleryAck>,
+    ) -> Result<GalleryQueueReply> {
+        let add = ack
+            .map(|ack| format!("{};{}", ack.gid, ack.minxres))
+            .unwrap_or_default();
+        let cfg = self.config.load();
+        let selected_host = self.router.select_host(&cfg);
+        let url = rpc::make_gallery_queue_url(&add, &cfg, &selected_host)?;
+        let host = url.host_str().unwrap_or("unknown").to_string();
+
+        let body = match Self::send_rpc_request(&self.http, url).await {
+            Ok(body) => body,
+            Err(e) => {
+                self.router.mark_failed(host.clone());
+                return Err(HathError::Rpc(format!(
+                    "gallery queue request failed: {}",
+                    e
+                )));
+            }
+        };
+        self.router.mark_success(host);
+        match body.trim_end_matches(['\r', '\n']) {
+            "NO_PENDING_DOWNLOADS" => Ok(GalleryQueueReply::NoPendingDownloads),
+            "INVALID_REQUEST" => Ok(GalleryQueueReply::InvalidRequest),
+            _ => Ok(GalleryQueueReply::Metadata(body)),
+        }
+    }
+
+    /// Request the one-time source URL for a gallery file.
+    pub(crate) async fn fetch_gallery_file_url(&self, request: &GalleryFileRequest) -> Result<Url> {
+        let add = format!(
+            "{};{};{};{};{}",
+            request.gid, request.page, request.fileindex, request.xres, request.attempt
+        );
+        let response = self.call(Action::DownloaderFetch, &add).await?;
+        if response.status != ResponseStatus::Ok {
+            return Err(HathError::Rpc(format!(
+                "dlfetch failed: {}",
+                response.fail_code.unwrap_or_default()
+            )));
+        }
+        let source = response
+            .lines
+            .iter()
+            .find(|line| !line.is_empty())
+            .ok_or_else(|| HathError::Rpc("dlfetch returned no URL".into()))?;
+        Url::parse(source).map_err(|e| HathError::Rpc(format!("invalid dlfetch URL: {}", e)))
+    }
+
+    /// Best-effort report of failed gallery source hosts. The caller enforces
+    /// de-duplication and the protocol's 50-entry cap.
+    pub(crate) async fn report_gallery_failures(&self, failures: &[String]) -> Result<()> {
+        if failures.is_empty() {
+            return Ok(());
+        }
+        let response = self
+            .call(Action::DownloaderFailreport, &failures.join(";"))
+            .await?;
+        if response.status == ResponseStatus::Ok {
+            Ok(())
+        } else {
+            Err(HathError::Rpc(format!(
+                "dlfails failed: {}",
+                response.fail_code.unwrap_or_default()
+            )))
+        }
+    }
 }
 
 /// Spawn periodic still_alive heartbeat (110s interval).
@@ -518,5 +613,47 @@ mod tests {
         let requests = server.requests();
         assert_eq!(requests.len(), 2);
         assert!(requests.iter().all(|r| r.contains("act=server_stat")));
+    }
+
+    #[tokio::test]
+    async fn gallery_queue_uses_fixed_dl_path_and_acknowledges_previous_gallery() {
+        let server = FakeHttpServer::start(vec![FakeResponse::ok("NO_PENDING_DOWNLOADS")]).await;
+        let client = rpc_client_for_fake_server(&server);
+
+        let reply = client
+            .fetch_gallery_queue(Some(&GalleryAck {
+                gid: 42,
+                minxres: "org".to_string(),
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(reply, GalleryQueueReply::NoPendingDownloads);
+        let requests = server.requests();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("GET /15/dl?"));
+        assert!(requests[0].contains("act=fetchqueue"));
+        assert!(requests[0].contains("add=42;org"));
+    }
+
+    #[tokio::test]
+    async fn gallery_file_url_requires_a_valid_rpc_url() {
+        let server =
+            FakeHttpServer::start(vec![FakeResponse::ok("OK\nhttp://example.test/file")]).await;
+        let client = rpc_client_for_fake_server(&server);
+        let url = client
+            .fetch_gallery_file_url(&GalleryFileRequest {
+                gid: 1,
+                page: 2,
+                fileindex: 3,
+                xres: "org".to_string(),
+                attempt: 1,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(url.as_str(), "http://example.test/file");
+        assert!(server.requests()[0].contains("act=dlfetch"));
+        assert!(server.requests()[0].contains("add=1;2;3;org;1"));
     }
 }

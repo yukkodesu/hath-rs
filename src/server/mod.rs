@@ -20,6 +20,7 @@ use crate::bandwidth::BandwidthMonitor;
 use crate::cache::CacheHandler;
 use crate::config::Config;
 use crate::error::{HathError, Result};
+use crate::gallery_downloader::GalleryDownloadSupervisor;
 use crate::rpc_client::RpcClient;
 use crate::stats::Stats;
 
@@ -42,6 +43,8 @@ pub(crate) struct AppState {
     pub(crate) stats: Arc<Stats>,
     pub(crate) cache: Arc<CacheHandler>,
     pub(crate) rpc_client: Arc<RpcClient>,
+    /// On-demand gallery queue consumer, kept separate from inbound serving.
+    pub(crate) gallery_downloader: Arc<GalleryDownloadSupervisor>,
     pub(crate) allow_normal_connections: Arc<std::sync::atomic::AtomicBool>,
     /// Flood control table (IP -> entry). Sharded because it is touched by each incoming connection.
     pub(crate) flood_control: Arc<DashMap<String, FloodControlEntry>>,

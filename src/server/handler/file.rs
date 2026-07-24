@@ -143,6 +143,12 @@ mod tests {
             .unwrap(),
         );
         let rpc_client = Arc::new(RpcClient::new(config.clone()).unwrap());
+        let gallery_downloader = crate::gallery_downloader::GalleryDownloadSupervisor::new(
+            config.clone(),
+            rpc_client.clone(),
+            stats.clone(),
+            tokio_util::sync::CancellationToken::new(),
+        );
         let proxy_client = crate::proxy_downloader::build_proxy_client(&config.load()).unwrap();
 
         AppState {
@@ -150,6 +156,7 @@ mod tests {
             stats: stats.clone(),
             cache,
             rpc_client,
+            gallery_downloader,
             allow_normal_connections: Arc::new(AtomicBool::new(true)),
             flood_control: Arc::new(DashMap::new()),
             tls_acceptor: Arc::new(ArcSwapOption::const_empty()),

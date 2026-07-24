@@ -1,6 +1,7 @@
 use crate::cache::{self, CacheHandler};
 use crate::config::{CliArgs, Config};
 use crate::error::{HathError, Result};
+use crate::gallery_downloader::GalleryDownloadSupervisor;
 use crate::rpc::{self, ResponseStatus};
 use crate::rpc_client::{self, RpcClient};
 use crate::server::{self, AppState};
@@ -107,12 +108,19 @@ pub async fn run() -> Result<()> {
     let flood_control = Arc::new(DashMap::new());
 
     let proxy_client = crate::proxy_downloader::build_proxy_client(&config.load())?;
+    let gallery_downloader = GalleryDownloadSupervisor::new(
+        config.clone(),
+        rpc_client.clone(),
+        stats.clone(),
+        shutdown.clone(),
+    );
 
     let app_state = AppState {
         config: config.clone(),
         stats: stats.clone(),
         cache: cache.clone(),
         rpc_client: rpc_client.clone(),
+        gallery_downloader,
         allow_normal_connections: allow_connections.clone(),
         flood_control: flood_control.clone(),
         tls_acceptor: Arc::new(ArcSwapOption::const_empty()),

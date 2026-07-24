@@ -46,7 +46,6 @@ pub(super) async fn build_tls_acceptor(
             10000,
             300000,
             crate::downloader::DownloadMode::File(cert_path.clone()),
-            false,
         );
         downloader.download().await?;
     }
