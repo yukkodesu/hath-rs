@@ -109,7 +109,17 @@ pub(super) async fn handle_server_command(
                 _ => response::text_response(StatusCode::OK, ""),
             }
         }
-        "start_downloader" => response::text_response(StatusCode::OK, ""),
+        "start_downloader" => {
+            match state.gallery_downloader.start() {
+                crate::gallery_downloader::StartOutcome::Started => {
+                    tracing::info!("Started gallery downloader");
+                }
+                crate::gallery_downloader::StartOutcome::AlreadyRunning => {
+                    tracing::debug!("Gallery downloader is already running");
+                }
+            }
+            response::text_response(StatusCode::OK, "")
+        }
         "refresh_certs" => {
             // Java: client.setCertRefresh() — just set the flag, main loop does
             // the actual work (suspend -> shutdown -> restart -> resume).

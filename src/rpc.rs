@@ -22,6 +22,7 @@ pub enum Action {
     GetBlacklist,
     GetCertificate,
     StaticRangeFetch,
+    GalleryQueueFetch,
     DownloaderFetch,
     DownloaderFailreport,
     Overload,
@@ -66,6 +67,7 @@ impl fmt::Display for Action {
             Self::GetBlacklist => write!(f, "get_blacklist"),
             Self::GetCertificate => write!(f, "get_cert"),
             Self::StaticRangeFetch => write!(f, "srfetch"),
+            Self::GalleryQueueFetch => write!(f, "fetchqueue"),
             Self::DownloaderFetch => write!(f, "dlfetch"),
             Self::DownloaderFailreport => write!(f, "dlfails"),
             Self::Overload => write!(f, "overload"),
@@ -117,6 +119,14 @@ pub fn make_rpc_url(act: Action, add: &str, config: &Config, host: &str) -> Resu
     }
     url.set_path(config.rpc_path.trim_end_matches('?'));
     url.set_query(Some(&query));
+    Ok(url)
+}
+
+/// Build the signed gallery-queue URL. The queue endpoint deliberately does
+/// not share the configurable RPC path: the H@H protocol fixes it at /15/dl.
+pub fn make_gallery_queue_url(act_add: &str, config: &Config, host: &str) -> Result<Url> {
+    let mut url = make_rpc_url(Action::GalleryQueueFetch, act_add, config, host)?;
+    url.set_path("/15/dl");
     Ok(url)
 }
 

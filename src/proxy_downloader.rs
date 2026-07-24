@@ -7,7 +7,6 @@ use crate::utils;
 use reqwest::{Client, Url};
 use sha1::Digest;
 use std::io;
-use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
@@ -513,56 +512,17 @@ impl ProxyFileDownloader {
 /// Build the shared reqwest::Client used for all proxy file downloads.
 /// Applies image proxy settings from config if configured.
 pub(crate) fn build_proxy_client(config: &Config) -> Result<Arc<Client>> {
-    let mut builder = proxy_client_builder();
-    // Java: isImageProxyEnabled() checks host only; type defaults to
-    // "socks"; port defaults to 1080 (socks) or 8080 (http).
-    if let Some(proxy_host) = &config.image_proxy_host {
-        let proxy_type = config.image_proxy_type.as_deref().unwrap_or("socks");
-        let default_port = if proxy_type == "http" { 8080 } else { 1080 };
-        let proxy_port = config.image_proxy_port.unwrap_or(default_port);
-        if let Ok(proxy_url) = build_proxy_url(proxy_type, proxy_host, proxy_port)
-            && let Ok(proxy) = reqwest::Proxy::all(proxy_url.as_str())
-        {
-            builder = builder.proxy(proxy);
-        }
-    }
-    builder
-        .build()
-        .map(Arc::new)
-        .map_err(|e| HathError::Network(e.to_string()))
+    crate::downloader::build_image_proxy_client(
+        config,
+        std::time::Duration::from_secs(5),
+        std::time::Duration::from_secs(30),
+    )
+    .map(Arc::new)
 }
 
+#[cfg(test)]
 pub(crate) fn build_proxy_url(proxy_type: &str, proxy_host: &str, proxy_port: u16) -> Result<Url> {
-    let mut url = match proxy_type {
-        "socks" => Url::parse("socks://hath.invalid/"),
-        "http" => Url::parse("http://hath.invalid/"),
-        _ => {
-            return Err(HathError::Config(format!(
-                "invalid proxy type: {}",
-                proxy_type
-            )));
-        }
-    }
-    .map_err(|e| HathError::Config(format!("invalid proxy URL base: {}", e)))?;
-    if let Ok(ip) = proxy_host.parse::<IpAddr>() {
-        url.set_ip_host(ip)
-            .map_err(|_| HathError::Config("invalid proxy host".into()))?;
-    } else {
-        url.set_host(Some(proxy_host))
-            .map_err(|e| HathError::Config(format!("invalid proxy host: {}", e)))?;
-    }
-    url.set_port(Some(proxy_port))
-        .map_err(|_| HathError::Config(format!("invalid proxy port: {}", proxy_port)))?;
-    Ok(url)
-}
-
-/// Reusable client building block: base builder with user-agent, connect,
-/// and read timeouts matching Java ProxyFileDownloader connection settings.
-fn proxy_client_builder() -> reqwest::ClientBuilder {
-    Client::builder()
-        .user_agent(format!("Hentai@Home {}", crate::rpc::CLIENT_VERSION))
-        .connect_timeout(std::time::Duration::from_secs(5))
-        .read_timeout(std::time::Duration::from_secs(30))
+    crate::downloader::build_proxy_url(proxy_type, proxy_host, proxy_port)
 }
 
 /// Send a Hath-Request-authenticated GET to an upstream image server.
