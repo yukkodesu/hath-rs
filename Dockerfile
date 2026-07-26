@@ -21,7 +21,7 @@ RUN --mount=type=cache,target=/build/target \
 FROM alpine:latest
 
 RUN apk add --no-cache \
-    tini ca-certificates openssl
+    tini ca-certificates libgcc openssl
 
 COPY --from=builder /build/out/hath-rs /usr/local/bin/hath-rs
 COPY docker-entrypoint.sh /docker-entrypoint.sh
