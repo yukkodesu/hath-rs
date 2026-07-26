@@ -4,6 +4,10 @@ FROM rust:alpine AS builder
 RUN apk add --no-cache \
     build-base musl-dev openssl-dev pkgconf
 
+# rust:alpine defaults to static musl linking. Keep OpenSSL dynamic so its
+# legacy provider can be loaded from Alpine's libcrypto3 package at runtime.
+ENV RUSTFLAGS="-C target-feature=-crt-static"
+
 WORKDIR /build
 
 COPY . .
