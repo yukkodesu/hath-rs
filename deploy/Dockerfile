@@ -20,7 +20,7 @@ RUN apk add --no-cache \
     tini ca-certificates libgcc
 
 COPY --from=builder /build/out/hath-rs /usr/local/bin/hath-rs
-COPY docker-entrypoint.sh /docker-entrypoint.sh
+COPY deploy/docker-entrypoint.sh /docker-entrypoint.sh
 
 VOLUME ["/hath/cache", "/hath/data", "/hath/download", "/hath/log", "/hath/tmp"]
 WORKDIR /hath
