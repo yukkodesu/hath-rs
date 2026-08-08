@@ -6,6 +6,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
+const PERSISTENT_CACHE_FORMAT_VERSION: u32 = 1;
+
 #[derive(Debug, Serialize, Deserialize)]
 pub(super) struct PersistentCacheState {
     pub(super) cache_count: u32,
@@ -57,8 +59,13 @@ pub(super) fn save(config: &Config, state: &PersistentCacheState) -> Result<()> 
     let lru_hash = utils::sha1_bytes(&lru_data);
 
     let info = format!(
-        "cacheCount={}\ncacheSize={}\nlruClearPointer={}\nagesHash={}\nlruHash={}",
-        state.cache_count, state.cache_size, state.lru_clear_pointer, ages_hash, lru_hash
+        "formatVersion={}\ncacheCount={}\ncacheSize={}\nlruClearPointer={}\nagesHash={}\nlruHash={}",
+        PERSISTENT_CACHE_FORMAT_VERSION,
+        state.cache_count,
+        state.cache_size,
+        state.lru_clear_pointer,
+        ages_hash,
+        lru_hash
     );
     fs::write(&info_path, info.as_bytes())
         .map_err(|e| HathError::Cache(format!("Failed to write info: {}", e)))?;
@@ -108,10 +115,12 @@ pub(super) fn try_load(config: &Config) -> Option<PersistentCacheState> {
     let mut cache_count: u32 = 0;
     let mut cache_size: u64 = 0;
     let mut lru_clear_pointer: usize = 0;
+    let mut format_version: Option<u32> = None;
 
     for line in info_content.lines() {
         if let Some((key, value)) = line.split_once('=') {
             match key {
+                "formatVersion" => format_version = Some(value.parse().ok()?),
                 "cacheCount" => {
                     cache_count = value.parse().ok()?;
                     tracing::debug!("CacheHandler: Loaded persistent cacheCount={}", cache_count);
@@ -147,6 +156,14 @@ pub(super) fn try_load(config: &Config) -> Option<PersistentCacheState> {
 
     if info_checksum != 31 {
         tracing::info!("CacheHandler: Persistent fields were missing, forcing rescan");
+        return None;
+    }
+
+    if format_version.is_some_and(|version| version != PERSISTENT_CACHE_FORMAT_VERSION) {
+        tracing::info!(
+            "CacheHandler: Unsupported persistent cache format {}, forcing rescan",
+            format_version.unwrap()
+        );
         return None;
     }
 
@@ -276,5 +293,91 @@ mod tests {
         for name in ["pcache_info", "pcache_ages", "pcache_lru"] {
             assert!(!temp.path().join(name).exists(), "{name} should be removed");
         }
+    }
+
+    #[test]
+    fn save_marks_new_snapshots_as_format_v1() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = config_for_data_dir(temp.path());
+
+        save(&config, &PersistentCacheState::default()).unwrap();
+
+        assert!(
+            fs::read_to_string(temp.path().join("pcache_info"))
+                .unwrap()
+                .contains("formatVersion=1")
+        );
+    }
+
+    #[test]
+    fn unversioned_rust_snapshot_remains_format_v1() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = config_for_data_dir(temp.path());
+
+        save(&config, &PersistentCacheState::default()).unwrap();
+        let path = temp.path().join("pcache_info");
+        let info = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .filter(|line| !line.starts_with("formatVersion="))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(path, info).unwrap();
+
+        assert!(try_load(&config).is_some());
+    }
+
+    #[test]
+    fn unknown_persistent_format_is_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = config_for_data_dir(temp.path());
+
+        save(&config, &PersistentCacheState::default()).unwrap();
+        let path = temp.path().join("pcache_info");
+        let info = fs::read_to_string(&path)
+            .unwrap()
+            .replace("formatVersion=1", "formatVersion=2");
+        fs::write(path, info).unwrap();
+
+        assert!(try_load(&config).is_none());
+    }
+
+    #[test]
+    fn java_importer_output_loads_through_client_persistence_path() {
+        use hath_rs_pcache_migrate::protocol::{LRU_CACHE_SIZE, LegacyCacheState};
+        use std::io::Cursor;
+
+        let temp = tempfile::tempdir().unwrap();
+        let config = config_for_data_dir(temp.path());
+        let mut lru_cache_table = vec![0u16; LRU_CACHE_SIZE];
+        lru_cache_table[123] = 0x8000;
+        lru_cache_table[456] = 0xffff;
+        let source = LegacyCacheState {
+            cache_count: 7,
+            cache_size: 99,
+            lru_clear_pointer: 17,
+            static_range_ages: HashMap::from([("a3f0".to_string(), 1_700_000_000_000)]),
+            lru_cache_table,
+        };
+
+        hath_rs_pcache_migrate::import_from_reader(
+            Cursor::new(hath_rs_pcache_migrate::test_support::encode_hpcache_v1(
+                &source,
+            )),
+            temp.path(),
+            false,
+        )
+        .unwrap();
+
+        let loaded = try_load(&config).unwrap();
+        assert_eq!(loaded.cache_count, 7);
+        assert_eq!(loaded.cache_size, 99);
+        assert_eq!(loaded.lru_clear_pointer, 17);
+        assert_eq!(
+            loaded.static_range_ages.get("a3f0"),
+            Some(&1_700_000_000_000)
+        );
+        assert_eq!(loaded.lru_cache_table[123], 0x8000);
+        assert_eq!(loaded.lru_cache_table[456], 0xffff);
     }
 }

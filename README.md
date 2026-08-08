@@ -122,6 +122,21 @@ Credentials may instead be stored as `CLIENT_ID-CLIENT_KEY` in `client_login` un
 
 Stop the client cleanly, then start the new image or binary with the same directory paths. Check the release notes for compatibility notes before upgrading.
 
+### Migrate Java persistent cache
+
+The Java client and `hath-rs` use different serialized metadata formats. To
+preserve fast-start cache metadata, download the independently released
+`pcache-migrator-v*` toolkit, stop both clients, then run:
+
+```sh
+java -jar pcache-java-exporter.jar --data-dir /old/data \
+  | hath-rs-pcache-migrate --data-dir /new/data
+```
+
+For the same data directory, add `--replace` to the importer. It creates a
+timestamped backup of the original `pcache_*` files; if migration fails,
+`hath-rs` safely performs its normal cache rescan.
+
 ## License
 
 This project is licensed under the [GNU Affero General Public License v3.0](LICENSE).
