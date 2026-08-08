@@ -12,6 +12,7 @@ pub mod rpc;
 pub mod rpc_client;
 pub mod server;
 pub mod stats;
+pub mod tls;
 pub mod types;
 pub mod utils;
 

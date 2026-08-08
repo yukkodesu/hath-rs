@@ -28,7 +28,6 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 use dashmap::DashMap;
 use hyper::server::conn::http1;
 use hyper_util::rt::TokioIo;
-use openssl::ssl::SslContext;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -48,8 +47,8 @@ pub(crate) struct AppState {
     pub(crate) allow_normal_connections: Arc<std::sync::atomic::AtomicBool>,
     /// Flood control table (IP -> entry). Sharded because it is touched by each incoming connection.
     pub(crate) flood_control: Arc<DashMap<String, FloodControlEntry>>,
-    /// TLS context that can be swapped at runtime (e.g. cert refresh).
-    pub(crate) tls_acceptor: Arc<ArcSwapOption<SslContext>>,
+    /// TLS acceptor that can be swapped at runtime (e.g. cert refresh).
+    pub(crate) tls_acceptor: Arc<ArcSwapOption<tokio_rustls::TlsAcceptor>>,
     /// Certificate expiry as a Unix timestamp (seconds). Checked periodically;
     /// if the cert expires within 24 hours, the client shuts down (matches Java).
     pub(crate) cert_expiry: Arc<Mutex<Option<i64>>>,
@@ -221,29 +220,17 @@ async fn run_server(
 
                 let state = state.clone();
 
-                // Load current TLS context (may have been refreshed)
-                let ssl_context = state.tls_acceptor.load_full()
-                    .expect("TLS context not initialized");
+                // Load current TLS acceptor (may have been refreshed)
+                let tls_acceptor = state.tls_acceptor.load_full()
+                    .expect("TLS acceptor not initialized");
 
                 let conn_state = state.clone();
                 tokio::spawn(async move {
                     // --- TLS handshake first (matches Java: SSLServerSocket.accept()
                     //     completes the handshake before any policy checks are applied) ---
-                    let ssl = match openssl::ssl::Ssl::new(ssl_context.as_ref()) {
-                        Ok(s) => s,
+                    let tls_stream = match tls_acceptor.accept(stream).await {
+                        Ok(stream) => stream,
                         Err(e) => {
-                            tracing::error!("SSL Ssl::new failed from {}: {:?}", remote_addr, e);
-                            return;
-                        }
-                    };
-                    let mut tls_stream = match tokio_openssl::SslStream::new(ssl, stream) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            tracing::error!("SslStream::new failed from {}: {:?}", remote_addr, e);
-                            return;
-                        }
-                    };
-                    if let Err(e) = Pin::new(&mut tls_stream).accept().await {
                         let msg = e.to_string();
                         if msg.contains("connection reset") || msg.contains("unexpected EOF") {
                             tracing::debug!("TLS accept from {} closed early: {}", remote_addr, e);
@@ -251,12 +238,13 @@ async fn run_server(
                             tracing::warn!("TLS accept failed from {}: {:?}", remote_addr, e);
                         }
                         return;
-                    }
+                        }
+                    };
 
                     // --- Post-handshake policy checks (Java: HTTPServer.run() order) ---
                     let cfg = conn_state.config.load_full();
                     let origin = peer::SessionOrigin::from_remote_addr(remote_addr, &cfg);
-                    admission::configure_send_buffer(tls_stream.get_ref(), &cfg);
+                    admission::configure_send_buffer(tls_stream.get_ref().0, &cfg);
                     let admission = match admission::admit_connection(
                         &conn_state,
                         remote_addr,

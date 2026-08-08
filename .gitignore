@@ -2,4 +2,6 @@
 .worktrees/
 .idea/
 *.p12
+!tests/fixtures/legacy-rc2.p12
+!tests/fixtures/legacy-rc2-chain.p12
 *.log

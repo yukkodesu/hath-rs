@@ -21,10 +21,16 @@ pub(crate) async fn run_threaded_proxy_test(
     // Java: FileDownloader(source, 10000, 60000, true)
     // connectTimeout=5s, readTimeout=10s,
     // maxDLTime=60s is stored but not enforced, 3 retries.
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(5))
-        .read_timeout(Duration::from_secs(10))
-        .build();
+    let client = crate::tls::configure_reqwest(
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .read_timeout(Duration::from_secs(10)),
+    )
+    .and_then(|builder| {
+        builder
+            .build()
+            .map_err(|error| HathError::Network(error.to_string()))
+    });
 
     let Ok(client) = client else {
         return (0, 0);
@@ -201,11 +207,14 @@ mod tests {
                 .delay_before_body(Duration::from_millis(60)),
         ])
         .await;
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(5))
-            .read_timeout(Duration::from_secs(10))
-            .build()
-            .unwrap();
+        let client = crate::tls::configure_reqwest(
+            reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(5))
+                .read_timeout(Duration::from_secs(10)),
+        )
+        .unwrap()
+        .build()
+        .unwrap();
 
         let elapsed_ms =
             run_threaded_proxy_test_download(&client, server.url("/t/8/30/key/1"), testsize)

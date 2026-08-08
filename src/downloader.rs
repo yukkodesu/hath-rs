@@ -237,12 +237,14 @@ pub(crate) fn build_direct_client(
     connect_timeout: Duration,
     read_timeout: Duration,
 ) -> Result<Client> {
-    Client::builder()
-        .user_agent(format!("Hentai@Home {}", crate::rpc::CLIENT_VERSION))
-        .connect_timeout(connect_timeout)
-        .read_timeout(read_timeout)
-        .build()
-        .map_err(|e| HathError::Network(e.to_string()))
+    crate::tls::configure_reqwest(
+        Client::builder()
+            .user_agent(format!("Hentai@Home {}", crate::rpc::CLIENT_VERSION))
+            .connect_timeout(connect_timeout)
+            .read_timeout(read_timeout),
+    )?
+    .build()
+    .map_err(|e| HathError::Network(e.to_string()))
 }
 
 /// Build an image-proxied client using the documented H@H configuration.
@@ -268,7 +270,7 @@ pub(crate) fn build_image_proxy_client(
         builder = builder.proxy(proxy);
     }
 
-    builder
+    crate::tls::configure_reqwest(builder)?
         .build()
         .map_err(|e| HathError::Network(e.to_string()))
 }
