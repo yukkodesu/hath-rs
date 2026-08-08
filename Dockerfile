@@ -2,11 +2,7 @@
 FROM rust:alpine AS builder
 
 RUN apk add --no-cache \
-    build-base musl-dev openssl-dev pkgconf
-
-# rust:alpine defaults to static musl linking. Keep OpenSSL dynamic so its
-# legacy provider can be loaded from Alpine's libcrypto3 package at runtime.
-ENV RUSTFLAGS="-C target-feature=-crt-static"
+    build-base cmake musl-dev nasm perl
 
 WORKDIR /build
 
@@ -21,7 +17,7 @@ RUN --mount=type=cache,target=/build/target \
 FROM alpine:latest
 
 RUN apk add --no-cache \
-    tini ca-certificates libgcc openssl
+    tini ca-certificates libgcc
 
 COPY --from=builder /build/out/hath-rs /usr/local/bin/hath-rs
 COPY docker-entrypoint.sh /docker-entrypoint.sh

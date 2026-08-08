@@ -172,13 +172,15 @@ impl RpcClient {
     pub fn new(config: Arc<ArcSwap<Config>>) -> Result<Self> {
         // Java: http.keepAlive=false (global), FileDownloader uses connect/read
         // timeout. Long timeouts for slow RPC responses.
-        let http = Client::builder()
-            .user_agent(format!("Hentai@Home {}", rpc::CLIENT_VERSION))
-            // Java: setConnectTimeout(5000), FileDownloader(timeout=3600000)
-            .connect_timeout(Duration::from_secs(5))
-            .read_timeout(Duration::from_secs(3600))
-            .build()
-            .map_err(|e| HathError::Network(e.to_string()))?;
+        let http = crate::tls::configure_reqwest(
+            Client::builder()
+                .user_agent(format!("Hentai@Home {}", rpc::CLIENT_VERSION))
+                // Java: setConnectTimeout(5000), FileDownloader(timeout=3600000)
+                .connect_timeout(Duration::from_secs(5))
+                .read_timeout(Duration::from_secs(3600)),
+        )?
+        .build()
+        .map_err(|e| HathError::Network(e.to_string()))?;
         Ok(Self {
             http,
             config,

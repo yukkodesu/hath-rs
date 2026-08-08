@@ -7,10 +7,8 @@ use std::sync::atomic::Ordering;
 use crate::rpc_client::RpcClient;
 use crate::server::{AppState, start_server, stop_server, tls};
 use arc_swap::ArcSwap;
-use openssl::asn1::Asn1Time;
-use openssl::pkcs12::Pkcs12;
-use openssl::provider::Provider;
-use openssl::ssl::{SslContext, SslMethod};
+use p12::PFX;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::task::JoinHandle;
 
@@ -28,14 +26,144 @@ pub(super) fn is_cert_expired(cert_expiry_unix: i64) -> bool {
     cert_expiry_unix < unix_time_secs().saturating_add(CERT_RENEWAL_WINDOW_SECS)
 }
 
-/// Build an OpenSSL SslContext from the PKCS12 certificate.
-/// Uses OpenSSL for both PKCS12 parsing and TLS context building.
+struct ParsedP12Certificate {
+    cert_chain: Vec<CertificateDer<'static>>,
+    private_key: PrivateKeyDer<'static>,
+}
+
+fn parse_p12_certificate(data: &[u8], password: &str) -> Result<ParsedP12Certificate> {
+    let pfx = PFX::parse(data)
+        .map_err(|error| HathError::Tls(format!("invalid PKCS12 archive: {error}")))?;
+    if !pfx.verify_mac(password) {
+        return Err(HathError::Tls(
+            "PKCS12 archive integrity check failed".into(),
+        ));
+    }
+    let private_key = pfx.key_bags(password).map_err(|error| {
+        HathError::Tls(format!("failed to decrypt PKCS12 private key: {error}"))
+    })?;
+    let cert_chain = pfx
+        .cert_x509_bags(password)
+        .map_err(|error| HathError::Tls(format!("failed to decrypt PKCS12 certificates: {error}")))?
+        .into_iter()
+        .map(CertificateDer::from)
+        .collect::<Vec<_>>();
+    let private_key = select_private_key(private_key)?;
+
+    Ok(ParsedP12Certificate {
+        cert_chain: order_certificate_chain(cert_chain, &private_key)?,
+        private_key,
+    })
+}
+
+fn select_private_key(mut private_keys: Vec<Vec<u8>>) -> Result<PrivateKeyDer<'static>> {
+    if private_keys.len() != 1 {
+        return Err(HathError::Tls(
+            "PKCS12 archive must contain exactly one private key".into(),
+        ));
+    }
+    Ok(PrivatePkcs8KeyDer::from(private_keys.pop().unwrap()).into())
+}
+
+fn order_certificate_chain(
+    mut certificates: Vec<CertificateDer<'static>>,
+    private_key: &PrivateKeyDer<'static>,
+) -> Result<Vec<CertificateDer<'static>>> {
+    let provider = crate::tls::aws_lc_provider();
+    let signing_key = provider
+        .key_provider
+        .load_private_key(private_key.clone_key())
+        .map_err(|error| HathError::Tls(format!("invalid PKCS12 private key: {error}")))?;
+    let key_spki = signing_key.public_key().ok_or_else(|| {
+        HathError::Tls("could not determine PKCS12 private key public key".into())
+    })?;
+
+    let mut leaf_index = None;
+    for (index, certificate) in certificates.iter().enumerate() {
+        let (_, parsed) = x509_parser::prelude::parse_x509_certificate(certificate.as_ref())
+            .map_err(|error| HathError::Tls(format!("invalid PKCS12 certificate: {error}")))?;
+        if parsed.public_key().raw == key_spki.as_ref() {
+            if leaf_index.replace(index).is_some() {
+                return Err(HathError::Tls(
+                    "multiple PKCS12 certificates match the private key".into(),
+                ));
+            }
+        }
+    }
+    let leaf_index = leaf_index
+        .ok_or_else(|| HathError::Tls("no PKCS12 certificate matches the private key".into()))?;
+
+    let mut chain = vec![certificates.remove(leaf_index)];
+    while !certificates.is_empty() {
+        let (_, child) =
+            x509_parser::prelude::parse_x509_certificate(chain.last().unwrap().as_ref())
+                .map_err(|error| HathError::Tls(format!("invalid PKCS12 certificate: {error}")))?;
+        let mut issuer_index = None;
+        for (index, certificate) in certificates.iter().enumerate() {
+            let (_, candidate) = x509_parser::prelude::parse_x509_certificate(certificate.as_ref())
+                .map_err(|error| HathError::Tls(format!("invalid PKCS12 certificate: {error}")))?;
+            if is_valid_issuer(&child, &candidate)? {
+                if issuer_index.replace(index).is_some() {
+                    return Err(HathError::Tls(
+                        "multiple PKCS12 certificates can issue the same child certificate".into(),
+                    ));
+                }
+            }
+        }
+        let issuer_index = issuer_index.ok_or_else(|| {
+            HathError::Tls("PKCS12 certificate chain is incomplete or invalid".into())
+        })?;
+        chain.push(certificates.remove(issuer_index));
+    }
+
+    Ok(chain)
+}
+
+fn is_valid_issuer(
+    child: &x509_parser::certificate::X509Certificate<'_>,
+    candidate: &x509_parser::certificate::X509Certificate<'_>,
+) -> Result<bool> {
+    if child.issuer() != candidate.subject() {
+        return Ok(false);
+    }
+    let basic_constraints = candidate
+        .basic_constraints()
+        .map_err(|error| HathError::Tls(format!("invalid issuer basic constraints: {error}")))?;
+    if !basic_constraints.is_some_and(|extension| extension.value.ca) {
+        return Ok(false);
+    }
+    let key_usage = candidate
+        .key_usage()
+        .map_err(|error| HathError::Tls(format!("invalid issuer key usage: {error}")))?;
+    if key_usage.is_some_and(|extension| !extension.value.key_cert_sign()) {
+        return Ok(false);
+    }
+    Ok(child.verify_signature(Some(candidate.public_key())).is_ok())
+}
+
+fn certificate_expiry_unix(cert: &CertificateDer<'_>) -> Result<i64> {
+    let (_, certificate) = x509_parser::prelude::parse_x509_certificate(cert.as_ref())
+        .map_err(|error| HathError::Tls(format!("invalid leaf certificate: {error}")))?;
+    Ok(certificate.validity().not_after.timestamp())
+}
+
+fn build_server_acceptor(parsed: ParsedP12Certificate) -> Result<tokio_rustls::TlsAcceptor> {
+    let config = rustls::ServerConfig::builder_with_provider(crate::tls::aws_lc_provider())
+        .with_safe_default_protocol_versions()
+        .map_err(|error| HathError::Tls(error.to_string()))?
+        .with_no_client_auth()
+        .with_single_cert(parsed.cert_chain, parsed.private_key)
+        .map_err(|error| HathError::Tls(format!("failed to configure TLS certificate: {error}")))?;
+    Ok(tokio_rustls::TlsAcceptor::from(Arc::new(config)))
+}
+
+/// Build a rustls acceptor from the PKCS12 certificate.
 /// If `force_download` is true, always re-download the cert from the RPC server.
-/// Returns (context, cert_expiry_unix_seconds).
+/// Returns (acceptor, cert_expiry_unix_seconds).
 pub(super) async fn build_tls_acceptor(
     config: &Config,
     force_download: bool,
-) -> Result<(SslContext, i64)> {
+) -> Result<(tokio_rustls::TlsAcceptor, i64)> {
     let cert_path = config.data_dir.join("hathcert.p12");
 
     if force_download || !cert_path.exists() {
@@ -50,31 +178,8 @@ pub(super) async fn build_tls_acceptor(
         downloader.download().await?;
     }
 
-    let cert_data = std::fs::read(&cert_path)?;
-    let pkcs12 = Pkcs12::from_der(&cert_data)?;
-    // OpenSSL 3.x disables legacy algorithms (including RC2-40-CBC used by
-    // the H@H server's PKCS12 certificate bags) unless the legacy provider is
-    // explicitly loaded. retain_fallbacks=true keeps the default provider active.
-    let _legacy = Provider::try_load(None, "legacy", true)?;
-    let pkcs12 = pkcs12.parse2(config.client_key.as_str())?;
-
-    let cert = pkcs12
-        .cert
-        .as_ref()
-        .ok_or_else(|| HathError::Tls("no certificate in PKCS12".into()))?;
-    let key = pkcs12
-        .pkey
-        .as_ref()
-        .ok_or_else(|| HathError::Tls("no private key in PKCS12".into()))?;
-
-    let not_after = cert.not_after();
-
-    // Compute cert expiry as a Unix timestamp for runtime checks.
-    // ASN1_TIME_diff(from, to) returns to-from, so now.diff(not_after) gives
-    // the remaining seconds until expiry (positive while cert is still valid).
-    let now_asn1 = Asn1Time::days_from_now(0)?;
-    let diff = now_asn1.diff(not_after)?;
-    let cert_expiry_unix = unix_time_secs() + diff.days as i64 * SECS_PER_DAY + diff.secs as i64;
+    let parsed = parse_p12_certificate(&std::fs::read(&cert_path)?, config.client_key.as_str())?;
+    let cert_expiry_unix = certificate_expiry_unix(&parsed.cert_chain[0])?;
 
     // Java: isCertExpired() returns true when the certificate expires within
     // the next 24 hours.
@@ -85,34 +190,7 @@ pub(super) async fn build_tls_acceptor(
         );
         return Err(HathError::CertExpired);
     }
-    // Java builds SSLContext.getInstance("TLS"), leaves cipher suites and other
-    // TLS parameters at provider defaults, then enables TLSv1.3/TLSv1.2 (or
-    // TLSv1.2 when TLSv1.3 is unavailable). Mirror that by only rejecting
-    // protocols below TLSv1.2; OpenSSL keeps its default cipher/group/session
-    // policy and default maximum protocol version.
-    let mut ctx_builder = SslContext::builder(SslMethod::tls_server())
-        .map_err(|e| HathError::Tls(format!("Failed to create SslContextBuilder: {}", e)))?;
-    ctx_builder
-        .set_min_proto_version(Some(openssl::ssl::SslVersion::TLS1_2))
-        .map_err(|e| HathError::Tls(format!("Failed to set min protocol: {}", e)))?;
-
-    ctx_builder
-        .set_certificate(cert)
-        .map_err(|e| HathError::Tls(format!("Failed to set certificate: {}", e)))?;
-    ctx_builder
-        .set_private_key(key)
-        .map_err(|e| HathError::Tls(format!("Failed to set private key: {}", e)))?;
-    ctx_builder
-        .check_private_key()
-        .map_err(|e| HathError::Tls(format!("Certificate/key mismatch: {}", e)))?;
-    if let Some(chain) = pkcs12.ca {
-        for ca in chain {
-            ctx_builder
-                .add_extra_chain_cert(ca)
-                .map_err(|e| HathError::Tls(format!("Failed to add chain cert: {}", e)))?;
-        }
-    }
-    Ok((ctx_builder.build(), cert_expiry_unix))
+    Ok((build_server_acceptor(parsed)?, cert_expiry_unix))
 }
 
 /// Spawn the certificate refresh watcher.
@@ -252,4 +330,24 @@ pub fn spawn_time_cert_check(
             }
         },
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_corrupt_pkcs12_data() {
+        assert!(parse_p12_certificate(b"not a p12 archive", "test-client-key").is_err());
+    }
+
+    #[test]
+    fn expiry_window_matches_the_existing_24_hour_rule() {
+        assert!(!is_cert_expired(
+            unix_time_secs() + CERT_RENEWAL_WINDOW_SECS + 1
+        ));
+        assert!(is_cert_expired(
+            unix_time_secs() + CERT_RENEWAL_WINDOW_SECS - 1
+        ));
+    }
 }

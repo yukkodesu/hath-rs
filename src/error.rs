@@ -46,14 +46,8 @@ pub enum HathError {
     Fatal(String),
 }
 
-impl From<openssl::error::ErrorStack> for HathError {
-    fn from(e: openssl::error::ErrorStack) -> Self {
-        HathError::Tls(e.to_string())
-    }
-}
-
-impl From<openssl::ssl::Error> for HathError {
-    fn from(e: openssl::ssl::Error) -> Self {
+impl From<rustls::Error> for HathError {
+    fn from(e: rustls::Error) -> Self {
         HathError::Tls(e.to_string())
     }
 }
