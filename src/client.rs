@@ -27,7 +27,8 @@ pub async fn run() -> Result<()> {
     config.initialize_directories()?;
 
     // 2. Start logging
-    let _ = crate::logging::init_logging(&config.log_dir, config.clone())?;
+    let config = Arc::new(ArcSwap::from_pointee(config));
+    crate::logging::init_logging(&config.load().log_dir, config.clone())?;
 
     tracing::info!(
         "Hentai@Home {} (Build {}) starting up",
@@ -55,17 +56,14 @@ pub async fn run() -> Result<()> {
     }
 
     // 3. Save client_login if newly provided via CLI
-    if config.client_id.0 > 0 && !config.client_key.as_str().is_empty() {
-        let _ = config.save_client_login();
+    if config.load().client_id.0 > 0 && !config.load().client_key.as_str().is_empty() {
+        let _ = config.load().save_client_login();
     }
 
     // Validate credentials
-    if config.client_id.0 < 1000 || config.client_key.as_str().len() != 20 {
+    if config.load().client_id.0 < 1000 || config.load().client_key.as_str().len() != 20 {
         return Err(HathError::Config("Invalid credentials".into()));
     }
-
-    // 4. Wrap config in ArcSwap for sharing
-    let config = Arc::new(ArcSwap::from(Arc::new(config)));
 
     // 5. Server stat: get server time, min build, RPC server list.
     // Java: refreshServerStat() applies these settings BEFORE client_login so
