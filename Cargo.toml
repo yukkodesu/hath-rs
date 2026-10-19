@@ -41,9 +41,11 @@ arc-swap = "1"
 uuid = { version = "1", features = ["v7"] }
 socket2 = "0.6"
 mimalloc = { git = "https://github.com/yukkodesu/mimalloc_rust.git", rev = "8d2745785801c976a92298b7ee4a8c8411c868d7", optional = true }
+tokio-io-timeout = "1.2.1"
 
 [dev-dependencies]
 tempfile = "3"
+tokio = { version = "1", features = ["test-util"] }
 
 [dev-dependencies.hath-rs-pcache-migrate]
 path = "crates/pcache-migrate"
