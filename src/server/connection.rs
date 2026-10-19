@@ -28,6 +28,9 @@ impl Connection {
         remote_addr: SocketAddr,
         shutdown: &CancellationToken,
     ) -> Option<Self> {
+        if state.shutdown.is_cancelled() {
+            return None;
+        }
         let config = state.config.load_full();
         let origin = SessionOrigin::from_remote_addr(remote_addr, &config);
         let admission = match admission::admit_connection(state, remote_addr, origin, &config) {

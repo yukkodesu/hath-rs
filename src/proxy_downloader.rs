@@ -352,13 +352,14 @@ impl ProxyFileDownloader {
     /// Try each source once until a valid HTTP 200 response with matching
     /// Content-Length is obtained. Body-stage retry happens in the background
     /// download task after the downstream response is declared.
-    pub async fn new(
+    pub(crate) async fn new(
         fileid: &str,
         sources: &[Url],
         config: &Config,
         cache_handler: Option<Arc<CacheHandler>>,
         stats: Arc<Stats>,
         client: &Arc<Client>,
+        tasks: &crate::tasks::TransferTasks,
     ) -> Result<Self> {
         let hv_file = HVFile::from_fileid(fileid)
             .ok_or_else(|| HathError::Parse(format!("invalid fileid: {}", fileid)))?;
@@ -408,7 +409,7 @@ impl ProxyFileDownloader {
             let retry_hath = hath_request.clone();
             let max_allowed_filesize = config.max_allowed_filesize;
 
-            tokio::spawn(async move {
+            let spawned = tasks.spawn(async move {
                 ProxyDownloadTask {
                     resp,
                     watch_tx,
@@ -432,6 +433,10 @@ impl ProxyFileDownloader {
                 .await;
             });
 
+            if !spawned {
+                utils::remove_file(&temp_file);
+                return Err(HathError::Shutdown);
+            }
             return Ok(Self {
                 content_length: hv_file.size as usize,
                 content_type: hv_file.mime_type().to_string(),
@@ -807,6 +812,7 @@ mod tests {
         let client = build_proxy_client(&config).unwrap();
         let stats = Arc::new(Stats::new());
 
+        let tasks = crate::tasks::TransferTasks::new(crate::shutdown::Shutdown::default());
         let proxy = ProxyFileDownloader::new(
             &fileid,
             &[server.url("/image")],
@@ -814,6 +820,7 @@ mod tests {
             None,
             stats,
             &client,
+            &tasks,
         )
         .await
         .unwrap();
@@ -833,6 +840,7 @@ mod tests {
         let server = FakeHttpServer::start(vec![FakeResponse::ok(body.clone())]).await;
         let client = build_proxy_client(&config).unwrap();
 
+        let tasks = crate::tasks::TransferTasks::new(crate::shutdown::Shutdown::default());
         let proxy = ProxyFileDownloader::new(
             &fileid,
             &[server.url("/head")],
@@ -840,6 +848,7 @@ mod tests {
             None,
             Arc::new(Stats::new()),
             &client,
+            &tasks,
         )
         .await
         .unwrap();
@@ -862,6 +871,7 @@ mod tests {
         let server = FakeHttpServer::start(vec![FakeResponse::ok(body.clone())]).await;
         let client = build_proxy_client(&config).unwrap();
 
+        let tasks = crate::tasks::TransferTasks::new(crate::shutdown::Shutdown::default());
         let proxy = ProxyFileDownloader::new(
             &fileid,
             &[server.url("/abort")],
@@ -869,6 +879,7 @@ mod tests {
             None,
             Arc::new(Stats::new()),
             &client,
+            &tasks,
         )
         .await
         .unwrap();

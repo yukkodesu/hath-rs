@@ -114,6 +114,9 @@ pub(super) async fn handle_server_command(
                 crate::gallery_downloader::StartOutcome::Started => {
                     tracing::info!("Started gallery downloader");
                 }
+                crate::gallery_downloader::StartOutcome::Stopping => {
+                    tracing::info!("Gallery downloader is stopping");
+                }
                 crate::gallery_downloader::StartOutcome::AlreadyRunning => {
                     tracing::debug!("Gallery downloader is already running");
                 }

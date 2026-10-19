@@ -195,101 +195,82 @@ pub(super) async fn build_tls_acceptor(
 pub fn spawn_cert_refresh_watcher(
     state: AppState,
     rpc_client: Arc<RpcClient>,
-    shutdown: tokio_util::sync::CancellationToken,
+    shutdown: crate::shutdown::Shutdown,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        let cancellation = shutdown.token();
         loop {
             tokio::select! {
-                _ = state.cert_refresh_notify.notified() => {},
+                biased;
                 _ = shutdown.cancelled() => break,
+                _ = state.cert_refresh_notify.notified() => {},
             }
             if !state.do_cert_refresh.load(Ordering::Acquire) {
                 continue;
             }
-            tracing::info!("Starting certificate refresh (full server restart)...");
-
-            // 1. Suspend traffic
-            match rpc_client.client_suspend().await {
-                Ok(resp) if resp.status == rpc::ResponseStatus::Ok => {
-                    tracing::info!("Suspend notification successful");
-                }
-                _ => {
-                    tracing::warn!(
-                        "Failed to contact server to suspend client traffic; will retry"
-                    );
-                    tokio::time::sleep(Duration::from_secs(10)).await;
-                    state.cert_refresh_notify.notify_one();
-                    continue;
-                }
-            }
-
-            // Java waits 5s before httpServerShutdown(true), and that helper
-            // waits another 5s before closing the listener.
-            tokio::time::sleep(Duration::from_secs(5)).await;
-
-            // 2-5. Reject non-RPC traffic, stop the listener, drain active
-            // requests, and wait for the old server generation to terminate.
-            stop_server(&state).await;
-
-            // 6. Wait 1s
-            tokio::time::sleep(Duration::from_secs(1)).await;
-
-            if shutdown.is_cancelled() {
+            tracing::info!("Starting certificate refresh");
+            let Some(suspended) = cancellation
+                .run_until_cancelled(rpc_client.client_suspend())
+                .await
+            else {
                 break;
-            }
-
-            // 7. Start a fresh server generation with a new shutdown token.
-            let (ready_rx, new_shutdown) = start_server(state.clone());
-            state
-                .server_shutdown_token
-                .store(Some(Arc::new(new_shutdown)));
-
-            // 8. Wait for new server to bind
-            match ready_rx.await {
-                Ok(Ok(port)) => {
-                    tracing::info!("Server restarted successfully on port {}", port);
-                }
-                Ok(Err(e)) => {
-                    tracing::error!("Server restart failed to bind: {}", e);
-                    shutdown.cancel();
+            };
+            if !matches!(suspended, Ok(response) if response.status == rpc::ResponseStatus::Ok) {
+                tracing::warn!("Failed to suspend client traffic; will retry");
+                if cancellation
+                    .run_until_cancelled(tokio::time::sleep(Duration::from_secs(10)))
+                    .await
+                    .is_none()
+                {
                     break;
                 }
-                Err(_) => {
-                    tracing::error!("Server restart failed unexpectedly (oneshot dropped)");
-                    shutdown.cancel();
-                    break;
-                }
+                state.cert_refresh_notify.notify_one();
+                continue;
             }
-
-            // 9. Re-allow connections
-            state.allow_normal_connections.store(true, Ordering::SeqCst);
-
-            // 10. Resume traffic
-            match rpc_client.still_alive(true).await {
-                Ok(resp) if resp.status == rpc::ResponseStatus::Ok => {
-                    tracing::info!("Resume notification successful");
+            let refresh = async {
+                // Preserve Java's delay before retiring the old listener generation.
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                if !stop_server(
+                    &state,
+                    tokio::time::Instant::now() + Duration::from_secs(25),
+                )
+                .await
+                {
+                    return Err(HathError::Fatal(
+                        "server did not drain during certificate refresh".into(),
+                    ));
                 }
-                Ok(resp) => {
-                    let code = resp.fail_code.unwrap_or_default();
-                    // Java: TERM_BAD_NETWORK → dieWithError (terminate client)
-                    if code.starts_with("TERM_BAD_NETWORK") {
-                        tracing::error!(
-                            "Client is shutting down since the network is misconfigured; \
-                             correct firewall/forwarding settings then restart the client."
-                        );
-                        shutdown.cancel();
-                        break;
-                    } else {
-                        tracing::warn!("Failed stillAlive test: ({}) - will retry later", code);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let port = start_server(state.clone()).await?;
+                if shutdown.is_cancelled() {
+                    return Err(HathError::Shutdown);
+                }
+                state
+                    .allow_normal_connections
+                    .store(true, Ordering::Release);
+                tracing::info!(port, "Server restarted successfully");
+                match rpc_client.still_alive(true).await {
+                    Ok(response) if response.status == rpc::ResponseStatus::Ok => {}
+                    Ok(response) => {
+                        let code = response.fail_code.unwrap_or_default();
+                        if code.starts_with("TERM_BAD_NETWORK") {
+                            return Err(HathError::Fatal(code));
+                        }
+                        tracing::warn!(code, "Resume notification rejected; will retry later");
                     }
+                    Err(error) => tracing::warn!(%error, "Resume notification failed"),
                 }
-                Err(e) => {
-                    tracing::warn!("Still-alive request failed: {}", e);
+                state.do_cert_refresh.store(false, Ordering::Release);
+                Ok(())
+            };
+            match cancellation.run_until_cancelled(refresh).await {
+                None | Some(Err(HathError::Shutdown)) => break,
+                Some(Err(error)) => {
+                    shutdown.fail(error);
+                    break;
                 }
+                Some(Ok(())) => tracing::info!("Certificate refresh completed"),
             }
-
-            state.do_cert_refresh.store(false, Ordering::Release);
-            tracing::info!("Certificate refresh completed successfully");
         }
     })
 }
@@ -299,11 +280,11 @@ pub fn spawn_cert_refresh_watcher(
 pub fn spawn_time_cert_check(
     config: Arc<ArcSwap<Config>>,
     state: AppState,
-    shutdown: tokio_util::sync::CancellationToken,
+    shutdown: crate::shutdown::Shutdown,
 ) -> JoinHandle<()> {
     let global_shutdown = shutdown.clone();
     tokio::spawn(crate::utils::tick_every(
-        shutdown,
+        shutdown.token(),
         Duration::from_secs(300),
         move || {
             let config = config.clone();
@@ -321,7 +302,7 @@ pub fn spawn_time_cert_check(
                          gone wrong with certificate renewal. Check your system clock and \
                          internet connection, then restart the client manually."
                     );
-                    shutdown_signal.cancel();
+                    shutdown_signal.fail(HathError::CertExpired);
                 }
             }
         },

@@ -5,6 +5,7 @@ use crate::gallery_downloader::GalleryDownloadSupervisor;
 use crate::rpc::{self, ResponseStatus};
 use crate::rpc_client::{self, RpcClient};
 use crate::server::{self, AppState};
+use crate::shutdown::{Shutdown, ShutdownReason};
 use crate::stats::Stats;
 
 use arc_swap::{ArcSwap, ArcSwapOption};
@@ -16,6 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
+#[cfg(test)]
 use tokio_util::sync::CancellationToken;
 
 /// Main client entry point. Follows Java HentaiAtHomeClient.run() lifecycle.
@@ -40,7 +42,7 @@ pub async fn run() -> Result<()> {
         "This software comes with ABSOLUTELY NO WARRANTY. This is free software, and you are welcome to modify and redistribute it under the GPL v3 license."
     );
 
-    let shutdown = CancellationToken::new();
+    let shutdown = Shutdown::default();
 
     // Handle shutdown signals for graceful exit (Java: ShutdownHook).
     // On Unix: SIGINT (Ctrl+C), SIGTERM (docker stop / systemctl stop), SIGQUIT.
@@ -50,8 +52,7 @@ pub async fn run() -> Result<()> {
     {
         let s = shutdown.clone();
         tokio::spawn(async move {
-            shutdown_signal().await;
-            s.cancel();
+            s.request(ShutdownReason::Signal(shutdown_signal().await));
         });
     }
 
@@ -71,32 +72,52 @@ pub async fn run() -> Result<()> {
     let rpc_client = Arc::new(RpcClient::new(config.clone())?);
     tracing::info!("Getting initial stat from server...");
 
-    let stat_resp = rpc_client.server_stat().await?;
-    if stat_resp.status != ResponseStatus::Ok {
-        return Err(HathError::Rpc(
-            "Failed to get initial stat from server".into(),
-        ));
-    }
+    let initialize = async {
+        let stat_resp = rpc_client.server_stat().await?;
+        if stat_resp.status != ResponseStatus::Ok {
+            return Err(HathError::Rpc(
+                "Failed to get initial stat from server".into(),
+            ));
+        }
 
-    Config::apply_server_response(&config, &stat_resp);
+        Config::apply_server_response(&config, &stat_resp);
 
-    // 6. Client login: get full settings (uses corrected server time from step 5)
-    let login_resp = rpc_client.client_login().await?;
-    if login_resp.status != ResponseStatus::Ok {
-        let code = login_resp.fail_code.unwrap_or_default();
-        return Err(HathError::Rpc(format!("Login failed: {}", code)));
-    }
+        // 6. Client login: get full settings (uses corrected server time from step 5)
+        let login_resp = rpc_client.client_login().await?;
+        if login_resp.status != ResponseStatus::Ok {
+            let code = login_resp.fail_code.unwrap_or_default();
+            return Err(HathError::Rpc(format!("Login failed: {}", code)));
+        }
 
-    Config::apply_server_response(&config, &login_resp);
+        Config::apply_server_response(&config, &login_resp);
+
+        crate::proxy_downloader::build_proxy_client(&config.load())
+    };
+    let proxy_client = tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => return shutdown.result(),
+        result = initialize => result?,
+    };
 
     // 7. Init cache
     let stats = Arc::new(Stats::new());
     let cache = Arc::new(CacheHandler::new(
         config.clone(),
         stats.clone(),
-        shutdown.clone(),
+        shutdown.token(),
     )?);
 
+    run_with_cache(config, rpc_client, proxy_client, stats, cache, shutdown).await
+}
+
+async fn run_with_cache(
+    config: Arc<ArcSwap<Config>>,
+    rpc_client: Arc<RpcClient>,
+    proxy_client: Arc<reqwest::Client>,
+    stats: Arc<Stats>,
+    cache: Arc<CacheHandler>,
+    shutdown: Shutdown,
+) -> Result<()> {
     // 8. Build AppState and spawn HTTP server
     let allow_connections = Arc::new(AtomicBool::new(false));
     // Java: reportShutdown — set after successful notifyStart(), never cleared.
@@ -105,12 +126,13 @@ pub async fn run() -> Result<()> {
     let report_shutdown = Arc::new(AtomicBool::new(false));
     let flood_control = Arc::new(DashMap::new());
 
-    let proxy_client = crate::proxy_downloader::build_proxy_client(&config.load())?;
+    let transfers = crate::tasks::TransferTasks::new(shutdown.clone());
     let gallery_downloader = GalleryDownloadSupervisor::new(
         config.clone(),
         rpc_client.clone(),
         stats.clone(),
-        shutdown.clone(),
+        shutdown.token(),
+        transfers.clone(),
     );
 
     let app_state = AppState {
@@ -129,138 +151,152 @@ pub async fn run() -> Result<()> {
         last_overload_notification: Arc::new(Mutex::new(None)),
         do_cert_refresh: Arc::new(AtomicBool::new(false)),
         cert_refresh_notify: Arc::new(Notify::new()),
-        server_shutdown_token: Arc::new(ArcSwapOption::const_empty()),
-        server_terminated: Arc::new(AtomicBool::new(false)),
+        generation: Arc::new(Mutex::new(None)),
+        shutdown: shutdown.clone(),
+        transfers,
         proxy_client,
     };
 
-    let (ready_rx, server_shutdown_token) = server::start_server(app_state.clone());
-    app_state
-        .server_shutdown_token
-        .store(Some(Arc::new(server_shutdown_token)));
+    let mut background_tasks = None;
+    // Keep every fallible startup step inside the same shutdown boundary.
+    let operation = async {
+        server::start_server(app_state.clone()).await?;
 
-    // Wait for server to bind before notifying the RPC server
-    match ready_rx.await {
-        Ok(Ok(_port)) => {}
-        Ok(Err(e)) => {
-            return Err(HathError::Config(format!("Server startup failed: {}", e)));
-        }
-        Err(_) => {
-            return Err(HathError::Config(
-                "Server startup failed unexpectedly".into(),
-            ));
-        }
-    }
-
-    // 9. notifyStart: tell server we're ready (this triggers connectivity test).
-    // Java: if notifyStart() returns false, the main thread skips
-    // allowNormalConnections and all periodic tasks, then waits for Ctrl+C.
-    let start_resp = rpc_client.client_start().await?;
-    let startup_ok = if start_resp.status == ResponseStatus::Ok {
-        true
-    } else {
-        let code = start_resp.fail_code.unwrap_or_default();
-        tracing::error!("Startup failure: {}", code);
-        if code.starts_with("FAIL_OTHER_CLIENT_CONNECTED") || code.starts_with("FAIL_CID_IN_USE") {
-            tracing::error!(
-                "Another client with the same ID ({}) is already connected to the server. \
-                 This can happen if the Java client is still running. \
-                 If you are switching from the Java client, make sure to stop it first, \
-                 then wait 5-10 minutes before starting this client.",
-                config.load().client_id.0
-            );
-            return Err(HathError::Fatal(code));
-        }
-        if code.starts_with("FAIL_CONNECT_TEST") {
-            tracing::error!(
-                "FAIL_CONNECT_TEST: The server was unable to verify your connection. \
-                 This usually means your port forwarding or firewall settings are incorrect. \
-                 Please ensure port {} is accessible from the internet.",
-                config.load().client_port
-            );
-            tracing::error!(
-                "The client will remain running so you can diagnose firewall and port \
-                 forwarding issues. Press Ctrl+C to exit."
-            );
+        // 9. notifyStart: tell server we're ready (this triggers connectivity test).
+        // Java: if notifyStart() returns false, the main thread skips
+        // allowNormalConnections and all periodic tasks, then waits for Ctrl+C.
+        let start_resp = rpc_client.client_start().await?;
+        let startup_ok = if start_resp.status == ResponseStatus::Ok {
+            true
         } else {
-            return Err(HathError::Fatal(format!(
-                "Unexpected client_start failure: {}",
-                code
-            )));
+            let code = start_resp.fail_code.unwrap_or_default();
+            tracing::error!("Startup failure: {}", code);
+            if code.starts_with("FAIL_OTHER_CLIENT_CONNECTED")
+                || code.starts_with("FAIL_CID_IN_USE")
+            {
+                tracing::error!(
+                    "Another client with the same ID ({}) is already connected to the server. \
+                     This can happen if the Java client is still running. \
+                     If you are switching from the Java client, make sure to stop it first, \
+                     then wait 5-10 minutes before starting this client.",
+                    config.load().client_id.0
+                );
+                return Err(HathError::Fatal(code));
+            }
+            if code.starts_with("FAIL_CONNECT_TEST") {
+                tracing::error!(
+                    "FAIL_CONNECT_TEST: The server was unable to verify your connection. \
+                     This usually means your port forwarding or firewall settings are incorrect. \
+                     Please ensure port {} is accessible from the internet.",
+                    config.load().client_port
+                );
+                tracing::error!(
+                    "The client will remain running so you can diagnose firewall and port \
+                     forwarding issues. Press Ctrl+C to exit."
+                );
+            } else {
+                return Err(HathError::Fatal(format!(
+                    "Unexpected client_start failure: {}",
+                    code
+                )));
+            }
+            false
+        };
+
+        background_tasks = if startup_ok {
+            // 10. Allow normal connections
+            allow_connections.store(true, Ordering::SeqCst);
+            report_shutdown.store(true, Ordering::SeqCst);
+            stats.program_started();
+
+            // Refresh settings after notifyStart
+            match rpc_client.refresh_settings().await {
+                Ok(refresh_resp) if refresh_resp.status == ResponseStatus::Ok => {
+                    Config::apply_server_response(&config, &refresh_resp);
+                }
+                Ok(_) => {
+                    tracing::warn!("refresh_settings returned non-OK status after startup");
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to refresh settings after startup: {}", e);
+                }
+            }
+
+            // Initial blacklist fetch (3-day delta, synchronous)
+            cache::fetch_initial_blacklist(&rpc_client, &cache).await;
+
+            tracing::info!("Startup completed successfully. Starting normal operation");
+
+            // 11. Spawn periodic background tasks
+            Some(spawn_background_tasks(
+                cache.clone(),
+                config.clone(),
+                stats.clone(),
+                app_state.clone(),
+                rpc_client.clone(),
+                shutdown.clone(),
+            ))
+        } else {
+            None
+        };
+
+        if let Some(tasks) = background_tasks.as_mut() {
+            let error = tasks.wait_for_failure().await;
+            app_state.transfers.invalidate();
+            return Err(error);
         }
-        false
+        std::future::pending().await
     };
-
-    let background_tasks = if startup_ok {
-        // 10. Allow normal connections
-        allow_connections.store(true, Ordering::SeqCst);
-        report_shutdown.store(true, Ordering::SeqCst);
-        stats.program_started();
-
-        // Refresh settings after notifyStart
-        match rpc_client.refresh_settings().await {
-            Ok(refresh_resp) if refresh_resp.status == ResponseStatus::Ok => {
-                Config::apply_server_response(&config, &refresh_resp);
-            }
-            Ok(_) => {
-                tracing::warn!("refresh_settings returned non-OK status after startup");
-            }
-            Err(e) => {
-                tracing::warn!("Failed to refresh settings after startup: {}", e);
-            }
-        }
-
-        // Initial blacklist fetch (3-day delta, synchronous)
-        cache::fetch_initial_blacklist(&rpc_client, &cache).await;
-
-        tracing::info!("Startup completed successfully. Starting normal operation");
-
-        // 11. Spawn periodic background tasks
-        Some(spawn_background_tasks(
-            cache.clone(),
-            config.clone(),
-            stats.clone(),
-            app_state.clone(),
-            rpc_client.clone(),
-            shutdown.clone(),
-        ))
-    } else {
-        None
+    let result: Result<()> = tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => Ok(()),
+        result = operation => result,
     };
+    if let Err(error) = result {
+        shutdown.fail(error);
+    }
 
-    // Wait for shutdown signal
-    shutdown.cancelled().await;
-
-    // Graceful shutdown (Java order: client_stop → stop listener → drain → save data).
-    // Java: reportShutdown is only set after successful notifyStart().
-    // Unlike allow_connections, it's never toggled during cert refresh.
+    // One shared I/O budget leaves time for the final snapshot before Docker's 60s grace expires.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(40);
     tracing::info!("Shutting down...");
-    if report_shutdown.load(Ordering::Relaxed)
-        && let Err(e) = rpc_client.client_stop().await
-    {
-        tracing::warn!("Failed to notify server about shutdown: {}", e);
+    allow_connections.store(false, Ordering::Release);
+    if report_shutdown.load(Ordering::Relaxed) {
+        match tokio::time::timeout(Duration::from_secs(5), rpc_client.client_stop()).await {
+            Ok(Ok(response)) if response.status == ResponseStatus::Ok => {}
+            Ok(Ok(response)) => {
+                tracing::warn!(code = ?response.fail_code, "Shutdown notification rejected")
+            }
+            Ok(Err(error)) => tracing::warn!(%error, "Failed to notify server about shutdown"),
+            Err(_) => tracing::warn!("Shutdown notification timed out"),
+        }
     }
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    server::stop_server(&app_state).await;
-    let background_tasks_stopped = if let Some(background_tasks) = background_tasks {
-        background_tasks.join_for(Duration::from_secs(5)).await
-    } else {
-        true
+    // Stop the refresh watcher before taking ownership of its current generation.
+    let background_clean = match background_tasks {
+        Some(tasks) => tasks.join_for(Duration::from_secs(5)).await,
+        None => true,
     };
-    if background_tasks_stopped {
-        cache.save_persistent_data();
-    } else {
-        tracing::warn!(
-            "Skipping persistent cache save because background shutdown was incomplete; \
-             the next startup will rescan the cache"
-        );
-        cache.discard_persistent_data();
-    }
-    {
-        let cfg = config.load();
-        cfg.save_client_login().ok();
-    }
+    let server_deadline = deadline.min(tokio::time::Instant::now() + Duration::from_secs(25));
+    let server_clean = server::stop_server(&app_state, server_deadline).await;
+    let transfers_clean = app_state.transfers.finish(deadline).await;
+    let clean = background_clean && server_clean && transfers_clean;
+    let persistence = save_shutdown_cache(&cache, clean);
+    config.load().save_client_login().ok();
+    shutdown.result().and(persistence)
+}
 
+fn save_shutdown_cache(cache: &CacheHandler, quiescent: bool) -> Result<()> {
+    if !quiescent {
+        tracing::warn!("Shutdown incomplete; discarding snapshot so the next startup rescans");
+        cache.discard_persistent_data();
+        return Err(HathError::Fatal(
+            "shutdown left unfinished cache work".into(),
+        ));
+    }
+    if !cache.save_persistent_data() {
+        return Err(HathError::Cache(
+            "failed to save the final cache snapshot".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -270,7 +306,7 @@ fn spawn_background_tasks(
     stats: Arc<Stats>,
     app_state: AppState,
     rpc_client: Arc<RpcClient>,
-    shutdown: CancellationToken,
+    shutdown: Shutdown,
 ) -> BackgroundTasks {
     let mut tasks = BackgroundTasks::new();
     tasks.track(
@@ -279,15 +315,15 @@ fn spawn_background_tasks(
     );
     tasks.track(
         "cache-periodic-stats",
-        cache::spawn_periodic_stats(cache.clone(), stats.clone(), shutdown.clone()),
+        cache::spawn_periodic_stats(cache.clone(), stats.clone(), shutdown.token()),
     );
     tasks.track(
         "flood-control-pruner",
-        server::spawn_flood_control_pruner(app_state.clone(), shutdown.clone()),
+        server::spawn_flood_control_pruner(app_state.clone(), shutdown.token()),
     );
     tasks.track(
         "session-reaper",
-        server::spawn_session_reaper(app_state.session_manager.clone(), shutdown.clone()),
+        server::spawn_session_reaper(app_state.session_manager.clone(), shutdown.token()),
     );
     tasks.track(
         "still-alive-heartbeat",
@@ -299,11 +335,11 @@ fn spawn_background_tasks(
     );
     tasks.track(
         "rpc-failure-clearer",
-        rpc_client::spawn_rpc_failure_clearer(rpc_client.clone(), shutdown.clone()),
+        rpc_client::spawn_rpc_failure_clearer(rpc_client.clone(), shutdown.token()),
     );
     tasks.track(
         "blacklist-fetcher",
-        cache::spawn_blacklist_fetcher(rpc_client.clone(), cache, shutdown.clone()),
+        cache::spawn_blacklist_fetcher(rpc_client.clone(), cache, shutdown.token()),
     );
     tasks.track(
         "cert-refresh-watcher",
@@ -332,6 +368,24 @@ impl BackgroundTasks {
         self.tasks.push_back(BackgroundTask { name, handle });
     }
 
+    async fn wait_for_failure(&mut self) -> HathError {
+        if self.tasks.is_empty() {
+            return std::future::pending().await;
+        }
+        let (result, index) = {
+            let (result, index, _) = futures_util::future::select_all(
+                self.tasks.iter_mut().map(|task| &mut task.handle),
+            )
+            .await;
+            (result, index)
+        };
+        let task = self.tasks.remove(index).unwrap();
+        HathError::Fatal(format!(
+            "background task {} stopped unexpectedly: {result:?}",
+            task.name
+        ))
+    }
+
     async fn join_for(mut self, timeout: Duration) -> bool {
         if self.tasks.is_empty() {
             return true;
@@ -347,7 +401,7 @@ impl BackgroundTasks {
                         if !e.is_cancelled() {
                             tracing::warn!("Background task {} exited with error: {}", task.name, e);
                         }
-                        self.abort_remaining();
+                        self.abort_remaining().await;
                         return false;
                     }
                 }
@@ -357,7 +411,8 @@ impl BackgroundTasks {
                         task.name
                     );
                     task.handle.abort();
-                    self.abort_remaining();
+                    let _ = task.handle.await;
+                    self.abort_remaining().await;
                     return false;
                 }
             }
@@ -365,9 +420,12 @@ impl BackgroundTasks {
         true
     }
 
-    fn abort_remaining(&mut self) {
-        for task in self.tasks.drain(..) {
+    async fn abort_remaining(&mut self) {
+        for task in &self.tasks {
             task.handle.abort();
+        }
+        for task in self.tasks.drain(..) {
+            let _ = task.handle.await;
         }
     }
 }
@@ -375,7 +433,7 @@ impl BackgroundTasks {
 /// Wait for any shutdown signal.
 /// Unix: SIGINT, SIGTERM, or SIGQUIT.
 /// Windows: Ctrl+C, Ctrl+Break, or console close (all via ctrl_c()).
-async fn shutdown_signal() {
+async fn shutdown_signal() -> &'static str {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
@@ -383,21 +441,101 @@ async fn shutdown_signal() {
             signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
         let mut sigquit = signal(SignalKind::quit()).expect("failed to register SIGQUIT handler");
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => tracing::info!("SIGINT received, shutting down gracefully..."),
-            _ = sigterm.recv() => tracing::info!("SIGTERM received, shutting down gracefully..."),
-            _ = sigquit.recv() => tracing::info!("SIGQUIT received, shutting down gracefully..."),
+            _ = tokio::signal::ctrl_c() => "SIGINT",
+            _ = sigterm.recv() => "SIGTERM",
+            _ = sigquit.recv() => "SIGQUIT",
         }
     }
     #[cfg(not(unix))]
     {
         tokio::signal::ctrl_c().await.ok();
-        tracing::info!("Interrupt received, shutting down gracefully...");
+        "interrupt"
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn certificate_failures_preserve_loaded_cache_for_restart() {
+        use crate::test_support::{FakeHttpServer, FakeResponse, FixtureDirs};
+
+        for (response, expected_error) in [
+            (FakeResponse::ok(Vec::new()), "invalid PKCS12 archive"),
+            (FakeResponse::status(404, "Not Found", "missing"), "404"),
+        ] {
+            let dirs = FixtureDirs::new();
+            let server = FakeHttpServer::start(vec![response]).await;
+            let mut cfg = dirs.config();
+            cfg.rpc_servers = vec!["127.0.0.1".parse().unwrap()];
+            cfg.rpc_port = server.port();
+            let config = Arc::new(ArcSwap::from_pointee(cfg));
+            let stats = Arc::new(Stats::new());
+            let shutdown = Shutdown::default();
+            let cache = Arc::new(
+                CacheHandler::new(config.clone(), stats.clone(), shutdown.token()).unwrap(),
+            );
+            // Nonzero metadata distinguishes a restored snapshot from an empty rescan.
+            let hv = crate::hvfile::HVFile::from_fileid(
+                "0123456789abcdef0123456789abcdef01234567-123-10-10-jpg",
+            )
+            .unwrap();
+            cache.register_proxy_file(&hv);
+            cache.save_persistent_data();
+            drop(cache);
+            let cache = Arc::new(
+                CacheHandler::new(config.clone(), stats.clone(), shutdown.token()).unwrap(),
+            );
+            assert!(!dirs.data_dir.join("pcache_info").exists());
+            let rpc_client = Arc::new(RpcClient::new(config.clone()).unwrap());
+
+            let proxy_client = crate::proxy_downloader::build_proxy_client(&config.load()).unwrap();
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                run_with_cache(
+                    config.clone(),
+                    rpc_client,
+                    proxy_client,
+                    stats,
+                    cache,
+                    shutdown,
+                ),
+            )
+            .await
+            .expect("failed server startup must finish shutdown promptly");
+
+            assert!(result.unwrap_err().to_string().contains(expected_error));
+            assert!(
+                dirs.data_dir.join("pcache_info").exists(),
+                "a handled startup failure must republish the loaded cache snapshot"
+            );
+            let restarted_stats = Arc::new(Stats::new());
+            let _restarted =
+                CacheHandler::new(config, restarted_stats.clone(), CancellationToken::new())
+                    .unwrap();
+            assert_eq!(restarted_stats.cache_count.load(Ordering::Relaxed), 1);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forced_transfer_abort_discards_snapshot_and_reports_failure() {
+        let dirs = crate::test_support::FixtureDirs::new();
+        let config = Arc::new(ArcSwap::from_pointee(dirs.config()));
+        let cache =
+            CacheHandler::new(config, Arc::new(Stats::new()), CancellationToken::new()).unwrap();
+        assert!(cache.save_persistent_data());
+        let shutdown = Shutdown::default();
+        shutdown.request(ShutdownReason::Signal("SIGTERM"));
+        let tasks = crate::tasks::TransferTasks::new(shutdown.clone());
+        tasks.spawn(std::future::pending());
+        let clean = tasks
+            .finish(tokio::time::Instant::now() + Duration::from_secs(1))
+            .await;
+        let persistence = save_shutdown_cache(&cache, clean);
+        assert!(shutdown.result().and(persistence).is_err());
+        assert!(!dirs.data_dir.join("pcache_info").exists());
+    }
 
     #[tokio::test]
     async fn background_task_timeout_prevents_a_clean_shutdown_result() {

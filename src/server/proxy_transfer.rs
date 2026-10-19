@@ -1,6 +1,5 @@
 use super::body::StreamingBody;
 use super::response::{self, ResponseSpec};
-use crate::cache::CacheHandler;
 use crate::config::Config;
 use crate::error::Result;
 use crate::proxy_downloader::ProxyFileDownloader;
@@ -19,13 +18,19 @@ impl ProxyTransfer {
     pub(crate) async fn start(
         fileid: &str,
         sources: &[reqwest::Url],
+        state: &super::AppState,
         config: &Config,
-        cache_handler: Option<Arc<CacheHandler>>,
-        stats: Arc<Stats>,
-        client: &Arc<reqwest::Client>,
     ) -> Result<Self> {
-        let downloader =
-            ProxyFileDownloader::new(fileid, sources, config, cache_handler, stats, client).await?;
+        let downloader = ProxyFileDownloader::new(
+            fileid,
+            sources,
+            config,
+            Some(state.cache.clone()),
+            state.stats.clone(),
+            &state.proxy_client,
+            &state.transfers,
+        )
+        .await?;
         let parts = downloader.into_parts();
         let content_length = parts.content_length();
         let content_type = parts.content_type().to_string();

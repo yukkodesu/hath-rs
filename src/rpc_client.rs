@@ -445,13 +445,13 @@ impl RpcClient {
 }
 
 /// Spawn periodic still_alive heartbeat (110s interval).
-pub fn spawn_still_alive_heartbeat(
+pub(crate) fn spawn_still_alive_heartbeat(
     rpc_client: Arc<RpcClient>,
     stats: Arc<Stats>,
-    shutdown: tokio_util::sync::CancellationToken,
+    shutdown: crate::shutdown::Shutdown,
 ) -> JoinHandle<()> {
     tokio::spawn(crate::utils::tick_every(
-        shutdown.clone(),
+        shutdown.token(),
         Duration::from_secs(110),
         move || {
             let rpc_client = rpc_client.clone();
@@ -470,7 +470,7 @@ pub fn spawn_still_alive_heartbeat(
                                 "Client is shutting down since the network is misconfigured; \
                              correct firewall/forwarding settings then restart the client."
                             );
-                            shutdown.cancel();
+                            shutdown.fail(HathError::Fatal(code));
                         } else {
                             tracing::warn!("Failed stillAlive test: ({}) - will retry later", code);
                         }

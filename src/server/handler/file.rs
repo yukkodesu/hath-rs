@@ -82,16 +82,7 @@ pub(super) async fn handle_file_serve(
                 // initialize() for both GET and HEAD. The init result
                 // (connecting to source, checking Content-Length/size)
                 // determines the status code. HEAD then skips body.
-                match ProxyTransfer::start(
-                    &fileid,
-                    &sources,
-                    &ctx.config,
-                    Some(ctx.state.cache.clone()),
-                    ctx.state.stats.clone(),
-                    &ctx.state.proxy_client,
-                )
-                .await
-                {
+                match ProxyTransfer::start(&fileid, &sources, &ctx.state, &ctx.config).await {
                     Ok(proxy) => proxy.into_response(head_only, ctx.state.stats.clone()),
                     Err(e) => {
                         tracing::warn!("Proxy download failed for {}: {}", fileid, e);
@@ -148,6 +139,7 @@ mod tests {
             rpc_client.clone(),
             stats.clone(),
             tokio_util::sync::CancellationToken::new(),
+            crate::tasks::TransferTasks::new(crate::shutdown::Shutdown::default()),
         );
         let proxy_client = crate::proxy_downloader::build_proxy_client(&config.load()).unwrap();
 
@@ -167,8 +159,9 @@ mod tests {
             last_overload_notification: Arc::new(Mutex::new(None)),
             do_cert_refresh: Arc::new(AtomicBool::new(false)),
             cert_refresh_notify: Arc::new(Notify::new()),
-            server_shutdown_token: Arc::new(ArcSwapOption::const_empty()),
-            server_terminated: Arc::new(AtomicBool::new(false)),
+            generation: Arc::new(Mutex::new(None)),
+            shutdown: crate::shutdown::Shutdown::default(),
+            transfers: crate::tasks::TransferTasks::new(crate::shutdown::Shutdown::default()),
             proxy_client,
         }
     }

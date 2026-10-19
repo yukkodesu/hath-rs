@@ -11,7 +11,9 @@ pub mod proxy_downloader;
 pub mod rpc;
 pub mod rpc_client;
 pub mod server;
+mod shutdown;
 pub mod stats;
+mod tasks;
 pub mod tls;
 pub mod types;
 pub mod utils;
@@ -26,9 +28,13 @@ pub(crate) mod test_support;
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[tokio::main]
-async fn main() {
-    if let Err(e) = client::run().await {
-        eprintln!("Fatal error: {}", e);
-        std::process::exit(1);
+async fn main() -> std::process::ExitCode {
+    match client::run().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            tracing::error!(%error, "Client stopped with an error");
+            eprintln!("Fatal error: {error}");
+            std::process::ExitCode::FAILURE
+        }
     }
 }
