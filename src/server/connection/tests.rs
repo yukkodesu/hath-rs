@@ -8,7 +8,7 @@ use crate::stats::Stats;
 use crate::test_support::{FakeHttpServer, FakeResponse, FixtureDirs};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use dashmap::DashMap;
-use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
+use rustls::pki_types::PrivatePkcs8KeyDer;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU32, Ordering},
@@ -39,12 +39,9 @@ impl Fixture {
         let cache =
             Arc::new(CacheHandler::new(config.clone(), stats.clone(), shutdown.clone()).unwrap());
         let rpc_client = Arc::new(RpcClient::new(config.clone()).unwrap());
-        let cert = CertificateDer::from(
-            include_bytes!("../../../tests/fixtures/tls/localhost.cert.der").to_vec(),
-        );
-        let key = PrivatePkcs8KeyDer::from(
-            include_bytes!("../../../tests/fixtures/tls/localhost.key.der").to_vec(),
-        );
+        let identity = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        let cert = identity.cert.der().clone();
+        let key = PrivatePkcs8KeyDer::from(identity.signing_key.serialize_der());
         let server_tls = rustls::ServerConfig::builder_with_provider(crate::tls::aws_lc_provider())
             .with_safe_default_protocol_versions()
             .unwrap()
