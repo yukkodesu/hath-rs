@@ -1,5 +1,6 @@
 mod admission;
 mod body;
+mod connection;
 mod handler;
 mod middleware;
 mod peer;
@@ -9,12 +10,11 @@ mod response;
 mod service;
 mod threaded_proxy;
 mod tls;
+mod transport;
 
 use self::admission::FloodControlEntry;
 pub(crate) use self::admission::spawn_flood_control_pruner;
-use self::middleware::access_log::AccessLogService;
 pub(crate) use self::middleware::session::{SessionManager, spawn_session_reaper};
-use self::service::HathService;
 pub(crate) use self::tls::{spawn_cert_refresh_watcher, spawn_time_cert_check};
 use crate::bandwidth::BandwidthMonitor;
 use crate::cache::CacheHandler;
@@ -26,8 +26,6 @@ use crate::stats::Stats;
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use dashmap::DashMap;
-use hyper::server::conn::http1;
-use hyper_util::rt::TokioIo;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -208,86 +206,12 @@ async fn run_server(
 
     loop {
         tokio::select! {
+            biased;
             _ = server_shutdown.cancelled() => break,
-            result = listener.accept() => {
-                let (stream, remote_addr) = match result {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::warn!("Accept error: {}", e);
-                        continue;
-                    },
-                };
-
-                let state = state.clone();
-
-                // Load current TLS acceptor (may have been refreshed)
-                let tls_acceptor = state.tls_acceptor.load_full()
-                    .expect("TLS acceptor not initialized");
-
-                let conn_state = state.clone();
-                tokio::spawn(async move {
-                    // --- TLS handshake first (matches Java: SSLServerSocket.accept()
-                    //     completes the handshake before any policy checks are applied) ---
-                    let tls_stream = match tls_acceptor.accept(stream).await {
-                        Ok(stream) => stream,
-                        Err(e) => {
-                        let msg = e.to_string();
-                        if msg.contains("connection reset") || msg.contains("unexpected EOF") {
-                            tracing::debug!("TLS accept from {} closed early: {}", remote_addr, e);
-                        } else {
-                            tracing::warn!("TLS accept failed from {}: {:?}", remote_addr, e);
-                        }
-                        return;
-                        }
-                    };
-
-                    // --- Post-handshake policy checks (Java: HTTPServer.run() order) ---
-                    let cfg = conn_state.config.load_full();
-                    let origin = peer::SessionOrigin::from_remote_addr(remote_addr, &cfg);
-                    admission::configure_send_buffer(tls_stream.get_ref().0, &cfg);
-                    let admission = match admission::admit_connection(
-                        &conn_state,
-                        remote_addr,
-                        origin,
-                        &cfg,
-                    )
-                    .await
-                    {
-                        admission::AdmissionOutcome::Accepted(admission) => admission,
-                        admission::AdmissionOutcome::Rejected(reason) => {
-                            let _ = reason;
-                            return;
-                        }
-                    };
-
-                    let io = TokioIo::new(tls_stream);
-                    let conn_id = admission.conn_id;
-                    let session_handle = admission.handle.clone();
-                    let cancel = admission.cancel.clone();
-                    let _session_guard = admission.guard;
-                    let service = AccessLogService::new(
-                        HathService {
-                            state: conn_state.clone(),
-                            origin,
-                            session: session_handle.clone(),
-                        },
-                        conn_id,
-                        remote_addr,
-                        Some(session_handle),
-                    );
-
-                    tokio::select! {
-                        result = http1::Builder::new().serve_connection(io, service) => {
-                            if let Err(e) = result
-                                && !e.to_string().contains("connection closed") {
-                                    tracing::debug!("HTTP connection error: {}", e);
-                                }
-                        }
-                        _ = cancel.cancelled() => {
-                            tracing::debug!("HTTP session {} timed out; closing connection", conn_id);
-                        }
-                    }
-                });
+            (stream, remote_addr) = transport::accept_tcp(&listener) => {
+                if let Some(connection) = connection::Connection::accept(&state, stream, remote_addr, &server_shutdown) {
+                    tokio::spawn(connection.serve());
+                }
             }
         }
     }

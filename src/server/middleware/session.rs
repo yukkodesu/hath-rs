@@ -4,8 +4,9 @@ use dashmap::DashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 const PENDING_TIMEOUT: Duration = Duration::from_secs(30);
@@ -123,9 +124,9 @@ impl SessionManager {
             .set_open_connections(active_before.saturating_add(1));
 
         let cancel = CancellationToken::new();
-        self.inner
-            .sessions
-            .insert(conn_id, SessionState::new(remote_addr, cancel.clone()));
+        let session = SessionState::new(remote_addr, cancel.clone());
+        let pending_deadline = session.started_at + PENDING_TIMEOUT;
+        self.inner.sessions.insert(conn_id, session);
 
         Ok(SessionAdmission {
             guard: SessionGuard {
@@ -137,6 +138,7 @@ impl SessionManager {
                 inner: self.inner.clone(),
             },
             cancel,
+            pending_deadline,
             active_before: matches!(admission_class, AdmissionClass::Limited)
                 .then_some(active_before),
         })
@@ -171,6 +173,7 @@ impl SessionManager {
 }
 
 pub struct SessionAdmission {
+    pub pending_deadline: Instant,
     pub guard: SessionGuard,
     pub handle: SessionHandle,
     pub cancel: CancellationToken,
