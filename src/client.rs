@@ -518,6 +518,25 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn forced_transfer_abort_discards_snapshot_and_reports_failure() {
+        let dirs = crate::test_support::FixtureDirs::new();
+        let config = Arc::new(ArcSwap::from_pointee(dirs.config()));
+        let cache =
+            CacheHandler::new(config, Arc::new(Stats::new()), CancellationToken::new()).unwrap();
+        assert!(cache.save_persistent_data());
+        let shutdown = Shutdown::default();
+        shutdown.request(ShutdownReason::Signal("SIGTERM"));
+        let tasks = crate::tasks::TransferTasks::new(shutdown.clone());
+        tasks.spawn(std::future::pending());
+        let clean = tasks
+            .finish(tokio::time::Instant::now() + Duration::from_secs(1))
+            .await;
+        let persistence = save_shutdown_cache(&cache, clean);
+        assert!(shutdown.result().and(persistence).is_err());
+        assert!(!dirs.data_dir.join("pcache_info").exists());
+    }
+
     #[tokio::test]
     async fn background_task_timeout_prevents_a_clean_shutdown_result() {
         let mut tasks = BackgroundTasks::new();

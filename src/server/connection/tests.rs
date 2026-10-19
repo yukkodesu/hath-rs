@@ -430,3 +430,155 @@ async fn long_response_survives_read_timeout_and_generation_stop() {
         .unwrap();
     fixture.assert_active(0);
 }
+
+#[tokio::test]
+async fn process_shutdown_drains_streaming_proxy_before_cache_snapshot() {
+    use crate::server::proxy_transfer::ProxyTransfer;
+    use crate::server::response::ResponsePolicy;
+    use http_body_util::BodyExt;
+
+    let fixture = Fixture::new();
+    let contents = vec![42; 4096];
+    let fileid = format!(
+        "{}-{}-jpg",
+        crate::utils::sha1_bytes(&contents),
+        contents.len()
+    );
+    let hv = crate::hvfile::HVFile::from_fileid(&fileid).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url =
+        reqwest::Url::parse(&format!("http://{}/image", listener.local_addr().unwrap())).unwrap();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let upstream = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            request.push(socket.read_u8().await.unwrap());
+        }
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4096\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        socket.write_all(&vec![42; 2048]).await.unwrap();
+        released.await.unwrap();
+        socket.write_all(&vec![42; 2048]).await.unwrap();
+    });
+    let config = fixture.state.config.load_full();
+    let transfer = ProxyTransfer::start(&fileid, &[url], &fixture.state, &config)
+        .await
+        .unwrap();
+    let response = transfer.into_response(false, fixture.state.stats.clone());
+    let mut body = ResponsePolicy::new(true, None, fixture.state.stats.clone())
+        .finalize(response)
+        .await
+        .into_body();
+    let first = timeout(Duration::from_secs(2), body.frame())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+        .into_data()
+        .unwrap();
+    assert!(
+        !upstream.is_finished(),
+        "first frame must be served before upstream completion"
+    );
+    let mut received = first.to_vec();
+    fixture
+        .state
+        .shutdown
+        .request(crate::shutdown::ShutdownReason::Signal("SIGTERM"));
+    let tasks = fixture.state.transfers.clone();
+    let drain = tokio::spawn(async move {
+        tasks
+            .finish(tokio::time::Instant::now() + Duration::from_secs(5))
+            .await
+    });
+    tokio::task::yield_now().await;
+    assert!(
+        !drain.is_finished(),
+        "shutdown must wait for proxy finalization"
+    );
+    release.send(()).unwrap();
+    while let Some(frame) = body.frame().await {
+        received.extend_from_slice(&frame.unwrap().into_data().unwrap());
+    }
+    assert_eq!(received, contents);
+    assert!(drain.await.unwrap());
+    upstream.await.unwrap();
+    assert_eq!(
+        std::fs::read(hv.cache_path(&config.cache_dir)).unwrap(),
+        contents
+    );
+    assert!(fixture.state.cache.save_persistent_data());
+    let stats = Arc::new(Stats::new());
+    let _restarted = CacheHandler::new(
+        fixture.state.config.clone(),
+        stats.clone(),
+        CancellationToken::new(),
+    )
+    .unwrap();
+    assert_eq!(stats.cache_count.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn shutdown_during_certificate_suspend_cannot_start_another_generation() {
+    let fixture = Fixture::new();
+    let rpc = FakeHttpServer::start(vec![
+        FakeResponse::ok("OK\n").delay_before_body(Duration::from_secs(3600)),
+    ])
+    .await;
+    fixture.configure(|cfg| {
+        cfg.rpc_servers = vec!["127.0.0.1".parse().unwrap()];
+        cfg.rpc_port = rpc.port();
+    });
+    let watcher = crate::server::spawn_cert_refresh_watcher(
+        fixture.state.clone(),
+        fixture.state.rpc_client.clone(),
+        fixture.state.shutdown.clone(),
+    );
+    fixture.state.do_cert_refresh.store(true, Ordering::Release);
+    fixture.state.cert_refresh_notify.notify_one();
+    timeout(Duration::from_secs(2), async {
+        while rpc.requests().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    fixture
+        .state
+        .shutdown
+        .request(crate::shutdown::ShutdownReason::Signal("SIGTERM"));
+    timeout(Duration::from_secs(1), watcher)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        crate::server::start_server(fixture.state.clone()).await,
+        Err(crate::error::HathError::Shutdown)
+    ));
+    assert!(fixture.state.generation.lock().await.is_none());
+    assert_eq!(rpc.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn generation_stop_joins_pending_tls_before_returning() {
+    let fixture = Fixture::new();
+    let (peer, connection) = fixture.accept().await;
+    let task = tokio::spawn(connection.unwrap().serve());
+    *fixture.state.generation.lock().await = Some(crate::server::ServerGeneration {
+        stop: fixture.shutdown.clone(),
+        task,
+    });
+    assert!(
+        crate::server::stop_server(
+            &fixture.state,
+            tokio::time::Instant::now() + Duration::from_secs(1)
+        )
+        .await
+    );
+    fixture.assert_active(0);
+    assert_closed(peer).await;
+    assert!(fixture.state.generation.lock().await.is_none());
+}
