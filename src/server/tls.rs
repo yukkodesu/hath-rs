@@ -82,12 +82,10 @@ fn order_certificate_chain(
     for (index, certificate) in certificates.iter().enumerate() {
         let (_, parsed) = x509_parser::prelude::parse_x509_certificate(certificate.as_ref())
             .map_err(|error| HathError::Tls(format!("invalid PKCS12 certificate: {error}")))?;
-        if parsed.public_key().raw == key_spki.as_ref() {
-            if leaf_index.replace(index).is_some() {
-                return Err(HathError::Tls(
-                    "multiple PKCS12 certificates match the private key".into(),
-                ));
-            }
+        if parsed.public_key().raw == key_spki.as_ref() && leaf_index.replace(index).is_some() {
+            return Err(HathError::Tls(
+                "multiple PKCS12 certificates match the private key".into(),
+            ));
         }
     }
     let leaf_index = leaf_index
@@ -102,12 +100,10 @@ fn order_certificate_chain(
         for (index, certificate) in certificates.iter().enumerate() {
             let (_, candidate) = x509_parser::prelude::parse_x509_certificate(certificate.as_ref())
                 .map_err(|error| HathError::Tls(format!("invalid PKCS12 certificate: {error}")))?;
-            if is_valid_issuer(&child, &candidate)? {
-                if issuer_index.replace(index).is_some() {
-                    return Err(HathError::Tls(
-                        "multiple PKCS12 certificates can issue the same child certificate".into(),
-                    ));
-                }
+            if is_valid_issuer(&child, &candidate)? && issuer_index.replace(index).is_some() {
+                return Err(HathError::Tls(
+                    "multiple PKCS12 certificates can issue the same child certificate".into(),
+                ));
             }
         }
         let issuer_index = issuer_index.ok_or_else(|| {
