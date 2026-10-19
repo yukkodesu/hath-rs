@@ -5,6 +5,7 @@ use crate::gallery_downloader::GalleryDownloadSupervisor;
 use crate::rpc::{self, ResponseStatus};
 use crate::rpc_client::{self, RpcClient};
 use crate::server::{self, AppState};
+use crate::shutdown::{Shutdown, ShutdownReason};
 use crate::stats::Stats;
 
 use arc_swap::{ArcSwap, ArcSwapOption};
@@ -40,7 +41,7 @@ pub async fn run() -> Result<()> {
         "This software comes with ABSOLUTELY NO WARRANTY. This is free software, and you are welcome to modify and redistribute it under the GPL v3 license."
     );
 
-    let shutdown = CancellationToken::new();
+    let shutdown = Shutdown::default();
 
     // Handle shutdown signals for graceful exit (Java: ShutdownHook).
     // On Unix: SIGINT (Ctrl+C), SIGTERM (docker stop / systemctl stop), SIGQUIT.
@@ -50,8 +51,7 @@ pub async fn run() -> Result<()> {
     {
         let s = shutdown.clone();
         tokio::spawn(async move {
-            shutdown_signal().await;
-            s.cancel();
+            s.request(ShutdownReason::Signal(shutdown_signal().await));
         });
     }
 
@@ -96,7 +96,7 @@ pub async fn run() -> Result<()> {
     let cache = Arc::new(CacheHandler::new(
         config.clone(),
         stats.clone(),
-        shutdown.clone(),
+        shutdown.token(),
     )?);
 
     run_with_cache(config, rpc_client, proxy_client, stats, cache, shutdown).await
@@ -108,7 +108,7 @@ async fn run_with_cache(
     proxy_client: Arc<reqwest::Client>,
     stats: Arc<Stats>,
     cache: Arc<CacheHandler>,
-    shutdown: CancellationToken,
+    shutdown: Shutdown,
 ) -> Result<()> {
     // 8. Build AppState and spawn HTTP server
     let allow_connections = Arc::new(AtomicBool::new(false));
@@ -122,7 +122,7 @@ async fn run_with_cache(
         config.clone(),
         rpc_client.clone(),
         stats.clone(),
-        shutdown.clone(),
+        shutdown.token(),
     );
 
     let app_state = AppState {
@@ -251,7 +251,9 @@ async fn run_with_cache(
         Ok(())
     }
     .await;
-    shutdown.cancel();
+    if let Err(error) = result {
+        shutdown.fail(error);
+    }
 
     // Graceful shutdown (Java order: client_stop → stop listener → drain → save data).
     // Java: reportShutdown is only set after successful notifyStart().
@@ -283,7 +285,7 @@ async fn run_with_cache(
         cfg.save_client_login().ok();
     }
 
-    result
+    shutdown.result()
 }
 
 fn spawn_background_tasks(
@@ -292,7 +294,7 @@ fn spawn_background_tasks(
     stats: Arc<Stats>,
     app_state: AppState,
     rpc_client: Arc<RpcClient>,
-    shutdown: CancellationToken,
+    shutdown: Shutdown,
 ) -> BackgroundTasks {
     let mut tasks = BackgroundTasks::new();
     tasks.track(
@@ -301,15 +303,15 @@ fn spawn_background_tasks(
     );
     tasks.track(
         "cache-periodic-stats",
-        cache::spawn_periodic_stats(cache.clone(), stats.clone(), shutdown.clone()),
+        cache::spawn_periodic_stats(cache.clone(), stats.clone(), shutdown.token()),
     );
     tasks.track(
         "flood-control-pruner",
-        server::spawn_flood_control_pruner(app_state.clone(), shutdown.clone()),
+        server::spawn_flood_control_pruner(app_state.clone(), shutdown.token()),
     );
     tasks.track(
         "session-reaper",
-        server::spawn_session_reaper(app_state.session_manager.clone(), shutdown.clone()),
+        server::spawn_session_reaper(app_state.session_manager.clone(), shutdown.token()),
     );
     tasks.track(
         "still-alive-heartbeat",
@@ -321,11 +323,11 @@ fn spawn_background_tasks(
     );
     tasks.track(
         "rpc-failure-clearer",
-        rpc_client::spawn_rpc_failure_clearer(rpc_client.clone(), shutdown.clone()),
+        rpc_client::spawn_rpc_failure_clearer(rpc_client.clone(), shutdown.token()),
     );
     tasks.track(
         "blacklist-fetcher",
-        cache::spawn_blacklist_fetcher(rpc_client.clone(), cache, shutdown.clone()),
+        cache::spawn_blacklist_fetcher(rpc_client.clone(), cache, shutdown.token()),
     );
     tasks.track(
         "cert-refresh-watcher",
@@ -397,7 +399,7 @@ impl BackgroundTasks {
 /// Wait for any shutdown signal.
 /// Unix: SIGINT, SIGTERM, or SIGQUIT.
 /// Windows: Ctrl+C, Ctrl+Break, or console close (all via ctrl_c()).
-async fn shutdown_signal() {
+async fn shutdown_signal() -> &'static str {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
@@ -405,15 +407,15 @@ async fn shutdown_signal() {
             signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
         let mut sigquit = signal(SignalKind::quit()).expect("failed to register SIGQUIT handler");
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => tracing::info!("SIGINT received, shutting down gracefully..."),
-            _ = sigterm.recv() => tracing::info!("SIGTERM received, shutting down gracefully..."),
-            _ = sigquit.recv() => tracing::info!("SIGQUIT received, shutting down gracefully..."),
+            _ = tokio::signal::ctrl_c() => "SIGINT",
+            _ = sigterm.recv() => "SIGTERM",
+            _ = sigquit.recv() => "SIGQUIT",
         }
     }
     #[cfg(not(unix))]
     {
         tokio::signal::ctrl_c().await.ok();
-        tracing::info!("Interrupt received, shutting down gracefully...");
+        "interrupt"
     }
 }
 
@@ -436,9 +438,9 @@ mod tests {
             cfg.rpc_port = server.port();
             let config = Arc::new(ArcSwap::from_pointee(cfg));
             let stats = Arc::new(Stats::new());
-            let shutdown = CancellationToken::new();
+            let shutdown = Shutdown::default();
             let cache = Arc::new(
-                CacheHandler::new(config.clone(), stats.clone(), shutdown.clone()).unwrap(),
+                CacheHandler::new(config.clone(), stats.clone(), shutdown.token()).unwrap(),
             );
             // Nonzero metadata distinguishes a restored snapshot from an empty rescan.
             let hv = crate::hvfile::HVFile::from_fileid(
@@ -449,7 +451,7 @@ mod tests {
             cache.save_persistent_data();
             drop(cache);
             let cache = Arc::new(
-                CacheHandler::new(config.clone(), stats.clone(), shutdown.clone()).unwrap(),
+                CacheHandler::new(config.clone(), stats.clone(), shutdown.token()).unwrap(),
             );
             assert!(!dirs.data_dir.join("pcache_info").exists());
             let rpc_client = Arc::new(RpcClient::new(config.clone()).unwrap());

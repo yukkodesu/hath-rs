@@ -1,12 +1,12 @@
 use crate::cache::{CacheHandler, PruneAction, PrunePlan, PruneResult};
 use crate::config::Config;
 use crate::hvfile::HVFile;
+use crate::shutdown::Shutdown;
 use crate::utils;
 use arc_swap::ArcSwap;
 use std::fs;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio_util::sync::CancellationToken;
 
 enum PruneExecution {
     Completed(PruneResult),
@@ -24,14 +24,14 @@ pub(super) struct CachePruner {
     /// Seconds between cache checks when not over limit.
     /// Adjusted dynamically based on free space.
     check_frequency: u32,
-    shutdown: CancellationToken,
+    shutdown: Shutdown,
 }
 
 impl CachePruner {
     pub(super) fn new(
         cache: Arc<CacheHandler>,
         config: Arc<ArcSwap<Config>>,
-        shutdown: CancellationToken,
+        shutdown: Shutdown,
     ) -> Self {
         Self {
             cache,
@@ -106,7 +106,9 @@ impl CachePruner {
                              Free up space, or reduce the cache size from the \
                              H@H settings page."
                         );
-                        self.shutdown.cancel();
+                        self.shutdown.fail(crate::error::HathError::Fatal(
+                            "insufficient free cache disk space".into(),
+                        ));
                         break;
                     }
                 }
@@ -213,11 +215,11 @@ mod tests {
             CacheHandler::new(
                 config.clone(),
                 Arc::new(Stats::new()),
-                CancellationToken::new(),
+                tokio_util::sync::CancellationToken::new(),
             )
             .unwrap(),
         );
-        let shutdown = CancellationToken::new();
+        let shutdown = Shutdown::default();
         let pruner = CachePruner::new(cache.clone(), config, shutdown.clone());
         let plan = PrunePlan {
             static_range: "aabb".to_string(),
@@ -239,7 +241,7 @@ mod tests {
         }
         assert_eq!(cache.cache_count.load(Ordering::Relaxed), 1);
 
-        shutdown.cancel();
+        shutdown.request(crate::shutdown::ShutdownReason::Signal("test"));
         assert!(matches!(task.await.unwrap(), PruneExecution::Interrupted));
         assert_eq!(cache.cache_count.load(Ordering::Relaxed), 1);
         assert_eq!(cache.cache_size.load(Ordering::Relaxed), 4);

@@ -195,7 +195,7 @@ pub(super) async fn build_tls_acceptor(
 pub fn spawn_cert_refresh_watcher(
     state: AppState,
     rpc_client: Arc<RpcClient>,
-    shutdown: tokio_util::sync::CancellationToken,
+    shutdown: crate::shutdown::Shutdown,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -251,12 +251,14 @@ pub fn spawn_cert_refresh_watcher(
                 }
                 Ok(Err(e)) => {
                     tracing::error!("Server restart failed to bind: {}", e);
-                    shutdown.cancel();
+                    shutdown.fail(HathError::Tls(e));
                     break;
                 }
                 Err(_) => {
                     tracing::error!("Server restart failed unexpectedly (oneshot dropped)");
-                    shutdown.cancel();
+                    shutdown.fail(HathError::Fatal(
+                        "server restart task ended unexpectedly".into(),
+                    ));
                     break;
                 }
             }
@@ -277,7 +279,7 @@ pub fn spawn_cert_refresh_watcher(
                             "Client is shutting down since the network is misconfigured; \
                              correct firewall/forwarding settings then restart the client."
                         );
-                        shutdown.cancel();
+                        shutdown.fail(HathError::Fatal(code));
                         break;
                     } else {
                         tracing::warn!("Failed stillAlive test: ({}) - will retry later", code);
@@ -299,11 +301,11 @@ pub fn spawn_cert_refresh_watcher(
 pub fn spawn_time_cert_check(
     config: Arc<ArcSwap<Config>>,
     state: AppState,
-    shutdown: tokio_util::sync::CancellationToken,
+    shutdown: crate::shutdown::Shutdown,
 ) -> JoinHandle<()> {
     let global_shutdown = shutdown.clone();
     tokio::spawn(crate::utils::tick_every(
-        shutdown,
+        shutdown.token(),
         Duration::from_secs(300),
         move || {
             let config = config.clone();
@@ -321,7 +323,7 @@ pub fn spawn_time_cert_check(
                          gone wrong with certificate renewal. Check your system clock and \
                          internet connection, then restart the client manually."
                     );
-                    shutdown_signal.cancel();
+                    shutdown_signal.fail(HathError::CertExpired);
                 }
             }
         },

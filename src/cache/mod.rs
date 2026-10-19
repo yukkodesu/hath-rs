@@ -501,10 +501,10 @@ impl CacheHandler {
 }
 
 /// Spawn the cache pruner background task.
-pub fn spawn_pruner(
+pub(crate) fn spawn_pruner(
     cache: Arc<CacheHandler>,
     config: Arc<ArcSwap<Config>>,
-    shutdown: tokio_util::sync::CancellationToken,
+    shutdown: crate::shutdown::Shutdown,
 ) -> JoinHandle<()> {
     let pruner = CachePruner::new(cache, config, shutdown);
     tokio::spawn(async move { pruner.run().await })
