@@ -7,6 +7,7 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
+use tokio::time::Instant as TokioInstant;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone)]
@@ -53,11 +54,8 @@ pub(crate) struct AcceptedConnection {
     pub(crate) handle: SessionHandle,
     pub(crate) cancel: CancellationToken,
     pub(crate) guard: SessionGuard,
-}
-
-pub(crate) enum AdmissionOutcome {
-    Accepted(AcceptedConnection),
-    Rejected(AdmissionRejection),
+    pub(crate) pending_deadline: TokioInstant,
+    pub(crate) near_limit: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,24 +90,27 @@ pub(crate) fn configure_send_buffer(stream: &TcpStream, config: &Config) {
     }
 }
 
-pub(crate) async fn admit_connection(
+pub(crate) fn admit_connection(
     state: &AppState,
     remote_addr: SocketAddr,
     origin: SessionOrigin,
     config: &Config,
-) -> AdmissionOutcome {
+) -> Result<AcceptedConnection, AdmissionRejection> {
     let rpc_authorized = peer::is_rpc_authorized(origin.peer_ip(), config);
     let admission_class = origin.admission_class(rpc_authorized);
     let host_addr = origin.peer_ip();
 
-    let allow = state.allow_normal_connections.load(Ordering::Relaxed);
-    if !allow && !rpc_authorized {
-        tracing::warn!(
-            "Rejecting connection from {} during startup (rpc_servers={:?})",
-            host_addr,
-            config.rpc_servers
-        );
-        return AdmissionOutcome::Rejected(AdmissionRejection::Startup);
+    if !state.allow_normal_connections.load(Ordering::Relaxed) && !rpc_authorized {
+        return Err(AdmissionRejection::Startup);
+    }
+
+    let max_conns = config.max_connections();
+    if matches!(admission_class, peer::AdmissionClass::Limited)
+        && state.session_manager.active_count() > max_conns
+    {
+        return Err(AdmissionRejection::MaxConnectionsExceeded {
+            max_connections: max_conns,
+        });
     }
 
     if matches!(admission_class, peer::AdmissionClass::Limited) && !config.disable_flood_control {
@@ -122,55 +123,49 @@ pub(crate) async fn admit_connection(
                 block_until: None,
             });
         if entry.is_blocked() || !entry.hit() {
-            tracing::warn!("Flood control activated for {}", host_addr);
-            return AdmissionOutcome::Rejected(AdmissionRejection::FloodControl);
+            return Err(AdmissionRejection::FloodControl);
         }
     }
 
     let conn_id = state.next_conn_id.fetch_add(1, Ordering::Relaxed) + 1;
-    let max_conns = config.max_connections();
-    let admission =
-        match state
-            .session_manager
-            .admit(conn_id, remote_addr, admission_class, max_conns)
-        {
-            Ok(admission) => admission,
-            Err(SessionAdmitError::MaxConnectionsExceeded { max_connections }) => {
-                tracing::warn!(
-                    "Exceeded the maximum allowed number of incoming connections ({}).",
-                    max_connections
-                );
-                return AdmissionOutcome::Rejected(AdmissionRejection::MaxConnectionsExceeded {
-                    max_connections,
-                });
-            }
-        };
-
-    if let Some(prev) = admission.active_before
-        && prev > (max_conns as f64 * 0.8) as u32
-        && prev > 0
-    {
+    let admission = state
+        .session_manager
+        .admit(conn_id, remote_addr, admission_class, max_conns)
+        .map_err(
+            |SessionAdmitError::MaxConnectionsExceeded { max_connections }| {
+                AdmissionRejection::MaxConnectionsExceeded { max_connections }
+            },
+        )?;
+    let near_limit = admission
+        .active_before
+        .is_some_and(|prev| prev > 0 && prev > (max_conns as f64 * 0.8) as u32);
+    if near_limit {
         tracing::warn!(
             "Near connection limit: {} / {} active connections",
-            prev + 1,
+            state.session_manager.active_count(),
             max_conns
         );
-        let now = Instant::now();
-        let mut last = state.last_overload_notification.lock().await;
-        let should_notify = last.is_none_or(|t| now - t >= Duration::from_secs(30));
-        if should_notify {
-            *last = Some(now);
-            drop(last);
-            let _ = state.rpc_client.notify_overload().await;
-        }
     }
 
-    AdmissionOutcome::Accepted(AcceptedConnection {
+    Ok(AcceptedConnection {
         conn_id,
         handle: admission.handle,
         cancel: admission.cancel,
         guard: admission.guard,
+        pending_deadline: admission.pending_deadline,
+        near_limit,
     })
+}
+
+/// Called inside the connection lifecycle so a stalled RPC can be cancelled with the session.
+pub(super) async fn notify_overload(state: &AppState) {
+    let mut last = state.last_overload_notification.lock().await;
+    let now = Instant::now();
+    if last.is_none_or(|t| now - t >= Duration::from_secs(30)) {
+        *last = Some(now);
+        drop(last);
+        let _ = state.rpc_client.notify_overload().await;
+    }
 }
 
 /// Spawn periodic flood control pruning (60s interval).
