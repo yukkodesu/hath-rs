@@ -29,7 +29,7 @@ use dashmap::DashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, Notify};
 
@@ -65,12 +65,10 @@ pub(crate) struct AppState {
     pub(crate) do_cert_refresh: Arc<AtomicBool>,
     /// Wakes the cert refresh watcher when a refresh_certs command arrives.
     pub(crate) cert_refresh_notify: Arc<Notify>,
-    /// Shutdown token for the currently-running server accept loop.
-    /// Swapped during cert refresh to terminate the old listener and start a new one.
-    pub(crate) server_shutdown_token: Arc<ArcSwapOption<tokio_util::sync::CancellationToken>>,
-    /// Set to true by start_server() after the accept loop exits.
-    /// The cert refresh watcher polls this to wait for the old server to terminate.
-    pub(crate) server_terminated: Arc<AtomicBool>,
+    /// Serializes listener generations across certificate refresh and process exit.
+    pub(crate) generation: Arc<Mutex<Option<ServerGeneration>>>,
+    pub(crate) shutdown: crate::shutdown::Shutdown,
+    pub(crate) transfers: crate::tasks::TransferTasks,
     /// Shared HTTP client for ProxyFileDownloader requests.
     /// 5s connect + 30s read timeout, reused across all proxy downloads.
     pub(crate) proxy_client: Arc<reqwest::Client>,
@@ -81,75 +79,85 @@ static LOCAL_NETWORK_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock
         .expect("invalid regex")
 });
 
-/// Start one HTTP server generation. Returns a oneshot receiver that fires when
-/// the server binds, and the generation shutdown token (to store in AppState).
-pub(crate) fn start_server(
-    state: AppState,
-) -> (
-    tokio::sync::oneshot::Receiver<std::result::Result<u16, String>>,
-    tokio_util::sync::CancellationToken,
-) {
-    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-    let server_shutdown_token = tokio_util::sync::CancellationToken::new();
-    let server_shutdown = server_shutdown_token.clone();
-    state.server_terminated.store(false, Ordering::Release);
-    tokio::spawn(async move {
-        if let Err(e) = run_server(state.clone(), server_shutdown, Some(ready_tx)).await {
-            tracing::error!("Server error: {}", e);
-        }
-        state.server_terminated.store(true, Ordering::Release);
-    });
-    (ready_rx, server_shutdown_token)
+/// Owns one listener generation; accepted connections are owned by its task.
+pub(crate) struct ServerGeneration {
+    stop: tokio_util::sync::CancellationToken,
+    task: tokio::task::JoinHandle<()>,
 }
 
-/// Stop the current HTTP server generation and drain in-flight requests.
-///
-/// RPC lifecycle actions such as client_stop/client_suspend are intentionally
-/// handled by callers. This helper only quiesces the local HTTP server.
-pub(crate) async fn stop_server(state: &AppState) {
-    tracing::info!("Stopping server");
+pub(crate) async fn start_server(state: AppState) -> Result<u16> {
+    let mut generation = state.generation.lock().await;
+    if state.shutdown.is_cancelled() {
+        return Err(HathError::Shutdown);
+    }
+    if generation.is_some() {
+        return Err(HathError::Config(
+            "server generation is already running".into(),
+        ));
+    }
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let stop = tokio_util::sync::CancellationToken::new();
+    let server_stop = stop.clone();
+    let task_state = state.clone();
+    let task = tokio::spawn(async move {
+        use futures_util::FutureExt;
+        match std::panic::AssertUnwindSafe(run_server(
+            task_state.clone(),
+            server_stop,
+            Some(ready_tx),
+        ))
+        .catch_unwind()
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(HathError::Shutdown)) => {}
+            Ok(Err(error)) => task_state.shutdown.fail(error),
+            Err(_) => {
+                task_state.transfers.invalidate();
+                task_state
+                    .shutdown
+                    .fail(HathError::Fatal("server task panicked".into()));
+            }
+        }
+    });
+    *generation = Some(ServerGeneration { stop, task });
+    tokio::select! {
+        biased;
+        result = ready_rx => {
+            result.map_err(|_| HathError::Fatal("server startup task ended unexpectedly".into()))?
+        }
+        _ = state.shutdown.cancelled() => Err(HathError::Shutdown),
+    }
+}
+
+/// Stops admission, then waits for the generation and its connections to finish.
+pub(crate) async fn stop_server(state: &AppState, deadline: tokio::time::Instant) -> bool {
     state
         .allow_normal_connections
         .store(false, Ordering::SeqCst);
-
-    if let Some(token) = state.server_shutdown_token.load_full() {
-        token.cancel();
+    let mut current = state.generation.lock().await;
+    let Some(generation) = current.as_mut() else {
+        return true;
+    };
+    generation.stop.cancel();
+    let clean = match tokio::time::timeout_at(deadline, &mut generation.task).await {
+        Ok(Ok(())) => true,
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "Server task failed");
+            false
+        }
+        Err(_) => {
+            tracing::warn!("Server drain timed out; cancelling remaining connections");
+            generation.task.abort();
+            let _ = (&mut generation.task).await;
+            false
+        }
+    };
+    if !clean {
+        state.transfers.invalidate();
     }
-
-    for close_wait_cycles in 1..25 {
-        let active = state.session_manager.active_count();
-        if active == 0 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        if close_wait_cycles % 5 == 0 {
-            let remaining = 25 - close_wait_cycles;
-            tracing::info!(
-                "Waiting for {} request(s) to finish; will wait for another {} seconds",
-                active,
-                remaining
-            );
-        }
-    }
-
-    let mut wait_cycles = 0u32;
-    loop {
-        if state.server_terminated.load(Ordering::Acquire) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_secs(5)).await;
-        wait_cycles += 1;
-        if wait_cycles >= 60 {
-            tracing::warn!("Server did not terminate after 300s");
-            break;
-        }
-        if wait_cycles > 1 {
-            tracing::info!(
-                "Waiting for HTTPServer to fully terminate... (waited {} seconds)",
-                wait_cycles * 5
-            );
-        }
-    }
+    *current = None;
+    clean
 }
 
 /// Run one TLS HTTP server generation. Sends readiness via `ready_tx` after successful bind.
@@ -157,17 +165,23 @@ pub(crate) async fn stop_server(state: &AppState) {
 async fn run_server(
     state: AppState,
     server_shutdown: tokio_util::sync::CancellationToken,
-    ready_tx: Option<tokio::sync::oneshot::Sender<std::result::Result<u16, String>>>,
+    ready_tx: Option<tokio::sync::oneshot::Sender<Result<u16>>>,
 ) -> Result<()> {
     let config = state.config.load_full();
 
     // Build TLS acceptor (downloads cert if needed)
     // Java: always re-downloads the certificate on startup.
-    let (tls_acceptor, cert_expiry) = match tls::build_tls_acceptor(&config, true).await {
+    let initialized = tokio::select! {
+        biased;
+        _ = server_shutdown.cancelled() => return Err(HathError::Shutdown),
+        result = tls::build_tls_acceptor(&config, true) => result,
+    };
+    let (tls_acceptor, cert_expiry) = match initialized {
         Ok((a, expiry)) => (a, expiry),
         Err(e) => {
             if let Some(tx) = ready_tx {
-                let _ = tx.send(Err(e.to_string()));
+                let _ = tx.send(Err(e));
+                return Err(HathError::Shutdown);
             }
             return Err(e);
         }
@@ -205,17 +219,31 @@ async fn run_server(
 
     tracing::info!("HTTPServer listening on port {}", port);
 
+    let mut connections = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
             biased;
             _ = server_shutdown.cancelled() => break,
+            result = connections.join_next(), if !connections.is_empty() => {
+                if let Some(Err(error)) = result {
+                    state.transfers.invalidate();
+                    return Err(HathError::Fatal(format!("connection task failed: {error}")));
+                }
+            }
             (stream, remote_addr) = transport::accept_tcp(&listener) => {
                 if let Some(connection) = connection::Connection::accept(&state, stream, remote_addr, &server_shutdown) {
-                    tokio::spawn(connection.serve());
+                    connections.spawn(connection.serve());
                 }
             }
         }
     }
 
+    drop(listener);
+    while let Some(result) = connections.join_next().await {
+        if let Err(error) = result {
+            state.transfers.invalidate();
+            return Err(HathError::Fatal(format!("connection task failed: {error}")));
+        }
+    }
     Ok(())
 }

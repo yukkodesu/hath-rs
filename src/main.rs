@@ -13,6 +13,7 @@ pub mod rpc_client;
 pub mod server;
 mod shutdown;
 pub mod stats;
+mod tasks;
 pub mod tls;
 pub mod types;
 pub mod utils;

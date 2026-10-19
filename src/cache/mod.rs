@@ -188,9 +188,9 @@ impl CacheHandler {
     /// - `pcache_ages`: bincode-serialized static range oldest timestamps
     /// - `pcache_lru`: bincode-serialized LRU cache table
     /// - `pcache_info`: plain-text metadata with SHA-1 hashes of the two files
-    pub fn save_persistent_data(&self) {
+    pub fn save_persistent_data(&self) -> bool {
         if !self.cache_loaded {
-            return;
+            return false;
         }
 
         let cfg = self.config.load();
@@ -227,6 +227,9 @@ impl CacheHandler {
         if let Err(e) = result {
             tracing::warn!("Failed to save persistent cache data: {}", e);
             self.discard_persistent_data();
+            false
+        } else {
+            true
         }
     }
 

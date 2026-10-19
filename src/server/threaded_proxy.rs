@@ -36,7 +36,7 @@ pub(crate) async fn run_threaded_proxy_test(
         return (0, 0);
     };
 
-    let mut handles = Vec::with_capacity(testcount as usize);
+    let mut tests = tokio::task::JoinSet::new();
 
     for _ in 0..testcount {
         let random_int: u32 = rand::rng().random();
@@ -47,16 +47,14 @@ pub(crate) async fn run_threaded_proxy_test(
         };
         let client = client.clone();
 
-        handles.push(tokio::spawn(async move {
-            run_threaded_proxy_test_download(&client, url, testsize).await
-        }));
+        tests.spawn(async move { run_threaded_proxy_test_download(&client, url, testsize).await });
     }
 
     let mut successful = 0u32;
     let mut total_time_ms = 0u64;
 
-    for handle in handles {
-        if let Ok(Some(ms)) = handle.await {
+    while let Some(result) = tests.join_next().await {
+        if let Ok(Some(ms)) = result {
             successful += 1;
             total_time_ms += ms;
         }

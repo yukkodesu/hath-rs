@@ -32,6 +32,7 @@ const DOWNLOAD_READ_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) enum StartOutcome {
     Started,
     AlreadyRunning,
+    Stopping,
 }
 
 /// Owns the single-flight lifecycle used by the authenticated server command.
@@ -40,6 +41,7 @@ pub(crate) enum StartOutcome {
 pub(crate) struct GalleryDownloadSupervisor {
     runner: GalleryQueueRunner,
     active: Arc<AtomicBool>,
+    tasks: crate::tasks::TransferTasks,
 }
 
 impl GalleryDownloadSupervisor {
@@ -48,6 +50,7 @@ impl GalleryDownloadSupervisor {
         rpc_client: Arc<RpcClient>,
         stats: Arc<Stats>,
         shutdown: CancellationToken,
+        tasks: crate::tasks::TransferTasks,
     ) -> Arc<Self> {
         Arc::new(Self {
             runner: GalleryQueueRunner {
@@ -57,10 +60,14 @@ impl GalleryDownloadSupervisor {
                 shutdown,
             },
             active: Arc::new(AtomicBool::new(false)),
+            tasks,
         })
     }
 
     pub(crate) fn start(self: &Arc<Self>) -> StartOutcome {
+        if self.runner.shutdown.is_cancelled() {
+            return StartOutcome::Stopping;
+        }
         if self
             .active
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -71,7 +78,7 @@ impl GalleryDownloadSupervisor {
 
         let runner = self.runner.clone();
         let active = self.active.clone();
-        tokio::spawn(async move {
+        let spawned = self.tasks.spawn(async move {
             let _reset_active = ActiveRun(active);
             match runner.run_until_idle().await {
                 Ok(report) => tracing::info!(
@@ -85,6 +92,10 @@ impl GalleryDownloadSupervisor {
                 Err(e) => tracing::warn!("Gallery downloader stopped: {}", e),
             }
         });
+        if !spawned {
+            self.active.store(false, Ordering::Release);
+            return StartOutcome::Stopping;
+        }
         StartOutcome::Started
     }
 }

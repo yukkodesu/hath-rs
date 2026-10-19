@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
+#[cfg(test)]
 use tokio_util::sync::CancellationToken;
 
 /// Main client entry point. Follows Java HentaiAtHomeClient.run() lifecycle.
@@ -71,25 +72,32 @@ pub async fn run() -> Result<()> {
     let rpc_client = Arc::new(RpcClient::new(config.clone())?);
     tracing::info!("Getting initial stat from server...");
 
-    let stat_resp = rpc_client.server_stat().await?;
-    if stat_resp.status != ResponseStatus::Ok {
-        return Err(HathError::Rpc(
-            "Failed to get initial stat from server".into(),
-        ));
-    }
+    let initialize = async {
+        let stat_resp = rpc_client.server_stat().await?;
+        if stat_resp.status != ResponseStatus::Ok {
+            return Err(HathError::Rpc(
+                "Failed to get initial stat from server".into(),
+            ));
+        }
 
-    Config::apply_server_response(&config, &stat_resp);
+        Config::apply_server_response(&config, &stat_resp);
 
-    // 6. Client login: get full settings (uses corrected server time from step 5)
-    let login_resp = rpc_client.client_login().await?;
-    if login_resp.status != ResponseStatus::Ok {
-        let code = login_resp.fail_code.unwrap_or_default();
-        return Err(HathError::Rpc(format!("Login failed: {}", code)));
-    }
+        // 6. Client login: get full settings (uses corrected server time from step 5)
+        let login_resp = rpc_client.client_login().await?;
+        if login_resp.status != ResponseStatus::Ok {
+            let code = login_resp.fail_code.unwrap_or_default();
+            return Err(HathError::Rpc(format!("Login failed: {}", code)));
+        }
 
-    Config::apply_server_response(&config, &login_resp);
+        Config::apply_server_response(&config, &login_resp);
 
-    let proxy_client = crate::proxy_downloader::build_proxy_client(&config.load())?;
+        crate::proxy_downloader::build_proxy_client(&config.load())
+    };
+    let proxy_client = tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => return shutdown.result(),
+        result = initialize => result?,
+    };
 
     // 7. Init cache
     let stats = Arc::new(Stats::new());
@@ -118,11 +126,13 @@ async fn run_with_cache(
     let report_shutdown = Arc::new(AtomicBool::new(false));
     let flood_control = Arc::new(DashMap::new());
 
+    let transfers = crate::tasks::TransferTasks::new(shutdown.clone());
     let gallery_downloader = GalleryDownloadSupervisor::new(
         config.clone(),
         rpc_client.clone(),
         stats.clone(),
         shutdown.token(),
+        transfers.clone(),
     );
 
     let app_state = AppState {
@@ -141,31 +151,16 @@ async fn run_with_cache(
         last_overload_notification: Arc::new(Mutex::new(None)),
         do_cert_refresh: Arc::new(AtomicBool::new(false)),
         cert_refresh_notify: Arc::new(Notify::new()),
-        server_shutdown_token: Arc::new(ArcSwapOption::const_empty()),
-        server_terminated: Arc::new(AtomicBool::new(false)),
+        generation: Arc::new(Mutex::new(None)),
+        shutdown: shutdown.clone(),
+        transfers,
         proxy_client,
     };
 
     let mut background_tasks = None;
     // Keep every fallible startup step inside the same shutdown boundary.
-    let result = async {
-        let (ready_rx, server_shutdown_token) = server::start_server(app_state.clone());
-        app_state
-            .server_shutdown_token
-            .store(Some(Arc::new(server_shutdown_token)));
-
-        // Wait for server to bind before notifying the RPC server
-        match ready_rx.await {
-            Ok(Ok(_port)) => {}
-            Ok(Err(e)) => {
-                return Err(HathError::Config(format!("Server startup failed: {}", e)));
-            }
-            Err(_) => {
-                return Err(HathError::Config(
-                    "Server startup failed unexpectedly".into(),
-                ));
-            }
-        }
+    let operation = async {
+        server::start_server(app_state.clone()).await?;
 
         // 9. notifyStart: tell server we're ready (this triggers connectivity test).
         // Java: if notifyStart() returns false, the main thread skips
@@ -245,47 +240,64 @@ async fn run_with_cache(
             None
         };
 
-        // Wait for shutdown signal
-        shutdown.cancelled().await;
-
-        Ok(())
-    }
-    .await;
+        if let Some(tasks) = background_tasks.as_mut() {
+            let error = tasks.wait_for_failure().await;
+            app_state.transfers.invalidate();
+            return Err(error);
+        }
+        std::future::pending().await
+    };
+    let result: Result<()> = tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => Ok(()),
+        result = operation => result,
+    };
     if let Err(error) = result {
         shutdown.fail(error);
     }
 
-    // Graceful shutdown (Java order: client_stop → stop listener → drain → save data).
-    // Java: reportShutdown is only set after successful notifyStart().
-    // Unlike allow_connections, it's never toggled during cert refresh.
+    // One shared I/O budget leaves time for the final snapshot before Docker's 60s grace expires.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(40);
     tracing::info!("Shutting down...");
-    if report_shutdown.load(Ordering::Relaxed)
-        && let Err(e) = rpc_client.client_stop().await
-    {
-        tracing::warn!("Failed to notify server about shutdown: {}", e);
+    allow_connections.store(false, Ordering::Release);
+    if report_shutdown.load(Ordering::Relaxed) {
+        match tokio::time::timeout(Duration::from_secs(5), rpc_client.client_stop()).await {
+            Ok(Ok(response)) if response.status == ResponseStatus::Ok => {}
+            Ok(Ok(response)) => {
+                tracing::warn!(code = ?response.fail_code, "Shutdown notification rejected")
+            }
+            Ok(Err(error)) => tracing::warn!(%error, "Failed to notify server about shutdown"),
+            Err(_) => tracing::warn!("Shutdown notification timed out"),
+        }
     }
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    server::stop_server(&app_state).await;
-    let background_tasks_stopped = if let Some(background_tasks) = background_tasks {
-        background_tasks.join_for(Duration::from_secs(5)).await
-    } else {
-        true
+    // Stop the refresh watcher before taking ownership of its current generation.
+    let background_clean = match background_tasks {
+        Some(tasks) => tasks.join_for(Duration::from_secs(5)).await,
+        None => true,
     };
-    if background_tasks_stopped {
-        cache.save_persistent_data();
-    } else {
-        tracing::warn!(
-            "Skipping persistent cache save because background shutdown was incomplete; \
-             the next startup will rescan the cache"
-        );
-        cache.discard_persistent_data();
-    }
-    {
-        let cfg = config.load();
-        cfg.save_client_login().ok();
-    }
+    let server_deadline = deadline.min(tokio::time::Instant::now() + Duration::from_secs(25));
+    let server_clean = server::stop_server(&app_state, server_deadline).await;
+    let transfers_clean = app_state.transfers.finish(deadline).await;
+    let clean = background_clean && server_clean && transfers_clean;
+    let persistence = save_shutdown_cache(&cache, clean);
+    config.load().save_client_login().ok();
+    shutdown.result().and(persistence)
+}
 
-    shutdown.result()
+fn save_shutdown_cache(cache: &CacheHandler, quiescent: bool) -> Result<()> {
+    if !quiescent {
+        tracing::warn!("Shutdown incomplete; discarding snapshot so the next startup rescans");
+        cache.discard_persistent_data();
+        return Err(HathError::Fatal(
+            "shutdown left unfinished cache work".into(),
+        ));
+    }
+    if !cache.save_persistent_data() {
+        return Err(HathError::Cache(
+            "failed to save the final cache snapshot".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn spawn_background_tasks(
@@ -356,6 +368,24 @@ impl BackgroundTasks {
         self.tasks.push_back(BackgroundTask { name, handle });
     }
 
+    async fn wait_for_failure(&mut self) -> HathError {
+        if self.tasks.is_empty() {
+            return std::future::pending().await;
+        }
+        let (result, index) = {
+            let (result, index, _) = futures_util::future::select_all(
+                self.tasks.iter_mut().map(|task| &mut task.handle),
+            )
+            .await;
+            (result, index)
+        };
+        let task = self.tasks.remove(index).unwrap();
+        HathError::Fatal(format!(
+            "background task {} stopped unexpectedly: {result:?}",
+            task.name
+        ))
+    }
+
     async fn join_for(mut self, timeout: Duration) -> bool {
         if self.tasks.is_empty() {
             return true;
@@ -371,7 +401,7 @@ impl BackgroundTasks {
                         if !e.is_cancelled() {
                             tracing::warn!("Background task {} exited with error: {}", task.name, e);
                         }
-                        self.abort_remaining();
+                        self.abort_remaining().await;
                         return false;
                     }
                 }
@@ -381,7 +411,8 @@ impl BackgroundTasks {
                         task.name
                     );
                     task.handle.abort();
-                    self.abort_remaining();
+                    let _ = task.handle.await;
+                    self.abort_remaining().await;
                     return false;
                 }
             }
@@ -389,9 +420,12 @@ impl BackgroundTasks {
         true
     }
 
-    fn abort_remaining(&mut self) {
-        for task in self.tasks.drain(..) {
+    async fn abort_remaining(&mut self) {
+        for task in &self.tasks {
             task.handle.abort();
+        }
+        for task in self.tasks.drain(..) {
+            let _ = task.handle.await;
         }
     }
 }

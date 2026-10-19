@@ -69,6 +69,7 @@ impl Fixture {
                 rpc_client.clone(),
                 stats.clone(),
                 shutdown.clone(),
+                crate::tasks::TransferTasks::new(crate::shutdown::Shutdown::default()),
             ),
             rpc_client,
             allow_normal_connections: Arc::new(AtomicBool::new(true)),
@@ -81,8 +82,9 @@ impl Fixture {
             last_overload_notification: Arc::new(Mutex::new(Some(std::time::Instant::now()))),
             do_cert_refresh: Arc::new(AtomicBool::new(false)),
             cert_refresh_notify: Arc::new(Notify::new()),
-            server_shutdown_token: Arc::new(ArcSwapOption::const_empty()),
-            server_terminated: Arc::new(AtomicBool::new(false)),
+            generation: Arc::new(Mutex::new(None)),
+            shutdown: crate::shutdown::Shutdown::default(),
+            transfers: crate::tasks::TransferTasks::new(crate::shutdown::Shutdown::default()),
             proxy_client: crate::proxy_downloader::build_proxy_client(&config.load()).unwrap(),
         };
         Self {
