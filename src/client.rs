@@ -89,6 +89,8 @@ pub async fn run() -> Result<()> {
 
     Config::apply_server_response(&config, &login_resp);
 
+    let proxy_client = crate::proxy_downloader::build_proxy_client(&config.load())?;
+
     // 7. Init cache
     let stats = Arc::new(Stats::new());
     let cache = Arc::new(CacheHandler::new(
@@ -97,6 +99,17 @@ pub async fn run() -> Result<()> {
         shutdown.clone(),
     )?);
 
+    run_with_cache(config, rpc_client, proxy_client, stats, cache, shutdown).await
+}
+
+async fn run_with_cache(
+    config: Arc<ArcSwap<Config>>,
+    rpc_client: Arc<RpcClient>,
+    proxy_client: Arc<reqwest::Client>,
+    stats: Arc<Stats>,
+    cache: Arc<CacheHandler>,
+    shutdown: CancellationToken,
+) -> Result<()> {
     // 8. Build AppState and spawn HTTP server
     let allow_connections = Arc::new(AtomicBool::new(false));
     // Java: reportShutdown — set after successful notifyStart(), never cleared.
@@ -105,7 +118,6 @@ pub async fn run() -> Result<()> {
     let report_shutdown = Arc::new(AtomicBool::new(false));
     let flood_control = Arc::new(DashMap::new());
 
-    let proxy_client = crate::proxy_downloader::build_proxy_client(&config.load())?;
     let gallery_downloader = GalleryDownloadSupervisor::new(
         config.clone(),
         rpc_client.clone(),
@@ -134,102 +146,112 @@ pub async fn run() -> Result<()> {
         proxy_client,
     };
 
-    let (ready_rx, server_shutdown_token) = server::start_server(app_state.clone());
-    app_state
-        .server_shutdown_token
-        .store(Some(Arc::new(server_shutdown_token)));
+    let mut background_tasks = None;
+    // Keep every fallible startup step inside the same shutdown boundary.
+    let result = async {
+        let (ready_rx, server_shutdown_token) = server::start_server(app_state.clone());
+        app_state
+            .server_shutdown_token
+            .store(Some(Arc::new(server_shutdown_token)));
 
-    // Wait for server to bind before notifying the RPC server
-    match ready_rx.await {
-        Ok(Ok(_port)) => {}
-        Ok(Err(e)) => {
-            return Err(HathError::Config(format!("Server startup failed: {}", e)));
+        // Wait for server to bind before notifying the RPC server
+        match ready_rx.await {
+            Ok(Ok(_port)) => {}
+            Ok(Err(e)) => {
+                return Err(HathError::Config(format!("Server startup failed: {}", e)));
+            }
+            Err(_) => {
+                return Err(HathError::Config(
+                    "Server startup failed unexpectedly".into(),
+                ));
+            }
         }
-        Err(_) => {
-            return Err(HathError::Config(
-                "Server startup failed unexpectedly".into(),
-            ));
-        }
-    }
 
-    // 9. notifyStart: tell server we're ready (this triggers connectivity test).
-    // Java: if notifyStart() returns false, the main thread skips
-    // allowNormalConnections and all periodic tasks, then waits for Ctrl+C.
-    let start_resp = rpc_client.client_start().await?;
-    let startup_ok = if start_resp.status == ResponseStatus::Ok {
-        true
-    } else {
-        let code = start_resp.fail_code.unwrap_or_default();
-        tracing::error!("Startup failure: {}", code);
-        if code.starts_with("FAIL_OTHER_CLIENT_CONNECTED") || code.starts_with("FAIL_CID_IN_USE") {
-            tracing::error!(
-                "Another client with the same ID ({}) is already connected to the server. \
-                 This can happen if the Java client is still running. \
-                 If you are switching from the Java client, make sure to stop it first, \
-                 then wait 5-10 minutes before starting this client.",
-                config.load().client_id.0
-            );
-            return Err(HathError::Fatal(code));
-        }
-        if code.starts_with("FAIL_CONNECT_TEST") {
-            tracing::error!(
-                "FAIL_CONNECT_TEST: The server was unable to verify your connection. \
-                 This usually means your port forwarding or firewall settings are incorrect. \
-                 Please ensure port {} is accessible from the internet.",
-                config.load().client_port
-            );
-            tracing::error!(
-                "The client will remain running so you can diagnose firewall and port \
-                 forwarding issues. Press Ctrl+C to exit."
-            );
+        // 9. notifyStart: tell server we're ready (this triggers connectivity test).
+        // Java: if notifyStart() returns false, the main thread skips
+        // allowNormalConnections and all periodic tasks, then waits for Ctrl+C.
+        let start_resp = rpc_client.client_start().await?;
+        let startup_ok = if start_resp.status == ResponseStatus::Ok {
+            true
         } else {
-            return Err(HathError::Fatal(format!(
-                "Unexpected client_start failure: {}",
-                code
-            )));
-        }
-        false
-    };
-
-    let background_tasks = if startup_ok {
-        // 10. Allow normal connections
-        allow_connections.store(true, Ordering::SeqCst);
-        report_shutdown.store(true, Ordering::SeqCst);
-        stats.program_started();
-
-        // Refresh settings after notifyStart
-        match rpc_client.refresh_settings().await {
-            Ok(refresh_resp) if refresh_resp.status == ResponseStatus::Ok => {
-                Config::apply_server_response(&config, &refresh_resp);
+            let code = start_resp.fail_code.unwrap_or_default();
+            tracing::error!("Startup failure: {}", code);
+            if code.starts_with("FAIL_OTHER_CLIENT_CONNECTED")
+                || code.starts_with("FAIL_CID_IN_USE")
+            {
+                tracing::error!(
+                    "Another client with the same ID ({}) is already connected to the server. \
+                     This can happen if the Java client is still running. \
+                     If you are switching from the Java client, make sure to stop it first, \
+                     then wait 5-10 minutes before starting this client.",
+                    config.load().client_id.0
+                );
+                return Err(HathError::Fatal(code));
             }
-            Ok(_) => {
-                tracing::warn!("refresh_settings returned non-OK status after startup");
+            if code.starts_with("FAIL_CONNECT_TEST") {
+                tracing::error!(
+                    "FAIL_CONNECT_TEST: The server was unable to verify your connection. \
+                     This usually means your port forwarding or firewall settings are incorrect. \
+                     Please ensure port {} is accessible from the internet.",
+                    config.load().client_port
+                );
+                tracing::error!(
+                    "The client will remain running so you can diagnose firewall and port \
+                     forwarding issues. Press Ctrl+C to exit."
+                );
+            } else {
+                return Err(HathError::Fatal(format!(
+                    "Unexpected client_start failure: {}",
+                    code
+                )));
             }
-            Err(e) => {
-                tracing::warn!("Failed to refresh settings after startup: {}", e);
+            false
+        };
+
+        background_tasks = if startup_ok {
+            // 10. Allow normal connections
+            allow_connections.store(true, Ordering::SeqCst);
+            report_shutdown.store(true, Ordering::SeqCst);
+            stats.program_started();
+
+            // Refresh settings after notifyStart
+            match rpc_client.refresh_settings().await {
+                Ok(refresh_resp) if refresh_resp.status == ResponseStatus::Ok => {
+                    Config::apply_server_response(&config, &refresh_resp);
+                }
+                Ok(_) => {
+                    tracing::warn!("refresh_settings returned non-OK status after startup");
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to refresh settings after startup: {}", e);
+                }
             }
-        }
 
-        // Initial blacklist fetch (3-day delta, synchronous)
-        cache::fetch_initial_blacklist(&rpc_client, &cache).await;
+            // Initial blacklist fetch (3-day delta, synchronous)
+            cache::fetch_initial_blacklist(&rpc_client, &cache).await;
 
-        tracing::info!("Startup completed successfully. Starting normal operation");
+            tracing::info!("Startup completed successfully. Starting normal operation");
 
-        // 11. Spawn periodic background tasks
-        Some(spawn_background_tasks(
-            cache.clone(),
-            config.clone(),
-            stats.clone(),
-            app_state.clone(),
-            rpc_client.clone(),
-            shutdown.clone(),
-        ))
-    } else {
-        None
-    };
+            // 11. Spawn periodic background tasks
+            Some(spawn_background_tasks(
+                cache.clone(),
+                config.clone(),
+                stats.clone(),
+                app_state.clone(),
+                rpc_client.clone(),
+                shutdown.clone(),
+            ))
+        } else {
+            None
+        };
 
-    // Wait for shutdown signal
-    shutdown.cancelled().await;
+        // Wait for shutdown signal
+        shutdown.cancelled().await;
+
+        Ok(())
+    }
+    .await;
+    shutdown.cancel();
 
     // Graceful shutdown (Java order: client_stop → stop listener → drain → save data).
     // Java: reportShutdown is only set after successful notifyStart().
@@ -261,7 +283,7 @@ pub async fn run() -> Result<()> {
         cfg.save_client_login().ok();
     }
 
-    Ok(())
+    result
 }
 
 fn spawn_background_tasks(
@@ -398,6 +420,67 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn certificate_failures_preserve_loaded_cache_for_restart() {
+        use crate::test_support::{FakeHttpServer, FakeResponse, FixtureDirs};
+
+        for (response, expected_error) in [
+            (FakeResponse::ok(Vec::new()), "invalid PKCS12 archive"),
+            (FakeResponse::status(404, "Not Found", "missing"), "404"),
+        ] {
+            let dirs = FixtureDirs::new();
+            let server = FakeHttpServer::start(vec![response]).await;
+            let mut cfg = dirs.config();
+            cfg.rpc_servers = vec!["127.0.0.1".parse().unwrap()];
+            cfg.rpc_port = server.port();
+            let config = Arc::new(ArcSwap::from_pointee(cfg));
+            let stats = Arc::new(Stats::new());
+            let shutdown = CancellationToken::new();
+            let cache = Arc::new(
+                CacheHandler::new(config.clone(), stats.clone(), shutdown.clone()).unwrap(),
+            );
+            // Nonzero metadata distinguishes a restored snapshot from an empty rescan.
+            let hv = crate::hvfile::HVFile::from_fileid(
+                "0123456789abcdef0123456789abcdef01234567-123-10-10-jpg",
+            )
+            .unwrap();
+            cache.register_proxy_file(&hv);
+            cache.save_persistent_data();
+            drop(cache);
+            let cache = Arc::new(
+                CacheHandler::new(config.clone(), stats.clone(), shutdown.clone()).unwrap(),
+            );
+            assert!(!dirs.data_dir.join("pcache_info").exists());
+            let rpc_client = Arc::new(RpcClient::new(config.clone()).unwrap());
+
+            let proxy_client = crate::proxy_downloader::build_proxy_client(&config.load()).unwrap();
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                run_with_cache(
+                    config.clone(),
+                    rpc_client,
+                    proxy_client,
+                    stats,
+                    cache,
+                    shutdown,
+                ),
+            )
+            .await
+            .expect("failed server startup must finish shutdown promptly");
+
+            assert!(result.unwrap_err().to_string().contains(expected_error));
+            assert!(
+                dirs.data_dir.join("pcache_info").exists(),
+                "a handled startup failure must republish the loaded cache snapshot"
+            );
+            let restarted_stats = Arc::new(Stats::new());
+            let _restarted =
+                CacheHandler::new(config, restarted_stats.clone(), CancellationToken::new())
+                    .unwrap();
+            assert_eq!(restarted_stats.cache_count.load(Ordering::Relaxed), 1);
+        }
+    }
 
     #[tokio::test]
     async fn background_task_timeout_prevents_a_clean_shutdown_result() {

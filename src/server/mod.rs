@@ -94,9 +94,10 @@ pub(crate) fn start_server(
     let server_shutdown = server_shutdown_token.clone();
     state.server_terminated.store(false, Ordering::Release);
     tokio::spawn(async move {
-        if let Err(e) = run_server(state, server_shutdown, Some(ready_tx)).await {
+        if let Err(e) = run_server(state.clone(), server_shutdown, Some(ready_tx)).await {
             tracing::error!("Server error: {}", e);
         }
+        state.server_terminated.store(true, Ordering::Release);
     });
     (ready_rx, server_shutdown_token)
 }
@@ -216,7 +217,5 @@ async fn run_server(
         }
     }
 
-    // Signal that the server has fully terminated (for cert refresh watcher).
-    state.server_terminated.store(true, Ordering::Release);
     Ok(())
 }

@@ -223,6 +223,11 @@ impl FileDownloader {
             .into());
         }
 
+        // Tokio may still have a blocking write pending after write_all returns.
+        if let Some(file) = &mut file {
+            file.flush().await?;
+        }
+
         self.download_time_millis.store(
             download_start.elapsed().as_millis() as u64,
             Ordering::Relaxed,
@@ -303,6 +308,78 @@ pub(crate) fn build_proxy_url(proxy_type: &str, proxy_host: &str, proxy_port: u1
 mod tests {
     use super::*;
     use crate::test_support::{FakeHttpServer, FakeResponse};
+
+    #[test]
+    fn completed_file_download_waits_for_pending_writes() {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::TcpListener;
+        use tokio::sync::oneshot;
+
+        // Hold the only filesystem worker after file creation, before body delivery.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("download");
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url =
+                Url::parse(&format!("http://{}/file", listener.local_addr().unwrap())).unwrap();
+            let (send_body, body_ready) = oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(stream.read_u8().await.unwrap());
+                }
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+                body_ready.await.unwrap();
+                stream.write_all(b"test").await.unwrap();
+            });
+            let downloader =
+                FileDownloader::new(url, 5_000, 5_000, DownloadMode::File(path.clone()));
+            let mut download = tokio::spawn(async move { downloader.download().await });
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !path.exists() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let (release, blocked) = std::sync::mpsc::channel();
+            let (started, worker_started) = oneshot::channel();
+            let worker = tokio::task::spawn_blocking(move || {
+                started.send(()).unwrap();
+                let _ = blocked.recv();
+            });
+            worker_started.await.unwrap();
+            send_body.send(()).unwrap();
+            let premature_result =
+                tokio::time::timeout(Duration::from_millis(100), &mut download).await;
+            release.send(()).unwrap();
+            worker.await.unwrap();
+            let completed_early = premature_result.is_ok();
+            match premature_result {
+                Ok(result) => {
+                    result.unwrap().unwrap();
+                }
+                Err(_) => {
+                    download.await.unwrap().unwrap();
+                }
+            }
+            server.await.unwrap();
+            assert!(
+                !completed_early,
+                "download must wait for filesystem writes to complete"
+            );
+            assert_eq!(std::fs::read(path).unwrap(), b"test");
+        });
+    }
 
     #[tokio::test]
     async fn does_not_retry_a_not_found_response() {
