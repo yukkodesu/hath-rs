@@ -170,10 +170,7 @@ pub(crate) async fn wait_for_file_contents(path: &Path, expected: &[u8]) {
 async fn read_http_request(stream: &mut tokio::net::TcpStream) -> String {
     let mut buf = Vec::new();
     let mut scratch = [0u8; 1024];
-    loop {
-        let Ok(n) = stream.read(&mut scratch).await else {
-            break;
-        };
+    while let Ok(n) = stream.read(&mut scratch).await {
         if n == 0 {
             break;
         }

@@ -288,6 +288,10 @@ impl GalleryQueueRunner {
         })
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "A single caller supplies the download context; a parameter wrapper would add indirection."
+    )]
     async fn download_file(
         &self,
         cfg: &Config,

@@ -107,7 +107,7 @@ pub fn make_rpc_url(act: Action, add: &str, config: &Config, host: &str) -> Resu
         url.set_ip_host(ip)
             .map_err(|_| HathError::Rpc("invalid URL host".into()))?;
     } else {
-        url.set_host(Some(&host))
+        url.set_host(Some(host))
             .map_err(|e| HathError::Rpc(format!("invalid URL host: {}", e)))?;
     }
     if config.rpc_port == 80 {
