@@ -112,7 +112,7 @@ impl SessionManager {
             AdmissionClass::Limited => self
                 .inner
                 .active_connections
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                     (current <= max_connections)
                         .then(|| current.checked_add(1))
                         .flatten()
