@@ -9,17 +9,17 @@ permissions:
 
 jobs:
   binaries:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     strategy:
       matrix:
         target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
       - uses: taiki-e/install-action@cross
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: "17"
@@ -37,7 +37,7 @@ jobs:
           cp README.md "$archive/README.md"
           tar -czf "$archive.tar.gz" "$archive"
           sha256sum "$archive.tar.gz" > "$archive.tar.gz.sha256"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.target }}
           path: |
@@ -46,15 +46,15 @@ jobs:
 
   release:
     needs: binaries
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
       - run: cat *.sha256 > SHA256SUMS
         working-directory: dist
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           generate_release_notes: true
           files: |
