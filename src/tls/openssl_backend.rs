@@ -1,12 +1,26 @@
 use crate::error::{HathError, Result};
 use openssl::pkey::PKey;
-use openssl::ssl::{Ssl, SslAcceptor, SslMethod};
+use openssl::ssl::{Ssl, SslAcceptor, SslMethod, SslOptions};
 use openssl::x509::X509;
 use reqwest::ClientBuilder;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use std::io;
 use std::pin::Pin;
 use tokio::io::{AsyncRead, AsyncWrite};
+
+// Union of the JDK 21 defaults and Mozilla's intermediate profile.
+const TLS12_CIPHERS: &str = "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-GCM-SHA256:\
+    ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-CHACHA20-POLY1305:\
+    ECDHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384:DHE-RSA-CHACHA20-POLY1305:\
+    DHE-DSS-AES256-GCM-SHA384:DHE-RSA-AES128-GCM-SHA256:DHE-DSS-AES128-GCM-SHA256:\
+    ECDHE-ECDSA-AES256-SHA384:ECDHE-RSA-AES256-SHA384:ECDHE-ECDSA-AES128-SHA256:\
+    ECDHE-RSA-AES128-SHA256:DHE-RSA-AES256-SHA256:DHE-DSS-AES256-SHA256:DHE-RSA-AES128-SHA256:\
+    DHE-DSS-AES128-SHA256:ECDHE-ECDSA-AES256-SHA:ECDHE-RSA-AES256-SHA:ECDHE-ECDSA-AES128-SHA:\
+    ECDHE-RSA-AES128-SHA:DHE-RSA-AES256-SHA:DHE-DSS-AES256-SHA:DHE-RSA-AES128-SHA:\
+    DHE-DSS-AES128-SHA";
+const TLS13_CIPHERS: &str =
+    "TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256";
+const TLS_GROUPS: &str = "X25519MLKEM768:X25519:P-256:P-384:P-521:X448:ffdhe2048:ffdhe3072:ffdhe4096:ffdhe6144:ffdhe8192";
 
 pub(crate) type TlsAcceptor = SslAcceptor;
 pub(crate) type TlsStream<S> = tokio_openssl::SslStream<S>;
@@ -36,6 +50,10 @@ pub(crate) fn build_server_acceptor(
 ) -> Result<TlsAcceptor> {
     let configure = || {
         let mut acceptor = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls_server())?;
+        acceptor.set_cipher_list(TLS12_CIPHERS)?;
+        acceptor.set_ciphersuites(TLS13_CIPHERS)?;
+        acceptor.set_groups_list(TLS_GROUPS)?;
+        acceptor.set_options(SslOptions::CIPHER_SERVER_PREFERENCE);
         let mut certificates = cert_chain.iter();
         if let Some(leaf) = certificates.next() {
             let leaf = X509::from_der(leaf)?;
