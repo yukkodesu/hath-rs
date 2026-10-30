@@ -126,6 +126,7 @@ impl FakeResponse {
         self
     }
 
+    #[cfg_attr(feature = "tls-openssl", allow(dead_code))]
     pub(crate) fn with_close_gate(mut self, gate: Arc<tokio::sync::Semaphore>) -> Self {
         self.close_gate = Some(gate);
         self

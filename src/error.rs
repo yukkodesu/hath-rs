@@ -46,6 +46,7 @@ pub enum HathError {
     Fatal(String),
 }
 
+#[cfg(feature = "tls-rustls")]
 impl From<rustls::Error> for HathError {
     fn from(e: rustls::Error) -> Self {
         HathError::Tls(e.to_string())

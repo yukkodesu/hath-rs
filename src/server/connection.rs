@@ -128,5 +128,5 @@ impl Connection {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tls-rustls"))]
 mod tests;

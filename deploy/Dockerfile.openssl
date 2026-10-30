@@ -1,0 +1,31 @@
+# Stage 1: Build
+FROM rust:alpine3.23 AS builder
+
+RUN apk add --no-cache \
+    build-base openssl-dev pkgconf
+
+WORKDIR /build
+
+COPY . .
+# musl targets link the C runtime statically by default, which rules out libssl.so.
+RUN --mount=type=cache,target=/build/target \
+    --mount=type=cache,target=/usr/local/cargo/registry \
+    RUSTFLAGS="-C target-feature=-crt-static" \
+    cargo build --release --no-default-features --features tls-openssl,mimalloc && \
+    mkdir -p /build/out && \
+    cp /build/target/release/hath-rs /build/out/hath-rs
+
+# Stage 2: Runtime
+# Keep the Alpine release in sync with the builder so libssl symbols match.
+FROM alpine:3.23
+
+RUN apk add --no-cache \
+    tini ca-certificates libgcc libssl3 libcrypto3
+
+COPY --from=builder /build/out/hath-rs /usr/local/bin/hath-rs
+COPY deploy/docker-entrypoint.sh /docker-entrypoint.sh
+
+VOLUME ["/hath/cache", "/hath/data", "/hath/download", "/hath/log", "/hath/tmp"]
+WORKDIR /hath
+
+ENTRYPOINT ["tini", "--", "/bin/sh", "/docker-entrypoint.sh"]

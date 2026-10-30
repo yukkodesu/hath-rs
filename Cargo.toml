@@ -1,9 +1,19 @@
 [package]
 name = "hath-rs"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2024"
 
 [features]
+default = ["tls-rustls"]
+# Exactly one TLS backend must be enabled.
+tls-rustls = [
+    "dep:rustls",
+    "dep:rustls-native-certs",
+    "dep:tokio-rustls",
+    "reqwest/rustls-no-provider",
+    "x509-parser/verify",
+]
+tls-openssl = ["dep:openssl", "dep:tokio-openssl", "reqwest/native-tls"]
 # Keep the platform allocator as the default. Enable this feature in deployment
 # builds to evaluate mimalloc under the target workload.
 mimalloc = ["dep:mimalloc"]
@@ -13,12 +23,15 @@ tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
-reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "socks"] }
+reqwest = { version = "0.13", default-features = false, features = ["socks"] }
 p12 = "0.6"
-rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
-rustls-native-certs = "0.8"
-tokio-rustls = { version = "0.26", default-features = false, features = ["tls12"] }
-x509-parser = { version = "0.18", features = ["verify"] }
+openssl = { version = "0.10", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"], optional = true }
+rustls-native-certs = { version = "0.8", optional = true }
+rustls-pki-types = "1"
+tokio-openssl = { version = "0.6", optional = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["tls12"], optional = true }
+x509-parser = "0.18"
 clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
