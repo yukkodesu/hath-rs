@@ -70,15 +70,27 @@ jobs:
             dist/SHA256SUMS
 
   container:
-    name: Build Alpine container image (${{ matrix.arch }})
+    name: Build Alpine container image (${{ matrix.variant }}, ${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - arch: amd64
+          - variant: rustls
+            dockerfile: deploy/Dockerfile
+            arch: amd64
             runner: ubuntu-26.04
-          - arch: arm64
+          - variant: rustls
+            dockerfile: deploy/Dockerfile
+            arch: arm64
+            runner: ubuntu-26.04-arm
+          - variant: openssl
+            dockerfile: deploy/Dockerfile.openssl
+            arch: amd64
+            runner: ubuntu-26.04
+          - variant: openssl
+            dockerfile: deploy/Dockerfile.openssl
+            arch: arm64
             runner: ubuntu-26.04-arm
     steps:
       - uses: actions/checkout@v7
@@ -93,7 +105,7 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: .
-          file: deploy/Dockerfile
+          file: ${{ matrix.dockerfile }}
           platforms: linux/${{ matrix.arch }}
           outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
       - name: Export digest
@@ -104,20 +116,28 @@ jobs:
           touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
       - uses: actions/upload-artifact@v7
         with:
-          name: image-digest-${{ matrix.arch }}
+          name: image-digest-${{ matrix.variant }}-${{ matrix.arch }}
           path: ${{ runner.temp }}/digests/*
           if-no-files-found: error
           retention-days: 1
 
   container-manifest:
-    name: Publish multi-architecture container image
+    name: Publish multi-architecture container image (${{ matrix.variant }})
     needs: container
     runs-on: ubuntu-26.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: rustls
+            tag_suffix: ""
+          - variant: openssl
+            tag_suffix: "-openssl"
     steps:
       - uses: actions/download-artifact@v8
         with:
           path: ${{ runner.temp }}/digests
-          pattern: image-digest-*
+          pattern: image-digest-${{ matrix.variant }}-*
           merge-multiple: true
       - uses: docker/setup-buildx-action@v4
       - uses: docker/login-action@v4
@@ -129,12 +149,13 @@ jobs:
         working-directory: ${{ runner.temp }}/digests
         env:
           RELEASE_TAG: ${{ github.ref_name }}
+          TAG_SUFFIX: ${{ matrix.tag_suffix }}
         run: |
           images=()
           for digest in *; do
             images+=("$IMAGE_NAME@sha256:$digest")
           done
           docker buildx imagetools create \
-            --tag "$IMAGE_NAME:$RELEASE_TAG" \
-            --tag "$IMAGE_NAME:latest" \
+            --tag "$IMAGE_NAME:$RELEASE_TAG$TAG_SUFFIX" \
+            --tag "$IMAGE_NAME:latest$TAG_SUFFIX" \
             "${images[@]}"

@@ -62,6 +62,15 @@ export HATH_IMAGE=ghcr.io/yukkodesu/hath-rs:v0.1.0
 docker compose up -d
 ```
 
+An OpenSSL build is also published with an `-openssl` tag suffix, such as `latest-openssl` or `v0.1.0-openssl`. It uses Alpine's OpenSSL for all TLS instead of rustls and AWS-LC:
+
+```sh
+export HATH_IMAGE=ghcr.io/yukkodesu/hath-rs:latest-openssl
+docker compose up -d
+```
+
+To build it from source, run `docker build -f deploy/Dockerfile.openssl -t hath-rs:openssl .`. For cargo builds, use `--no-default-features --features tls-openssl`.
+
 For a local image build:
 
 ```sh

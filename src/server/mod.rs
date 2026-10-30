@@ -46,7 +46,7 @@ pub(crate) struct AppState {
     /// Flood control table (IP -> entry). Sharded because it is touched by each incoming connection.
     pub(crate) flood_control: Arc<DashMap<String, FloodControlEntry>>,
     /// TLS acceptor that can be swapped at runtime (e.g. cert refresh).
-    pub(crate) tls_acceptor: Arc<ArcSwapOption<tokio_rustls::TlsAcceptor>>,
+    pub(crate) tls_acceptor: Arc<ArcSwapOption<crate::tls::TlsAcceptor>>,
     /// Certificate expiry as a Unix timestamp (seconds). Checked periodically;
     /// if the cert expires within 24 hours, the client shuts down (matches Java).
     pub(crate) cert_expiry: Arc<Mutex<Option<i64>>>,

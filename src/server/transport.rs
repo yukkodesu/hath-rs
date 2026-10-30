@@ -1,10 +1,10 @@
+use crate::tls::{TlsAcceptor, TlsStream};
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_io_timeout::TimeoutReader;
-use tokio_rustls::{TlsAcceptor, server::TlsStream};
 
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_secs(1);
@@ -29,5 +29,5 @@ pub(super) async fn accept_tls(
 ) -> io::Result<TlsStream<Pin<Box<TimeoutReader<TcpStream>>>>> {
     let mut stream = TimeoutReader::new(stream);
     stream.set_timeout(Some(READ_TIMEOUT));
-    acceptor.accept(Box::pin(stream)).await
+    crate::tls::accept(acceptor, Box::pin(stream)).await
 }

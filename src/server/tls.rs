@@ -8,7 +8,7 @@ use crate::rpc_client::RpcClient;
 use crate::server::{AppState, start_server, stop_server, tls};
 use arc_swap::ArcSwap;
 use p12::PFX;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::task::JoinHandle;
 
@@ -69,20 +69,13 @@ fn order_certificate_chain(
     mut certificates: Vec<CertificateDer<'static>>,
     private_key: &PrivateKeyDer<'static>,
 ) -> Result<Vec<CertificateDer<'static>>> {
-    let provider = crate::tls::aws_lc_provider();
-    let signing_key = provider
-        .key_provider
-        .load_private_key(private_key.clone_key())
-        .map_err(|error| HathError::Tls(format!("invalid PKCS12 private key: {error}")))?;
-    let key_spki = signing_key.public_key().ok_or_else(|| {
-        HathError::Tls("could not determine PKCS12 private key public key".into())
-    })?;
+    let key_spki = crate::tls::private_key_spki(private_key)?;
 
     let mut leaf_index = None;
     for (index, certificate) in certificates.iter().enumerate() {
         let (_, parsed) = x509_parser::prelude::parse_x509_certificate(certificate.as_ref())
             .map_err(|error| HathError::Tls(format!("invalid PKCS12 certificate: {error}")))?;
-        if parsed.public_key().raw == key_spki.as_ref() && leaf_index.replace(index).is_some() {
+        if parsed.public_key().raw == key_spki.as_slice() && leaf_index.replace(index).is_some() {
             return Err(HathError::Tls(
                 "multiple PKCS12 certificates match the private key".into(),
             ));
@@ -100,7 +93,10 @@ fn order_certificate_chain(
         for (index, certificate) in certificates.iter().enumerate() {
             let (_, candidate) = x509_parser::prelude::parse_x509_certificate(certificate.as_ref())
                 .map_err(|error| HathError::Tls(format!("invalid PKCS12 certificate: {error}")))?;
-            if is_valid_issuer(&child, &candidate)? && issuer_index.replace(index).is_some() {
+            if is_valid_issuer(&child, &candidate)?
+                && crate::tls::is_signed_by(chain.last().unwrap(), certificate)
+                && issuer_index.replace(index).is_some()
+            {
                 return Err(HathError::Tls(
                     "multiple PKCS12 certificates can issue the same child certificate".into(),
                 ));
@@ -131,10 +127,7 @@ fn is_valid_issuer(
     let key_usage = candidate
         .key_usage()
         .map_err(|error| HathError::Tls(format!("invalid issuer key usage: {error}")))?;
-    if key_usage.is_some_and(|extension| !extension.value.key_cert_sign()) {
-        return Ok(false);
-    }
-    Ok(child.verify_signature(Some(candidate.public_key())).is_ok())
+    Ok(!key_usage.is_some_and(|extension| !extension.value.key_cert_sign()))
 }
 
 fn certificate_expiry_unix(cert: &CertificateDer<'_>) -> Result<i64> {
@@ -143,23 +136,13 @@ fn certificate_expiry_unix(cert: &CertificateDer<'_>) -> Result<i64> {
     Ok(certificate.validity().not_after.timestamp())
 }
 
-fn build_server_acceptor(parsed: ParsedP12Certificate) -> Result<tokio_rustls::TlsAcceptor> {
-    let config = rustls::ServerConfig::builder_with_provider(crate::tls::aws_lc_provider())
-        .with_safe_default_protocol_versions()
-        .map_err(|error| HathError::Tls(error.to_string()))?
-        .with_no_client_auth()
-        .with_single_cert(parsed.cert_chain, parsed.private_key)
-        .map_err(|error| HathError::Tls(format!("failed to configure TLS certificate: {error}")))?;
-    Ok(tokio_rustls::TlsAcceptor::from(Arc::new(config)))
-}
-
-/// Build a rustls acceptor from the PKCS12 certificate.
+/// Build a TLS acceptor from the PKCS12 certificate.
 /// If `force_download` is true, always re-download the cert from the RPC server.
 /// Returns (acceptor, cert_expiry_unix_seconds).
 pub(super) async fn build_tls_acceptor(
     config: &Config,
     force_download: bool,
-) -> Result<(tokio_rustls::TlsAcceptor, i64)> {
+) -> Result<(crate::tls::TlsAcceptor, i64)> {
     let cert_path = config.data_dir.join("hathcert.p12");
 
     if force_download || !cert_path.exists() {
@@ -186,7 +169,10 @@ pub(super) async fn build_tls_acceptor(
         );
         return Err(HathError::CertExpired);
     }
-    Ok((build_server_acceptor(parsed)?, cert_expiry_unix))
+    Ok((
+        crate::tls::build_server_acceptor(parsed.cert_chain, parsed.private_key)?,
+        cert_expiry_unix,
+    ))
 }
 
 /// Spawn the certificate refresh watcher.
@@ -312,6 +298,41 @@ pub fn spawn_time_cert_check(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ca_params(name: &str) -> rcgen::CertificateParams {
+        let mut params = rcgen::CertificateParams::new(vec![name.to_owned()]).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, name);
+        params
+    }
+
+    #[test]
+    fn orders_chain_from_leaf_and_verifies_issuer_signatures() {
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let ca_cert = ca_params("ca").self_signed(&ca_key).unwrap();
+        let issuer = rcgen::Issuer::new(ca_params("ca"), &ca_key);
+        let leaf_key = rcgen::KeyPair::generate().unwrap();
+        let leaf_cert = rcgen::CertificateParams::new(vec!["leaf".to_owned()])
+            .unwrap()
+            .signed_by(&leaf_key, &issuer)
+            .unwrap();
+        let private_key: PrivateKeyDer<'static> =
+            PrivatePkcs8KeyDer::from(leaf_key.serialize_der()).into();
+        let leaf = leaf_cert.der().clone();
+        let ca = ca_cert.der().clone();
+
+        let ordered =
+            order_certificate_chain(vec![ca.clone(), leaf.clone()], &private_key).unwrap();
+        assert_eq!(ordered, vec![leaf.clone(), ca]);
+
+        // Same subject as the real issuer, but a different key.
+        let forged_key = rcgen::KeyPair::generate().unwrap();
+        let forged = ca_params("ca").self_signed(&forged_key).unwrap();
+        assert!(order_certificate_chain(vec![forged.der().clone(), leaf], &private_key).is_err());
+    }
 
     #[test]
     fn rejects_corrupt_pkcs12_data() {
