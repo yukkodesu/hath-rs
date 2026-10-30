@@ -1,5 +1,5 @@
 # Stage 1: Build
-FROM rust:alpine3.23 AS builder
+FROM rust:alpine AS builder
 
 RUN apk add --no-cache \
     build-base openssl-dev pkgconf
@@ -16,8 +16,7 @@ RUN --mount=type=cache,target=/build/target \
     cp /build/target/release/hath-rs /build/out/hath-rs
 
 # Stage 2: Runtime
-# Keep the Alpine release in sync with the builder so libssl symbols match.
-FROM alpine:3.23
+FROM alpine:latest
 
 RUN apk add --no-cache \
     tini ca-certificates libgcc libssl3 libcrypto3
