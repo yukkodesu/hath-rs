@@ -411,11 +411,16 @@ impl Body for StreamingBody {
                     watch_rx, wait_fut, ..
                 } = &mut self.source
                 {
+                    // A dropped sender (task panic or abort) will never publish again.
+                    let sender_gone = watch_rx.has_changed().is_err();
                     // Sample the latest watch state without holding the borrow.
                     let (write_offset, fail_incomplete) = {
                         let state = watch_rx.borrow_and_update();
                         match *state {
-                            DownloadState::InProgress(n) => (n, None),
+                            DownloadState::InProgress(n) => (
+                                n,
+                                sender_gone.then_some(BodyIncompleteReason::ProxyEndedEarly),
+                            ),
                             DownloadState::Done => (current_total as u64, None),
                             DownloadState::Failed(reason) => {
                                 let incomplete = match reason {
@@ -770,43 +775,25 @@ mod tests {
         );
     }
 
-    /// Simulates P0-01 body-stage retry: InProgress resets to 0 (file truncated,
-    /// download restarted), then catches back up. Body must wait through the
-    /// zero-reset and resume reading once the write offset passes its position.
+    /// A panicked or aborted download task drops the sender in `InProgress`;
+    /// the body must end instead of polling a closed channel forever.
     #[tokio::test]
-    async fn proxy_body_handles_write_offset_reset_on_retry() {
+    async fn proxy_body_ends_when_download_task_disappears() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("proxy-retry");
-        // File has 20 bytes; positions 0-19 all valid (retry rewrites from 0).
+        let path = dir.path().join("proxy-aborted");
         std::fs::write(&path, [0xAAu8; 20]).unwrap();
         let file = std::fs::File::open(&path).unwrap();
         let (tx, rx) = watch::channel(DownloadState::InProgress(7));
         let (done_tx, _done_rx) = oneshot::channel();
+        drop(tx);
 
         let source = ProxyBodySource::for_test(path.clone(), rx, done_tx);
         let mut body = StreamingBody::new_proxy(20, file, source, None);
 
-        // Spawn the body consumer.
-        let handle = tokio::spawn(async move {
-            let data = collect_body(&mut body).await;
-            (data, body.completion_status().completion)
-        });
-
-        // Body reads 7 bytes (one TCP packet), then hits the wait gate at offset 7.
-        // Simulate retry: InProgress resets to 0.
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        let _ = tx.send(DownloadState::InProgress(0));
-
-        // Body should now be waiting. Give it time to notice.
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-
-        // Retry catches up: write offset passes body's position (7 + 1460).
-        let _ = tx.send(DownloadState::InProgress(20));
-        // Signal download complete.
-        let _ = tx.send(DownloadState::Done);
-
-        let (data, completion) = handle.await.unwrap();
-        assert_eq!(data.len(), 20);
-        assert_eq!(completion, BodyCompletion::Complete);
+        collect_body(&mut body).await;
+        assert_eq!(
+            body.completion_status().completion,
+            BodyCompletion::Incomplete(BodyIncompleteReason::ProxyEndedEarly)
+        );
     }
 }

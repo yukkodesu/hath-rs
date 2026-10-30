@@ -209,7 +209,12 @@ impl GalleryQueueRunner {
         let gallery_dir = create_gallery_dir(&cfg, &metadata)?;
         let direct_client = build_direct_client(DOWNLOAD_CONNECT_TIMEOUT, DOWNLOAD_READ_TIMEOUT)?;
         let proxied_client = if cfg.image_proxy_host.is_some() {
-            build_image_proxy_client(&cfg, DOWNLOAD_CONNECT_TIMEOUT, DOWNLOAD_READ_TIMEOUT)?
+            build_image_proxy_client(
+                &cfg,
+                DOWNLOAD_CONNECT_TIMEOUT,
+                DOWNLOAD_READ_TIMEOUT,
+                reqwest::redirect::Policy::default(),
+            )?
         } else {
             direct_client.clone()
         };

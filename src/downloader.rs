@@ -259,11 +259,13 @@ pub(crate) fn build_image_proxy_client(
     config: &Config,
     connect_timeout: Duration,
     read_timeout: Duration,
+    redirect: reqwest::redirect::Policy,
 ) -> Result<Client> {
     let mut builder = Client::builder()
         .user_agent(format!("Hentai@Home {}", crate::rpc::CLIENT_VERSION))
         .connect_timeout(connect_timeout)
-        .read_timeout(read_timeout);
+        .read_timeout(read_timeout)
+        .redirect(redirect);
 
     if let Some(proxy_host) = &config.image_proxy_host {
         let proxy_type = config.image_proxy_type.as_deref().unwrap_or("socks");
@@ -308,6 +310,12 @@ pub(crate) fn build_proxy_url(proxy_type: &str, proxy_host: &str, proxy_port: u1
 mod tests {
     use super::*;
     use crate::test_support::{FakeHttpServer, FakeResponse};
+
+    #[test]
+    fn build_proxy_url_handles_ipv6_host() {
+        let url = build_proxy_url("socks", "::1", 1080).unwrap();
+        assert_eq!(url.as_str(), "socks://[::1]:1080/");
+    }
 
     #[test]
     fn completed_file_download_waits_for_pending_writes() {

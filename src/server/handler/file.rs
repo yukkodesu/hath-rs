@@ -141,7 +141,8 @@ mod tests {
             tokio_util::sync::CancellationToken::new(),
             crate::tasks::TransferTasks::new(crate::shutdown::Shutdown::default()),
         );
-        let proxy_client = crate::proxy_downloader::build_proxy_client(&config.load()).unwrap();
+        let proxy_downloader =
+            crate::proxy_downloader::ProxyDownloader::new(&config.load()).unwrap();
 
         AppState {
             config,
@@ -162,7 +163,7 @@ mod tests {
             generation: Arc::new(Mutex::new(None)),
             shutdown: crate::shutdown::Shutdown::default(),
             transfers: crate::tasks::TransferTasks::new(crate::shutdown::Shutdown::default()),
-            proxy_client,
+            proxy_downloader,
         }
     }
 

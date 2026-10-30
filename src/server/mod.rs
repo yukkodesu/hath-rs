@@ -69,9 +69,8 @@ pub(crate) struct AppState {
     pub(crate) generation: Arc<Mutex<Option<ServerGeneration>>>,
     pub(crate) shutdown: crate::shutdown::Shutdown,
     pub(crate) transfers: crate::tasks::TransferTasks,
-    /// Shared HTTP client for ProxyFileDownloader requests.
-    /// 5s connect + 30s read timeout, reused across all proxy downloads.
-    pub(crate) proxy_client: Arc<reqwest::Client>,
+    /// Shared HTTP transport for on-demand upstream downloads.
+    pub(crate) proxy_downloader: crate::proxy_downloader::ProxyDownloader,
 }
 
 static LOCAL_NETWORK_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {

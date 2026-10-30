@@ -82,7 +82,8 @@ impl Fixture {
             generation: Arc::new(Mutex::new(None)),
             shutdown: crate::shutdown::Shutdown::default(),
             transfers: crate::tasks::TransferTasks::new(crate::shutdown::Shutdown::default()),
-            proxy_client: crate::proxy_downloader::build_proxy_client(&config.load()).unwrap(),
+            proxy_downloader: crate::proxy_downloader::ProxyDownloader::new(&config.load())
+                .unwrap(),
         };
         Self {
             _dirs: dirs,
@@ -426,6 +427,91 @@ async fn long_response_survives_read_timeout_and_generation_stop() {
         .unwrap()
         .unwrap();
     fixture.assert_active(0);
+}
+
+#[tokio::test]
+async fn proxy_stream_recovers_from_truncated_primary_using_backup() {
+    use crate::server::proxy_transfer::ProxyTransfer;
+    use crate::server::response::ResponsePolicy;
+    use http_body_util::BodyExt;
+
+    let fixture = Fixture::new();
+    let contents: Vec<u8> = (0..256333).map(|n| (n % 251) as u8).collect();
+    let fileid = format!(
+        "{}-{}-jpg",
+        crate::utils::sha1_bytes(&contents),
+        contents.len()
+    );
+    let close_primary = Arc::new(tokio::sync::Semaphore::new(0));
+    let start_backup = Arc::new(tokio::sync::Semaphore::new(0));
+    let primary = FakeHttpServer::start(vec![
+        FakeResponse::ok(contents.clone())
+            .close_after(130005)
+            .with_close_gate(close_primary.clone()),
+    ])
+    .await;
+    let backup = FakeHttpServer::start(vec![
+        FakeResponse::ok(contents.clone()).with_body_gate(start_backup.clone()),
+    ])
+    .await;
+    let config = fixture.state.config.load_full();
+    let transfer = ProxyTransfer::start(
+        &fileid,
+        &[primary.url("/image"), backup.url("/image")],
+        &fixture.state,
+        &config,
+    )
+    .await
+    .unwrap();
+    let mut body = ResponsePolicy::new(true, None, fixture.state.stats.clone())
+        .finalize(transfer.into_response(false, fixture.state.stats.clone()))
+        .await
+        .into_body();
+    let first = timeout(Duration::from_secs(2), body.frame())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+        .into_data()
+        .unwrap();
+    let mut received = first.to_vec();
+    assert_eq!(
+        backup.requests().len(),
+        0,
+        "the first bytes must stream before recovery starts"
+    );
+    close_primary.add_permits(1);
+    timeout(Duration::from_secs(2), async {
+        while backup.requests().is_empty() {
+            tokio::task::yield_now().await;
+        }
+        // Drain full TCP packets from the retained prefix while the backup
+        // has only sent headers and cannot yet append any bytes.
+        while received.len() + 1460 <= 130005 {
+            received.extend_from_slice(&body.frame().await.unwrap().unwrap().into_data().unwrap());
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(received, contents[..received.len()]);
+    start_backup.add_permits(1);
+    timeout(Duration::from_secs(2), async {
+        while let Some(frame) = body.frame().await {
+            received.extend_from_slice(&frame.unwrap().into_data().unwrap());
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        received.len(),
+        contents.len(),
+        "healthy backup must rescue the streaming response"
+    );
+    assert_eq!(received, contents);
+    let hv = crate::hvfile::HVFile::from_fileid(&fileid).unwrap();
+    crate::test_support::wait_for_file_contents(&hv.cache_path(&config.cache_dir), &contents).await;
+    assert_eq!(primary.requests().len(), 1);
+    assert_eq!(backup.requests().len(), 1);
 }
 
 #[tokio::test]
