@@ -2,7 +2,6 @@ use super::body::StreamingBody;
 use super::response::{self, ResponseSpec};
 use crate::config::Config;
 use crate::error::Result;
-use crate::proxy_downloader::ProxyFileDownloader;
 use crate::stats::Stats;
 use hyper::StatusCode;
 use std::sync::Arc;
@@ -11,7 +10,7 @@ pub(crate) struct ProxyTransfer {
     fileid: String,
     content_length: usize,
     content_type: String,
-    parts: crate::proxy_downloader::ProxyDownloadParts,
+    download: crate::proxy_downloader::ProxyDownload,
 }
 
 impl ProxyTransfer {
@@ -21,24 +20,24 @@ impl ProxyTransfer {
         state: &super::AppState,
         config: &Config,
     ) -> Result<Self> {
-        let downloader = ProxyFileDownloader::new(
-            fileid,
-            sources,
-            config,
-            Some(state.cache.clone()),
-            state.stats.clone(),
-            &state.proxy_client,
-            &state.transfers,
-        )
-        .await?;
-        let parts = downloader.into_parts();
-        let content_length = parts.content_length();
-        let content_type = parts.content_type().to_string();
+        let download = state
+            .proxy_downloader
+            .start(
+                fileid,
+                sources,
+                config,
+                Some(state.cache.clone()),
+                state.stats.clone(),
+                &state.transfers,
+            )
+            .await?;
+        let content_length = download.content_length();
+        let content_type = download.content_type().to_string();
         Ok(Self {
             fileid: fileid.to_string(),
             content_length,
             content_type,
-            parts,
+            download,
         })
     }
 
@@ -51,18 +50,18 @@ impl ProxyTransfer {
             fileid,
             content_length,
             content_type,
-            parts,
+            download,
         } = self;
 
         if head_only {
             return response::head_response(&content_type, content_length);
         }
 
-        let file = match parts.open_temp_file() {
+        let file = match download.open_temp_file() {
             Ok(file) => file,
             Err(e) => {
                 tracing::warn!("Proxy: cannot open temp file for {}: {}", fileid, e);
-                parts.abandon();
+                download.abandon();
                 return response::text_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "proxy temp file unavailable",
@@ -73,7 +72,7 @@ impl ProxyTransfer {
         let body = StreamingBody::new_proxy(
             content_length,
             file,
-            parts.into_body_source(),
+            download.into_body_source(),
             Some(file_stats),
         );
         let response = response::proxy_body_response(&content_type, content_length, body);

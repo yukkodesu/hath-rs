@@ -91,9 +91,9 @@ pub async fn run() -> Result<()> {
 
         Config::apply_server_response(&config, &login_resp);
 
-        crate::proxy_downloader::build_proxy_client(&config.load())
+        crate::proxy_downloader::ProxyDownloader::new(&config.load())
     };
-    let proxy_client = tokio::select! {
+    let proxy_downloader = tokio::select! {
         biased;
         _ = shutdown.cancelled() => return shutdown.result(),
         result = initialize => result?,
@@ -107,13 +107,13 @@ pub async fn run() -> Result<()> {
         shutdown.token(),
     )?);
 
-    run_with_cache(config, rpc_client, proxy_client, stats, cache, shutdown).await
+    run_with_cache(config, rpc_client, proxy_downloader, stats, cache, shutdown).await
 }
 
 async fn run_with_cache(
     config: Arc<ArcSwap<Config>>,
     rpc_client: Arc<RpcClient>,
-    proxy_client: Arc<reqwest::Client>,
+    proxy_downloader: crate::proxy_downloader::ProxyDownloader,
     stats: Arc<Stats>,
     cache: Arc<CacheHandler>,
     shutdown: Shutdown,
@@ -154,7 +154,7 @@ async fn run_with_cache(
         generation: Arc::new(Mutex::new(None)),
         shutdown: shutdown.clone(),
         transfers,
-        proxy_client,
+        proxy_downloader,
     };
 
     let mut background_tasks = None;
@@ -490,13 +490,14 @@ mod tests {
             assert!(!dirs.data_dir.join("pcache_info").exists());
             let rpc_client = Arc::new(RpcClient::new(config.clone()).unwrap());
 
-            let proxy_client = crate::proxy_downloader::build_proxy_client(&config.load()).unwrap();
+            let proxy_downloader =
+                crate::proxy_downloader::ProxyDownloader::new(&config.load()).unwrap();
             let result = tokio::time::timeout(
                 Duration::from_secs(5),
                 run_with_cache(
                     config.clone(),
                     rpc_client,
-                    proxy_client,
+                    proxy_downloader,
                     stats,
                     cache,
                     shutdown,

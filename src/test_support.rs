@@ -64,7 +64,10 @@ pub(crate) struct FakeResponse {
     headers: Vec<(String, String)>,
     body: Vec<u8>,
     close_after: Option<usize>,
+    delay_before_headers: Duration,
     delay_before_body: Duration,
+    body_gate: Option<Arc<tokio::sync::Semaphore>>,
+    close_gate: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 impl FakeResponse {
@@ -76,7 +79,10 @@ impl FakeResponse {
             headers: vec![("Content-Length".to_string(), body.len().to_string())],
             body,
             close_after: None,
+            delay_before_headers: Duration::ZERO,
             delay_before_body: Duration::ZERO,
+            body_gate: None,
+            close_gate: None,
         }
     }
 
@@ -88,8 +94,16 @@ impl FakeResponse {
             headers: vec![("Content-Length".to_string(), body.len().to_string())],
             body,
             close_after: None,
+            delay_before_headers: Duration::ZERO,
             delay_before_body: Duration::ZERO,
+            body_gate: None,
+            close_gate: None,
         }
+    }
+
+    pub(crate) fn with_header(mut self, name: &str, value: &str) -> Self {
+        self.headers.push((name.to_string(), value.to_string()));
+        self
     }
 
     pub(crate) fn close_after(mut self, bytes: usize) -> Self {
@@ -97,8 +111,23 @@ impl FakeResponse {
         self
     }
 
+    pub(crate) fn delay_before_headers(mut self, delay: Duration) -> Self {
+        self.delay_before_headers = delay;
+        self
+    }
+
     pub(crate) fn delay_before_body(mut self, delay: Duration) -> Self {
         self.delay_before_body = delay;
+        self
+    }
+
+    pub(crate) fn with_body_gate(mut self, gate: Arc<tokio::sync::Semaphore>) -> Self {
+        self.body_gate = Some(gate);
+        self
+    }
+
+    pub(crate) fn with_close_gate(mut self, gate: Arc<tokio::sync::Semaphore>) -> Self {
+        self.close_gate = Some(gate);
         self
     }
 }
@@ -183,6 +212,7 @@ async fn read_http_request(stream: &mut tokio::net::TcpStream) -> String {
 }
 
 async fn write_http_response(stream: &mut tokio::net::TcpStream, response: FakeResponse) {
+    tokio::time::sleep(response.delay_before_headers).await;
     let mut head = format!("HTTP/1.1 {} {}\r\n", response.status, response.reason);
     for (name, value) in response.headers {
         head.push_str(&name);
@@ -192,6 +222,9 @@ async fn write_http_response(stream: &mut tokio::net::TcpStream, response: FakeR
     }
     head.push_str("Connection: close\r\n\r\n");
     stream.write_all(head.as_bytes()).await.unwrap();
+    if let Some(gate) = response.body_gate {
+        gate.acquire().await.unwrap().forget();
+    }
     if !response.delay_before_body.is_zero() {
         tokio::time::sleep(response.delay_before_body).await;
     }
@@ -200,5 +233,8 @@ async fn write_http_response(stream: &mut tokio::net::TcpStream, response: FakeR
         .write_all(&response.body[..write_len.min(response.body.len())])
         .await
         .unwrap();
+    if let Some(gate) = response.close_gate {
+        gate.acquire().await.unwrap().forget();
+    }
     let _ = stream.shutdown().await;
 }
