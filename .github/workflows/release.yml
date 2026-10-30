@@ -70,27 +70,15 @@ jobs:
             dist/SHA256SUMS
 
   container:
-    name: Build Alpine container image (${{ matrix.variant }}, ${{ matrix.arch }})
+    name: Build Alpine container images (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - variant: rustls
-            dockerfile: deploy/Dockerfile
-            arch: amd64
+          - arch: amd64
             runner: ubuntu-26.04
-          - variant: rustls
-            dockerfile: deploy/Dockerfile
-            arch: arm64
-            runner: ubuntu-26.04-arm
-          - variant: openssl
-            dockerfile: deploy/Dockerfile.openssl
-            arch: amd64
-            runner: ubuntu-26.04
-          - variant: openssl
-            dockerfile: deploy/Dockerfile.openssl
-            arch: arm64
+          - arch: arm64
             runner: ubuntu-26.04-arm
     steps:
       - uses: actions/checkout@v7
@@ -100,44 +88,46 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build and push image by digest
-        id: build
+      - name: Build and push rustls image by digest
+        id: rustls
         uses: docker/build-push-action@v7
         with:
           context: .
-          file: ${{ matrix.dockerfile }}
+          file: deploy/Dockerfile
           platforms: linux/${{ matrix.arch }}
           outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
-      - name: Export digest
+      - name: Build and push OpenSSL image by digest
+        id: openssl
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: deploy/Dockerfile.openssl
+          platforms: linux/${{ matrix.arch }}
+          outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+      - name: Export digests
         env:
-          DIGEST: ${{ steps.build.outputs.digest }}
+          RUSTLS_DIGEST: ${{ steps.rustls.outputs.digest }}
+          OPENSSL_DIGEST: ${{ steps.openssl.outputs.digest }}
         run: |
-          mkdir -p "$RUNNER_TEMP/digests"
-          touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+          mkdir -p "$RUNNER_TEMP/digests/rustls" "$RUNNER_TEMP/digests/openssl"
+          touch "$RUNNER_TEMP/digests/rustls/${RUSTLS_DIGEST#sha256:}"
+          touch "$RUNNER_TEMP/digests/openssl/${OPENSSL_DIGEST#sha256:}"
       - uses: actions/upload-artifact@v7
         with:
-          name: image-digest-${{ matrix.variant }}-${{ matrix.arch }}
-          path: ${{ runner.temp }}/digests/*
+          name: image-digests-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/
           if-no-files-found: error
           retention-days: 1
 
   container-manifest:
-    name: Publish multi-architecture container image (${{ matrix.variant }})
+    name: Publish multi-architecture container images
     needs: container
     runs-on: ubuntu-26.04
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - variant: rustls
-            tag_suffix: ""
-          - variant: openssl
-            tag_suffix: "-openssl"
     steps:
       - uses: actions/download-artifact@v8
         with:
           path: ${{ runner.temp }}/digests
-          pattern: image-digest-${{ matrix.variant }}-*
+          pattern: image-digests-*
           merge-multiple: true
       - uses: docker/setup-buildx-action@v4
       - uses: docker/login-action@v4
@@ -145,17 +135,21 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Create and push manifest
+      - name: Create and push manifests
         working-directory: ${{ runner.temp }}/digests
         env:
           RELEASE_TAG: ${{ github.ref_name }}
-          TAG_SUFFIX: ${{ matrix.tag_suffix }}
         run: |
-          images=()
-          for digest in *; do
-            images+=("$IMAGE_NAME@sha256:$digest")
-          done
-          docker buildx imagetools create \
-            --tag "$IMAGE_NAME:$RELEASE_TAG$TAG_SUFFIX" \
-            --tag "$IMAGE_NAME:latest$TAG_SUFFIX" \
-            "${images[@]}"
+          publish() {
+            local variant=$1 suffix=$2 digest
+            local images=()
+            for digest in "$variant"/*; do
+              images+=("$IMAGE_NAME@sha256:${digest##*/}")
+            done
+            docker buildx imagetools create \
+              --tag "$IMAGE_NAME:$RELEASE_TAG$suffix" \
+              --tag "$IMAGE_NAME:latest$suffix" \
+              "${images[@]}"
+          }
+          publish rustls ""
+          publish openssl "-openssl"
