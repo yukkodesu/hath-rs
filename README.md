@@ -55,14 +55,16 @@ docker compose up -d
 
 The copied compose file stores persistent state in `./volumes/` and publishes the port selected by `HATH_PORT`. Configure the same external port and hostname in the Hentai@Home client settings.
 
-To use a specific version instead of `latest`, set `HATH_IMAGE` before starting Compose:
+To pin the [latest release](https://github.com/yukkodesu/hath-rs/releases/latest) instead of tracking the moving `latest` image tag, resolve its version and set `HATH_IMAGE` before starting Compose:
 
 ```sh
-export HATH_IMAGE=ghcr.io/yukkodesu/hath-rs:v0.1.0
+VERSION=$(curl -fsSL -o /dev/null -w '%{url_effective}' https://github.com/yukkodesu/hath-rs/releases/latest)
+VERSION=${VERSION##*/}
+export HATH_IMAGE="ghcr.io/yukkodesu/hath-rs:${VERSION}"
 docker compose up -d
 ```
 
-An OpenSSL build is also published with an `-openssl` tag suffix, such as `latest-openssl` or `v0.1.0-openssl`. It uses Alpine's OpenSSL for all TLS instead of rustls and AWS-LC:
+To pin an older release, set `VERSION` to its tag instead. An OpenSSL build is also published with an `-openssl` tag suffix: use `latest-openssl` or append `-openssl` to a release tag. It uses Alpine's OpenSSL for all TLS instead of rustls and AWS-LC:
 
 ```sh
 export HATH_IMAGE=ghcr.io/yukkodesu/hath-rs:latest-openssl
@@ -86,16 +88,17 @@ docker compose up -d --build
 
 ## Run a release tarball
 
-Set `VERSION` and `TARGET` for your platform, then download, verify, and extract the matching release archive:
+Resolve the [latest release](https://github.com/yukkodesu/hath-rs/releases/latest) and set `TARGET` for your platform, then download, verify, and extract the matching release archive. To install an older release, set `VERSION` to its tag instead (including the `v` prefix).
 
 ```sh
-VERSION=0.1.0
+VERSION=$(curl -fsSL -o /dev/null -w '%{url_effective}' https://github.com/yukkodesu/hath-rs/releases/latest)
+VERSION=${VERSION##*/}
 TARGET=x86_64-unknown-linux-musl
-curl -fLO "https://github.com/yukkodesu/hath-rs/releases/download/v${VERSION}/hath-rs-v${VERSION}-${TARGET}.tar.gz"
-curl -fLO "https://github.com/yukkodesu/hath-rs/releases/download/v${VERSION}/SHA256SUMS"
-grep "hath-rs-v${VERSION}-${TARGET}.tar.gz$" SHA256SUMS | sha256sum -c -
-tar -xzf "hath-rs-v${VERSION}-${TARGET}.tar.gz"
-cd "hath-rs-v${VERSION}-${TARGET}"
+curl -fLO "https://github.com/yukkodesu/hath-rs/releases/download/${VERSION}/hath-rs-${VERSION}-${TARGET}.tar.gz"
+curl -fLO "https://github.com/yukkodesu/hath-rs/releases/download/${VERSION}/SHA256SUMS"
+grep "hath-rs-${VERSION}-${TARGET}.tar.gz$" SHA256SUMS | sha256sum -c -
+tar -xzf "hath-rs-${VERSION}-${TARGET}.tar.gz"
+cd "hath-rs-${VERSION}-${TARGET}"
 export HATH_CLIENT_ID='your-client-id'
 export HATH_CLIENT_KEY='your-client-key'
 export HATH_PORT='11451'
