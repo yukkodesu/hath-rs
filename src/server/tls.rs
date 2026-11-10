@@ -238,9 +238,9 @@ pub fn spawn_cert_refresh_watcher(
                 match rpc_client.still_alive(true).await {
                     Ok(response) if response.status == rpc::ResponseStatus::Ok => {}
                     Ok(response) => {
-                        let code = response.fail_code.unwrap_or_default();
-                        if code.starts_with("TERM_BAD_NETWORK") {
-                            return Err(HathError::Fatal(code));
+                        let code = response.fail_code();
+                        if response.fail_kind() == Some(rpc::FailKind::BadNetwork) {
+                            return Err(HathError::Fatal(code.to_string()));
                         }
                         tracing::warn!(code, "Resume notification rejected; will retry later");
                     }

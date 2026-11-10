@@ -6,7 +6,7 @@ use crate::downloader::{
 use crate::error::{HathError, Result};
 use crate::rpc_client::{GalleryAck, GalleryFileRequest, GalleryQueueReply, RpcClient};
 use crate::stats::Stats;
-use crate::types::Sha1Hash;
+use crate::types::{ClientKey, Sha1Hash};
 use arc_swap::ArcSwap;
 use reqwest::Client;
 use sha1::Digest;
@@ -184,13 +184,15 @@ impl GalleryQueueRunner {
                 GalleryQueueReply::InvalidRequest => {
                     return Err(HathError::Rpc("gallery queue rejected request".into()));
                 }
-                GalleryQueueReply::Metadata(raw) => match parse_gallery_metadata(&raw) {
-                    Ok(metadata) => metadata,
-                    Err(e) => {
-                        tracing::warn!("Refusing malformed gallery metadata: {}", e);
-                        return Ok(report);
+                GalleryQueueReply::Metadata(raw) => {
+                    match parse_gallery_metadata(&raw, &self.config.load().client_key) {
+                        Ok(metadata) => metadata,
+                        Err(e) => {
+                            tracing::warn!("Refusing malformed gallery metadata: {}", e);
+                            return Ok(report);
+                        }
                     }
-                },
+                }
             };
 
             tracing::info!(gid = metadata.gid, title = %metadata.title, "Starting gallery download");
@@ -405,7 +407,10 @@ impl GalleryQueueRunner {
     }
 }
 
-fn parse_gallery_metadata(raw: &str) -> Result<GalleryMetadata> {
+/// Parse a gallery metadata document. Since 1.6.6 its `DLHASH` header signs
+/// the file list (see [`crate::rpc::sign_lines`], prefixed by the client key),
+/// so an altered list is rejected before anything is downloaded.
+fn parse_gallery_metadata(raw: &str, key: &ClientKey) -> Result<GalleryMetadata> {
     enum State {
         Header,
         FileList,
@@ -420,6 +425,8 @@ fn parse_gallery_metadata(raw: &str) -> Result<GalleryMetadata> {
     let mut files: Vec<Option<GalleryFile>> = Vec::new();
     let mut filenames = HashSet::new();
     let mut information = String::new();
+    let mut dlhash = None;
+    let mut file_lines = Vec::new();
 
     for line in raw.lines() {
         match state {
@@ -449,6 +456,12 @@ fn parse_gallery_metadata(raw: &str) -> Result<GalleryMetadata> {
                     "MINXRES" if minxres.is_none() && valid_xres(value) => {
                         minxres = Some(value.to_string())
                     }
+                    "DLHASH" if dlhash.is_none() => {
+                        dlhash = Some(
+                            Sha1Hash::new(value)
+                                .ok_or_else(|| HathError::Parse("invalid dlhash".into()))?,
+                        )
+                    }
                     "TITLE" if title.is_none() => title = Some(sanitize_title(value)),
                     _ => {
                         return Err(HathError::Parse(format!(
@@ -466,6 +479,7 @@ fn parse_gallery_metadata(raw: &str) -> Result<GalleryMetadata> {
                     state = State::Information;
                     continue;
                 }
+                file_lines.push(line);
                 let entry = parse_file_line(line)?;
                 let count = filecount.expect("FILELIST requires FILECOUNT");
                 if entry.page == 0 || entry.page as usize > count {
@@ -489,6 +503,12 @@ fn parse_gallery_metadata(raw: &str) -> Result<GalleryMetadata> {
         }
     }
 
+    let signature = crate::rpc::sign_lines(key.as_str(), file_lines);
+    if dlhash.as_ref().map(Sha1Hash::as_str) != Some(signature.as_str()) {
+        return Err(HathError::Parse(format!(
+            "gallery file list signature {signature} does not match dlhash {dlhash:?}"
+        )));
+    }
     let gid = gid.ok_or_else(|| HathError::Parse("gallery has no gid".into()))?;
     let minxres = minxres.ok_or_else(|| HathError::Parse("gallery has no minxres".into()))?;
     let title = title.ok_or_else(|| HathError::Parse("gallery has no title".into()))?;
@@ -567,31 +587,26 @@ fn sanitize_title(value: &str) -> String {
         .join(" ")
 }
 
+/// Gallery filenames must fit the H@H 1.6.6 allowlist (`[a-zA-Z0-9._-]{1,250}`,
+/// no `..`). On top of that, reject what Windows cannot store: a trailing dot
+/// and reserved device names.
 fn safe_file_component(value: &str) -> bool {
-    if value.is_empty()
-        || value == "."
-        || value == ".."
-        || value.ends_with(['.', ' '])
-        || value
-            .chars()
-            .any(|ch| matches!(ch, '/' | '\\' | ':' | '\0'))
-    {
-        return false;
-    }
+    let allowed = (1..=250).contains(&value.len())
+        && !value.contains("..")
+        && !value.ends_with('.')
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
     let base = value.split('.').next().unwrap_or("").to_ascii_uppercase();
-    !matches!(base.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        && !matches!(
-            base.as_str(),
-            "COM1" | "COM2" | "COM3" | "COM4" | "COM5" | "COM6" | "COM7" | "COM8" | "COM9"
-        )
-        && !matches!(
-            base.as_str(),
-            "LPT1" | "LPT2" | "LPT3" | "LPT4" | "LPT5" | "LPT6" | "LPT7" | "LPT8" | "LPT9"
-        )
+    let reserved = matches!(base.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (base.len() == 4
+            && (base.starts_with("COM") || base.starts_with("LPT"))
+            && matches!(base.as_bytes()[3], b'1'..=b'9'));
+    allowed && !reserved
 }
 
 fn safe_filetype(value: &str) -> bool {
-    !value.is_empty() && value.len() <= 16 && value.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    matches!(value, "jpg" | "gif" | "png" | "webp")
 }
 
 fn create_gallery_dir(config: &Config, metadata: &GalleryMetadata) -> Result<PathBuf> {
@@ -699,15 +714,36 @@ fn source_failure_key(source: &reqwest::Url, file: &GalleryFile) -> Option<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{FakeHttpServer, FakeResponse, FixtureDirs};
+    use crate::test_support::{
+        FakeHttpServer, FakeResponse, FixtureDirs, TEST_CLIENT_KEY, signed_rpc_body,
+        test_client_key,
+    };
     use arc_swap::ArcSwap;
     use std::net::{IpAddr, Ipv4Addr};
 
+    /// Build gallery metadata whose DLHASH signs `files`.
+    fn meta(header: &str, files: &[&str], info: &str) -> String {
+        format!(
+            "{header}DLHASH {}\nFILELIST\n{}\nINFORMATION\n{info}",
+            crate::rpc::sign_lines(TEST_CLIENT_KEY, files.iter().copied()),
+            files.join("\n")
+        )
+    }
+
+    fn parse(raw: &str) -> Result<GalleryMetadata> {
+        parse_gallery_metadata(raw, &test_client_key())
+    }
+
     #[test]
     fn parses_complete_metadata_and_preserves_information() {
-        let metadata = parse_gallery_metadata(
-            "GID 42\nFILECOUNT 2\nMINXRES org\nTITLE hello/world\nFILELIST\n1 10 org unknown jpg first page\n2 11 1280 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa png second\nINFORMATION\nline one\nline two\n",
-        )
+        let metadata = parse(&meta(
+            "GID 42\nFILECOUNT 2\nMINXRES org\nTITLE hello/world\n",
+            &[
+                "1 10 org unknown jpg first_page",
+                "2 11 1280 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa png second",
+            ],
+            "line one\nline two\n",
+        ))
         .unwrap();
         assert_eq!(metadata.gid, 42);
         assert_eq!(metadata.title, "helloworld");
@@ -717,14 +753,40 @@ mod tests {
 
     #[test]
     fn rejects_unsafe_or_incomplete_metadata() {
-        assert!(parse_gallery_metadata(
-            "GID 1\nFILECOUNT 1\nMINXRES org\nTITLE x\nFILELIST\n1 1 org unknown jpg ../escape\nINFORMATION\n"
-        )
-        .is_err());
-        assert!(parse_gallery_metadata(
-            "GID 1\nFILECOUNT 2\nMINXRES org\nTITLE x\nFILELIST\n1 1 org unknown jpg one\nINFORMATION\n"
-        )
-        .is_err());
+        let header = "GID 1\nFILECOUNT 1\nMINXRES org\nTITLE x\n";
+        for file in [
+            "1 1 org unknown jpg ../escape",
+            "1 1 org unknown jpg a..b",
+            "1 1 org unknown jpg has space",
+            "1 1 org unknown exe one",
+            "1 1 org unknown JPG one",
+            "1 1 org unknown jpg trailing.",
+            "1 1 org unknown jpg CON",
+            "1 1 org unknown jpg lpt1.x",
+        ] {
+            assert!(parse(&meta(header, &[file], "")).is_err(), "{file}");
+        }
+        assert!(
+            parse(&meta(
+                "GID 1\nFILECOUNT 2\nMINXRES org\nTITLE x\n",
+                &["1 1 org unknown jpg one"],
+                ""
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_tampered_or_unsigned_file_list() {
+        let header = "GID 1\nFILECOUNT 1\nMINXRES org\nTITLE x\n";
+        let good = meta(header, &["1 1 org unknown jpg one"], "");
+        assert!(parse(&good).is_ok());
+        let tampered = good.replace("jpg one", "jpg two");
+        assert!(parse(&tampered).is_err());
+        let other_key = ClientKey::new("00000000000000000000").unwrap();
+        assert!(parse_gallery_metadata(&good, &other_key).is_err());
+        let unsigned = "GID 1\nFILECOUNT 1\nMINXRES org\nTITLE x\nFILELIST\n1 1 org unknown jpg one\nINFORMATION\n";
+        assert!(parse(unsigned).is_err());
     }
 
     #[tokio::test]
@@ -734,11 +796,15 @@ mod tests {
         let fixture = FixtureDirs::new();
         let mut config = fixture.config();
         let rpc_server = FakeHttpServer::start(vec![
-            FakeResponse::ok(format!(
-                "GID 42\nFILECOUNT 1\nMINXRES org\nTITLE Gallery\nFILELIST\n1 7 org {} jpg page\nINFORMATION\nmetadata\n",
-                crate::utils::sha1_bytes(&body),
+            FakeResponse::ok(meta(
+                "GID 42\nFILECOUNT 1\nMINXRES org\nTITLE Gallery\n",
+                &[&format!(
+                    "1 7 org {} jpg page",
+                    crate::utils::sha1_bytes(&body)
+                )],
+                "metadata\n",
             )),
-            FakeResponse::ok(format!("OK\n{}", source_server.url("/image"))),
+            FakeResponse::ok(signed_rpc_body(&[source_server.url("/image").as_str()])),
             FakeResponse::ok("NO_PENDING_DOWNLOADS"),
         ])
         .await;

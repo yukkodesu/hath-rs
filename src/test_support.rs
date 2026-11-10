@@ -1,4 +1,5 @@
 use crate::config::{CliArgs, Config};
+use crate::types::ClientKey;
 use clap::Parser;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -8,6 +9,21 @@ use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
+
+pub(crate) const TEST_CLIENT_KEY: &str = "abcde12345abcde12345";
+
+pub(crate) fn test_client_key() -> ClientKey {
+    ClientKey::new(TEST_CLIENT_KEY).unwrap()
+}
+
+/// A successful RPC response body signed with [`TEST_CLIENT_KEY`].
+pub(crate) fn signed_rpc_body(lines: &[&str]) -> String {
+    let signature = crate::rpc::sign_lines(&format!("1-{TEST_CLIENT_KEY}"), lines.iter().copied());
+    std::iter::once(format!("OK-1-{signature}").as_str())
+        .chain(lines.iter().copied())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
 pub(crate) struct FixtureDirs {
     _dir: TempDir,
@@ -38,7 +54,7 @@ impl FixtureDirs {
             "--client-id",
             "12345",
             "--client-key",
-            "abcde12345abcde12345",
+            TEST_CLIENT_KEY,
             "--cache-dir",
             self.cache_dir.to_str().unwrap(),
             "--temp-dir",

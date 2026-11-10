@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::error::{HathError, Result};
-use crate::rpc::{self, Action, ResponseStatus, ServerResponse};
+use crate::rpc::{self, Action, FailKind, ResponseStatus, ServerResponse};
 use crate::stats::Stats;
 use arc_swap::ArcSwap;
 use rand::Rng;
@@ -209,11 +209,11 @@ impl RpcClient {
                 }
             };
 
-            let parsed = rpc::parse_server_response(&body, &host);
+            let parsed = rpc::parse_server_response(&body, &host, &cfg.client_key);
 
             // Java: KEY_EXPIRED retry only for string-act calls with non-null retryact.
             // URL/add-based calls (still_alive, get_blacklist, srfetch) do not retry.
-            if parsed.fail_code.as_deref() == Some("KEY_EXPIRED")
+            if parsed.fail_kind() == Some(FailKind::KeyExpired)
                 && key_expired_retries < KEY_EXPIRED_RETRY_LIMIT
                 && act.supports_key_expired_retry()
             {
@@ -304,7 +304,7 @@ impl RpcClient {
                 return Err(HathError::Rpc(format!("stat request failed: {}", e)));
             }
         };
-        Ok(rpc::parse_server_response(&body, &host))
+        Ok(rpc::parse_server_response(&body, &host, &cfg.client_key))
     }
 
     /// Server stat: get server time and minimum build.
@@ -421,7 +421,13 @@ impl RpcClient {
             .iter()
             .find(|line| !line.is_empty())
             .ok_or_else(|| HathError::Rpc("dlfetch returned no URL".into()))?;
-        Url::parse(source).map_err(|e| HathError::Rpc(format!("invalid dlfetch URL: {}", e)))
+        let url = Url::parse(source)
+            .map_err(|e| HathError::Rpc(format!("invalid dlfetch URL: {}", e)))?;
+        // Java 1.6.6: only http/https sources are allowed.
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(HathError::Rpc("invalid protocol for dlfetch URL".into()));
+        }
+        Ok(url)
     }
 
     /// Best-effort report of failed gallery source hosts. The caller enforces
@@ -463,9 +469,9 @@ pub(crate) fn spawn_still_alive_heartbeat(
                         stats.record_server_contact();
                     }
                     Ok(resp) => {
-                        let code = resp.fail_code.unwrap_or_default();
+                        let code = resp.fail_code().to_string();
                         // Java: TERM_BAD_NETWORK → dieWithError (terminate client)
-                        if code.starts_with("TERM_BAD_NETWORK") {
+                        if resp.fail_kind() == Some(FailKind::BadNetwork) {
                             tracing::error!(
                                 "Client is shutting down since the network is misconfigured; \
                              correct firewall/forwarding settings then restart the client."
@@ -504,7 +510,7 @@ pub fn spawn_rpc_failure_clearer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{FakeHttpServer, FakeResponse, FixtureDirs};
+    use crate::test_support::{FakeHttpServer, FakeResponse, FixtureDirs, signed_rpc_body};
     use arc_swap::ArcSwap;
     use std::net::{IpAddr, Ipv4Addr};
 
@@ -570,6 +576,23 @@ mod tests {
         assert_eq!(router.select_host(&config), "192.0.2.2");
     }
 
+    #[tokio::test]
+    async fn gallery_file_url_rejects_non_http_scheme() {
+        let server = FakeHttpServer::start(vec![FakeResponse::ok(signed_rpc_body(&[
+            "file:///etc/passwd",
+        ]))])
+        .await;
+        let client = rpc_client_for_fake_server(&server);
+        let request = GalleryFileRequest {
+            gid: 1,
+            page: 2,
+            fileindex: 3,
+            xres: "org".to_string(),
+            attempt: 1,
+        };
+        assert!(client.fetch_gallery_file_url(&request).await.is_err());
+    }
+
     fn rpc_client_for_fake_server(server: &FakeHttpServer) -> RpcClient {
         let fixture = FixtureDirs::new();
         let mut config = fixture.config();
@@ -584,8 +607,8 @@ mod tests {
         let now = chrono::Utc::now().timestamp();
         let server = FakeHttpServer::start(vec![
             FakeResponse::ok("KEY_EXPIRED"),
-            FakeResponse::ok(format!("OK\nserver_time={}", now)),
-            FakeResponse::ok("OK\n"),
+            FakeResponse::ok(signed_rpc_body(&[&format!("server_time={}", now)])),
+            FakeResponse::ok(signed_rpc_body(&[])),
         ])
         .await;
         let client = rpc_client_for_fake_server(&server);
@@ -604,7 +627,7 @@ mod tests {
     async fn rpc_http_500_retries_against_fake_rpc_server() {
         let server = FakeHttpServer::start(vec![
             FakeResponse::status(500, "Internal Server Error", "try again"),
-            FakeResponse::ok("OK\n"),
+            FakeResponse::ok(signed_rpc_body(&[])),
         ])
         .await;
         let client = rpc_client_for_fake_server(&server);
@@ -633,15 +656,17 @@ mod tests {
         assert_eq!(reply, GalleryQueueReply::NoPendingDownloads);
         let requests = server.requests();
         assert_eq!(requests.len(), 1);
-        assert!(requests[0].starts_with("GET /15/dl?"));
+        assert!(requests[0].starts_with("GET /16/dl?"));
         assert!(requests[0].contains("act=fetchqueue"));
         assert!(requests[0].contains("add=42;org"));
     }
 
     #[tokio::test]
     async fn gallery_file_url_requires_a_valid_rpc_url() {
-        let server =
-            FakeHttpServer::start(vec![FakeResponse::ok("OK\nhttp://example.test/file")]).await;
+        let server = FakeHttpServer::start(vec![FakeResponse::ok(signed_rpc_body(&[
+            "http://example.test/file",
+        ]))])
+        .await;
         let client = rpc_client_for_fake_server(&server);
         let url = client
             .fetch_gallery_file_url(&GalleryFileRequest {
