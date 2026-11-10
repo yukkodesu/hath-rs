@@ -735,6 +735,25 @@ mod tests {
     }
 
     #[test]
+    fn parses_java_1_6_6_multifile_list_vector() {
+        // Generated with Java v1.6.6 Tools.getSHA1String using GalleryDownloader's
+        // client-key prefix and LF-prefixed FILELIST entries, without section markers.
+        let raw = concat!(
+            "GID 42\nFILECOUNT 2\nMINXRES org\nTITLE Gallery\n",
+            "DLHASH bcdd1c65b14b043bf93afceeb47cba6468b343cf\nFILELIST\n",
+            "1 10 org unknown jpg first_page\n",
+            "2 11 1280 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa png second\n",
+            "INFORMATION\nmetadata\n",
+        );
+        let metadata = parse(raw).unwrap();
+        assert_eq!(metadata.files.len(), 2);
+        assert_eq!(metadata.files[0].filename, "first_page");
+        assert_eq!(metadata.files[1].filename, "second");
+        assert_eq!(metadata.information, "metadata\n");
+        assert!(parse(&raw.replace("png second", "png changed")).is_err());
+    }
+
+    #[test]
     fn parses_complete_metadata_and_preserves_information() {
         let metadata = parse(&meta(
             "GID 42\nFILECOUNT 2\nMINXRES org\nTITLE hello/world\n",

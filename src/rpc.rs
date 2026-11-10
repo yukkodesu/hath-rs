@@ -342,6 +342,29 @@ mod tests {
     }
 
     #[test]
+    fn parses_java_1_6_6_empty_response_vector() {
+        // Java v1.6.6 Tools.getSHA1String("1730000000-abcde12345abcde12345").
+        let response = parse("OK-1730000000-01a0fdfedcdc840cfe5982fe2cc7ff3e6e96f8ea\n\n");
+        assert_eq!(response.status, ResponseStatus::Ok);
+        assert!(response.lines.is_empty());
+    }
+
+    #[test]
+    fn parses_java_1_6_6_multiline_response_vector() {
+        // Generated with Java v1.6.6 Tools.getSHA1String using ServerResponse's
+        // responseTime-key prefix and LF-prefixed payload lines, including the empty line.
+        let response = parse(concat!(
+            "OK-1730000000-51a5b85e538006d263a6c2d0668eb038d286da97\n",
+            "server_time=1730000000\n\nmin_client_build=181\n\n",
+        ));
+        assert_eq!(response.status, ResponseStatus::Ok);
+        assert_eq!(
+            response.lines,
+            ["server_time=1730000000", "", "min_client_build=181"]
+        );
+    }
+
+    #[test]
     fn test_parse_rejects_bad_or_missing_signature() {
         let body = signed_rpc_body(&["key=val"]);
         for bad in [
