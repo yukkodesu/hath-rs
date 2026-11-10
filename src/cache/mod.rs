@@ -123,12 +123,13 @@ impl CacheHandler {
             state
         };
 
-        stats.set_cache_count(startup_state.cache_count);
-        stats.set_cache_size(Self::cache_size_with_overhead(
+        let cache_size = Self::cache_size_with_overhead(
             startup_state.cache_size,
             startup_state.cache_count,
             &cfg,
-        ));
+        );
+        stats.set_cache_count(startup_state.cache_count);
+        stats.set_cache_size(cache_size);
 
         // Java: startup safety checks (CacheHandler constructor lines 111-127)
         // Java: Settings.getStaticRangeCount() — server-assigned ranges, not cached ranges
@@ -136,23 +137,21 @@ impl CacheHandler {
         let static_range_count = cfg.static_range_count;
         if !cfg.skip_free_space_check
             && let Ok(free) = fs2::free_space(&cfg.cache_dir)
+            && free < cfg.disklimit_bytes.saturating_sub(cache_size)
         {
-            let needed = cfg
-                .disklimit_bytes
-                .saturating_sub(Self::cache_size_with_overhead(
-                    startup_state.cache_size,
-                    startup_state.cache_count,
-                    &cfg,
-                ));
-            if free < needed {
-                tracing::error!(
-                    "The storage device does not have enough space available to \
-                     hold the set cache size. Free up space for H@H, or reduce \
-                     the cache size from the H@H settings page."
-                );
-                shutdown.cancel();
-                return Err(HathError::Fatal("insufficient disk space for cache".into()));
-            }
+            const GIB: u64 = 1 << 30;
+            tracing::error!(
+                "The storage device does not have enough space available for the set \
+                 maximum cache size. The maximum cache size is set to {} GiB, and the \
+                 total disk space currently available for the cache is {} GiB. Free up \
+                 space for H@H, or reduce the cache size from the H@H settings page: \
+                 https://e-hentai.org/hentaiathome.php?cid={}",
+                cfg.disklimit_bytes / GIB,
+                (free + cache_size) / GIB,
+                cfg.client_id.0
+            );
+            shutdown.cancel();
+            return Err(HathError::Fatal("insufficient disk space for cache".into()));
         }
         if startup_state.cache_count < 1 && static_range_count > 20 {
             tracing::error!(

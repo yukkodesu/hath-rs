@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 #[derive(Parser, Debug)]
-#[command(name = "hath-rs", version = "1.6.5")]
+#[command(name = "hath-rs", version = "1.6.6")]
 pub struct CliArgs {
     #[arg(long, env = "HATH_CLIENT_ID")]
     pub client_id: Option<u32>,
@@ -163,7 +163,7 @@ impl Config {
             max_filename_length: 125,
             rpc_servers: Vec::new(),
             rpc_port: 80,
-            rpc_path: "15/rpc?".to_string(),
+            rpc_path: crate::rpc::DEFAULT_RPC_PATH.to_string(),
             static_ranges: HashMap::new(),
             static_range_count: 0,
             verify_cache: args.verify_cache.unwrap_or(false),
@@ -221,7 +221,7 @@ impl Config {
             }
             "cur_client_build" => {
                 if let Ok(build) = value.parse::<i32>()
-                    && build > 178
+                    && build > crate::rpc::CLIENT_BUILD
                 {
                     self.warn_new_client = true;
                 }

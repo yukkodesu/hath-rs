@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 const DEFAULT_CONTENT_TYPE: &str = "text/html; charset=iso-8859-1";
 const CACHE_CONTROL_VALUE: &str = "public, max-age=31536000";
-const SERVER_VALUE: &str = "Genetic Lifeform and Distributed Open Server 1.6.5";
+const SERVER_VALUE: &str = "Genetic Lifeform and Distributed Open Server 1.6.6";
 
 /// A response before common HTTP policy has been applied.
 pub(crate) struct ResponseSpec {

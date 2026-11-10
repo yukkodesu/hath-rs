@@ -156,12 +156,13 @@ fn rotate_log(path: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
     use crate::rpc::parse_server_response;
-    use crate::test_support::FixtureDirs;
+    use crate::test_support::{FixtureDirs, signed_rpc_body, test_client_key};
 
     fn set_disabled(config: &ArcSwap<Config>, disabled: bool) {
         let response = parse_server_response(
-            &format!("OK\ndisable_logging={disabled}\n"),
+            &signed_rpc_body(&[&format!("disable_logging={disabled}")]),
             "example.invalid",
+            &test_client_key(),
         );
         Config::apply_server_response(config, &response);
     }

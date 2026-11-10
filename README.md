@@ -2,7 +2,7 @@
 
 A stubborn, unofficial Rust implementation of the [Hentai@Home](https://ehwiki.org/wiki/Hentai@Home) client, with best-effort 1:1 feature parity with the official Java client.
 
-Currently updated to match Hentai@Home Java 1.6.5 build 178.
+Currently updated to match Hentai@Home Java 1.6.6 build 181.
 
 `hath-rs` is neither an official Hentai@Home project nor affiliated with E-Hentai.
 
@@ -23,7 +23,7 @@ Official-client functionality implemented by hath-rs:
 - Speed tests
 - Cache pruning and disk-space checks
 - Bandwidth limiting, flood control, and logging
-- Full feature parity with Java 1.6.5 build 178
+- Full feature parity with Java 1.6.6 build 181
 
 ## Planned
 

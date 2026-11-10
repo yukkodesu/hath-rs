@@ -2,7 +2,7 @@ use crate::cache::{self, CacheHandler};
 use crate::config::{CliArgs, Config};
 use crate::error::{HathError, Result};
 use crate::gallery_downloader::GalleryDownloadSupervisor;
-use crate::rpc::{self, ResponseStatus};
+use crate::rpc::{self, FailKind, ResponseStatus, ServerResponse};
 use crate::rpc_client::{self, RpcClient};
 use crate::server::{self, AppState};
 use crate::shutdown::{Shutdown, ShutdownReason};
@@ -74,21 +74,12 @@ pub async fn run() -> Result<()> {
 
     let initialize = async {
         let stat_resp = rpc_client.server_stat().await?;
-        if stat_resp.status != ResponseStatus::Ok {
-            return Err(HathError::Rpc(
-                "Failed to get initial stat from server".into(),
-            ));
-        }
-
+        ensure_authenticated(&stat_resp, "stat")?;
         Config::apply_server_response(&config, &stat_resp);
 
         // 6. Client login: get full settings (uses corrected server time from step 5)
         let login_resp = rpc_client.client_login().await?;
-        if login_resp.status != ResponseStatus::Ok {
-            let code = login_resp.fail_code.unwrap_or_default();
-            return Err(HathError::Rpc(format!("Login failed: {}", code)));
-        }
-
+        ensure_authenticated(&login_resp, "login")?;
         Config::apply_server_response(&config, &login_resp);
 
         crate::proxy_downloader::ProxyDownloader::new(&config.load())
@@ -108,6 +99,34 @@ pub async fn run() -> Result<()> {
     )?);
 
     run_with_cache(config, rpc_client, proxy_downloader, stats, cache, shutdown).await
+}
+
+/// server_stat and client_login are both signed since 1.6.6, so a rejection
+/// means bad credentials unless the server says why. Java re-prompts for the
+/// ID and key here; this client has no prompt, so it stops instead.
+fn ensure_authenticated(response: &ServerResponse, stage: &str) -> Result<()> {
+    let Some(kind) = response.fail_kind() else {
+        return Ok(());
+    };
+    let code = response.fail_code();
+    Err(match kind {
+        FailKind::Unavailable => HathError::Rpc(format!(
+            "Failed to get a {stage} response from server ({code})"
+        )),
+        FailKind::StartupLoop => HathError::Fatal(
+            "The server detected that the client is stuck in a startup loop, and has blocked \
+             it for 15 minutes. Fix whatever is preventing the client from starting, and try \
+             again in a bit."
+                .into(),
+        ),
+        FailKind::UnsupportedLocation => HathError::Fatal(format!(
+            "The server detected that the client is located in a country that H@H does not \
+             support ({code})"
+        )),
+        _ => HathError::Rpc(format!(
+            "Authentication failed; check your Client ID and Key (Code: {code})"
+        )),
+    })
 }
 
 async fn run_with_cache(
@@ -166,41 +185,43 @@ async fn run_with_cache(
         // Java: if notifyStart() returns false, the main thread skips
         // allowNormalConnections and all periodic tasks, then waits for Ctrl+C.
         let start_resp = rpc_client.client_start().await?;
-        let startup_ok = if start_resp.status == ResponseStatus::Ok {
-            true
-        } else {
-            let code = start_resp.fail_code.unwrap_or_default();
-            tracing::error!("Startup failure: {}", code);
-            if code.starts_with("FAIL_OTHER_CLIENT_CONNECTED")
-                || code.starts_with("FAIL_CID_IN_USE")
-            {
-                tracing::error!(
-                    "Another client with the same ID ({}) is already connected to the server. \
-                     This can happen if the Java client is still running. \
-                     If you are switching from the Java client, make sure to stop it first, \
-                     then wait 5-10 minutes before starting this client.",
-                    config.load().client_id.0
-                );
-                return Err(HathError::Fatal(code));
+        let startup_ok = match start_resp.fail_kind() {
+            None => true,
+            Some(kind) => {
+                let code = start_resp.fail_code();
+                tracing::error!("Startup failure: {}", code);
+                match kind {
+                    FailKind::OtherClientConnected => {
+                        tracing::error!(
+                            "Another client with the same ID ({}) is already connected to the \
+                             server. This can happen if the Java client is still running. \
+                             If you are switching from the Java client, make sure to stop it \
+                             first, then wait 5-10 minutes before starting this client.",
+                            config.load().client_id.0
+                        );
+                        return Err(HathError::Fatal(code.to_string()));
+                    }
+                    FailKind::ConnectTest => {
+                        tracing::error!(
+                            "FAIL_CONNECT_TEST: The server was unable to verify your connection. \
+                             This usually means your port forwarding or firewall settings are \
+                             incorrect. Please ensure port {} is accessible from the internet.",
+                            config.load().client_port
+                        );
+                        tracing::error!(
+                            "The client will remain running so you can diagnose firewall and \
+                             port forwarding issues. Press Ctrl+C to exit."
+                        );
+                        false
+                    }
+                    _ => {
+                        return Err(HathError::Fatal(format!(
+                            "Unexpected client_start failure: {}",
+                            code
+                        )));
+                    }
+                }
             }
-            if code.starts_with("FAIL_CONNECT_TEST") {
-                tracing::error!(
-                    "FAIL_CONNECT_TEST: The server was unable to verify your connection. \
-                     This usually means your port forwarding or firewall settings are incorrect. \
-                     Please ensure port {} is accessible from the internet.",
-                    config.load().client_port
-                );
-                tracing::error!(
-                    "The client will remain running so you can diagnose firewall and port \
-                     forwarding issues. Press Ctrl+C to exit."
-                );
-            } else {
-                return Err(HathError::Fatal(format!(
-                    "Unexpected client_start failure: {}",
-                    code
-                )));
-            }
-            false
         };
 
         background_tasks = if startup_ok {
